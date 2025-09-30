@@ -87,10 +87,16 @@ class PerJobLogHandler(logging.Handler):
         self.job_id = job_id
         self.buf = JOB_LOGS.setdefault(job_id, deque(maxlen=max_lines))
         self.persist_fp = None
+        self.log_path = None
         if persist_dir:
-            os.makedirs(persist_dir, exist_ok=True)
-            self.log_path = os.path.join(persist_dir, f"{job_id}.log")
-            self.persist_fp = open(self.log_path, "a", encoding="utf-8")
+            try:
+                os.makedirs(persist_dir, exist_ok=True)
+                self.log_path = os.path.join(persist_dir, f"{job_id}.log")
+                self.persist_fp = open(self.log_path, "a", encoding="utf-8")
+            except Exception as e:
+                self.persist_fp = None
+                self.log_path = None
+                logging.warning("PerJobLogHandler: file persistence disabled: %s", e)
 
     def emit(self, record: logging.LogRecord):
         msg = self.format(record)

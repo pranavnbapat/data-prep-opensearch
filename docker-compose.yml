@@ -1,22 +1,41 @@
 services:
+
   data-prep-opensearch:
     build:
       context: .
+
     image: ghcr.io/pranavnbapat/data-prep-opensearch:latest
+
     container_name: data-prep-opensearch
+
     env_file:
       - .env
+
     volumes:
       - ./output:/app/output
+
     restart: unless-stopped
 
-#    labels:
-#      - "traefik.enable=true"
-#      - "traefik.http.routers.data-prep.rule=Host(`data-prep.opensearch.nexavion.com`)"
-#      - "traefik.http.routers.data-prep.entrypoints=websecure"
-#      - "traefik.http.routers.data-prep.tls=true"
-#      - "traefik.http.routers.data-prep.tls.certresolver=letsencrypt"
-#      - "traefik.http.services.data-prep.loadbalancer.server.port=8000"
+    healthcheck:
+      test: [ "CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0) if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3).status==200 else sys.exit(1)\"" ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  data-prep-opensearch-scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile.scheduler
+    container_name: data-prep-opensearch-scheduler
+    depends_on:
+      - data-prep-opensearch
+    environment:
+      TARGET_URL: http://data-prep-opensearch:8000/run
+      ENV_MODE: PRD
+      TZ: UTC
+    networks: [ traefik-net ]
+    restart: unless-stopped
 
 #    networks:
 #      - traefik-net
