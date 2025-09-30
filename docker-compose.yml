@@ -34,7 +34,6 @@ services:
       TARGET_URL: http://data-prep-opensearch:8000/run
       ENV_MODE: PRD
       TZ: UTC
-    networks: [ traefik-net ]
     restart: unless-stopped
 
 #    networks:
