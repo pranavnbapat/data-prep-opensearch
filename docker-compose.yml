@@ -1,0 +1,28 @@
+version: "3.8"
+
+services:
+  data-prep-opensearch:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: data-prep-opensearch
+    env_file:
+      - .env
+    volumes:
+      - ./output:/app/output
+    restart: unless-stopped
+
+#    labels:
+#      - "traefik.enable=true"
+#      - "traefik.http.routers.data-prep.rule=Host(`data-prep.opensearch.nexavion.com`)"
+#      - "traefik.http.routers.data-prep.entrypoints=websecure"
+#      - "traefik.http.routers.data-prep.tls=true"
+#      - "traefik.http.routers.data-prep.tls.certresolver=letsencrypt"
+#      - "traefik.http.services.data-prep.loadbalancer.server.port=8000"
+
+#    networks:
+#      - traefik-net
+
+#networks:
+#  traefik-net:
+#    external: true
