@@ -1,10 +1,8 @@
-version: "3.8"
-
 services:
   data-prep-opensearch:
     build:
       context: .
-      dockerfile: Dockerfile
+    image: ghcr.io/pranavnbapat/data-prep-opensearch:latest
     container_name: data-prep-opensearch
     env_file:
       - .env

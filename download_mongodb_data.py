@@ -333,7 +333,7 @@ def save_results(data):
     """
     if not data:
         logging.warning("No documents found to save.")
-        return
+        return None
 
     # -------- helpers --------
     def _canonicalise_docs(docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -366,8 +366,9 @@ def save_results(data):
         reverse=True
     )
 
-    existing_data_canon: List[Dict[str, Any]] = []
     latest_file = existing_files[0] if existing_files else None
+
+    existing_data_canon: List[Dict[str, Any]] = []
     if latest_file:
         try:
             with open(latest_file, "r", encoding="utf-8") as fh:
@@ -385,7 +386,7 @@ def save_results(data):
 
     if latest_file and existing_data_canon == new_data_canon:
         logging.info("No changes detected. Skipping file save: %s", latest_file)
-        return
+        return latest_file
 
     # -------- write new snapshot (atomic) --------
     timestamp = datetime.now().strftime("%d_%m-%Y_%H-%M-%S")
@@ -400,6 +401,7 @@ def save_results(data):
             json.dump(new_data_canon, fh, cls=CustomJSONEncoder, indent=4, ensure_ascii=False)
         os.replace(tmp_filename, json_filename)  # atomic on POSIX
         logging.info("Data saved: %s", json_filename)
+        return json_filename
     except Exception as e:
         # Clean up tmp if something went wrong
         try:
@@ -408,6 +410,7 @@ def save_results(data):
         except Exception:
             pass
         logging.error("Error saving file %s: %s", json_filename, e)
+        return None
 
 
 def _is_blank(val) -> bool:
@@ -638,12 +641,19 @@ def get_ko_metadata(max_workers: int = 10, page_size: Optional[int] = None, sort
 
         # Save once at the end
         if total_emitted == 0:
-            save_results([])
+            out_path = save_results([])
         else:
-            save_results(combined_results_all)
+            out_path = save_results(combined_results_all)
+
+        return {
+            "emitted": total_emitted,
+            "dropped": total_dropped,
+            "output_file": out_path,
+        }
 
     except Exception as e:
         logging.error(f"Error fetching metadata via API: {e}")
+        return {"emitted": 0, "dropped": 0, "output_file": None}
 
 
 def get_ko_content(document_id: str) -> List[dict]:
