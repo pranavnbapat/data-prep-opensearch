@@ -8,6 +8,7 @@ from collections import deque
 from datetime import datetime
 from enum import Enum
 from threading import Lock
+from time import tzset
 from typing import Optional, Dict
 
 from dotenv import load_dotenv
@@ -21,14 +22,21 @@ app = FastAPI(title="Data Prep")
 
 MAX_PAGE_SIZE = 100
 
+_tz = os.getenv("TZ")
+if _tz:
+    os.environ["TZ"] = _tz
+    try:
+        tzset()
+    except Exception:
+        pass
+
 class EnvMode(str, Enum):
     DEV = "DEV"
     PRD = "PRD"
 
 class RunParams(BaseModel):
     page_size: Optional[int] = None
-    background: bool = True
-    env_mode: EnvMode = EnvMode.DEV
+    env_mode: Optional[EnvMode] = None
 
     model_config = {"extra": "ignore"}
 
@@ -172,23 +180,26 @@ def trigger_run(params: RunParams, bg: BackgroundTasks):
         if any(j.status == JobStatus.running for j in JOBS.values()):
             raise HTTPException(status_code=409, detail="Another job is already running")
 
+    env_mode_val = (params.env_mode.value if params.env_mode
+                    else (os.getenv("ENV_MODE") or "DEV")).upper()
+    try:
+        resolved_env_mode = EnvMode(env_mode_val)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid ENV_MODE {env_mode_val!r}. Use DEV or PRD")
+
     job_id = uuid4().hex
     job = Job(
         id=job_id,
         status=JobStatus.queued,
         created_at=datetime.utcnow(),
-        env_mode=params.env_mode,
+        env_mode=resolved_env_mode,
         page_size=_effective_page_size(params.page_size)
     )
     with JOB_LOCK:
         JOBS[job_id] = job
 
-    if params.background:
-        bg.add_task(_run_job, job_id, job.page_size, job.env_mode)
-        return {"status": "scheduled", "job_id": job_id}
-    else:
-        _run_job(job_id, job.page_size, job.env_mode)
-        return {"status": JOBS[job_id].status, "job_id": job_id}
+    bg.add_task(_run_job, job_id, job.page_size, job.env_mode)
+    return {"status": "scheduled", "job_id": job_id}
 
 @app.get("/jobs")
 def list_jobs():

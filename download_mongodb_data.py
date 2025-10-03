@@ -50,8 +50,8 @@ def _ensure_backend(env_hint: Optional[str] = None) -> None:
     global CURRENT_ENV_MODE, CURRENT_BACKEND
     if CURRENT_BACKEND is not None:
         return
-    # Prefer explicit hint, then ENVIRONMENT, else default to DEV
-    mode = (env_hint or os.getenv("ENVIRONMENT") or "DEV").upper()
+    # Prefer explicit hint, then ENV_MODE, else default to DEV
+    mode = (env_hint or os.getenv("ENV_MODE") or "DEV").upper()
     CURRENT_BACKEND = _load_backend_cfg(mode)
     CURRENT_ENV_MODE = mode
 
@@ -321,10 +321,29 @@ def combine_metadata_and_content(metadata, content_list):
     metadata_copy['ko_content'] = content_list
     return metadata_copy
 
+def _env_and_date_paths(output_root: str = "output") -> tuple[str, str, str, str]:
+    """
+    Returns (env_dir, write_dir, year, month)
+    - env_dir:   output/<ENV_MODE>
+    - write_dir: output/<ENV_MODE>/<YYYY>/<MM>
+    """
+    _ensure_backend()  # ensures CURRENT_ENV_MODE is available
+    env = (CURRENT_ENV_MODE or os.getenv("ENV_MODE") or "DEV").upper()
 
-def save_results(data):
+    now = datetime.now()
+    year = now.strftime("%Y")
+    month = now.strftime("%m")
+
+    env_dir = os.path.join(output_root, env)
+    write_dir = os.path.join(env_dir, year, month)
+    return env_dir, write_dir, year, month
+
+def save_results(data, output_root: str = "output"):
     """
     Save data to a timestamped JSON snapshot if it differs from the latest snapshot.
+
+    Directory layout:
+      output/<ENV_MODE>/<YYYY>/<MM>/final_output_<dd_mm-YYYY>_<HH-MM-SS>.json
 
     - Canonicalises both "existing" and "new" docs the same way before comparing:
         * move top-level "_id" -> "_orig_id" (non-destructive: done on copies)
@@ -356,16 +375,15 @@ def save_results(data):
     def _sort_key(doc: Dict[str, Any]) -> str:
         return (doc.get("@id") or doc.get("_orig_id") or "")
 
-    # -------- ensure output dir --------
-    output_dir = "output"
-    os.makedirs(output_dir, exist_ok=True)
+    # -------- resolve target dirs --------
+    env_dir, write_dir, year, month = _env_and_date_paths(output_root)
+    os.makedirs(write_dir, exist_ok=True)
 
     # -------- find latest snapshot (if any) --------
     existing_files = sorted(
-        glob.glob(os.path.join(output_dir, "final_output_*.json")),
+        glob.glob(os.path.join(env_dir, "**", "final_output_*.json"), recursive=True),
         reverse=True
     )
-
     latest_file = existing_files[0] if existing_files else None
 
     existing_data_canon: List[Dict[str, Any]] = []
@@ -390,7 +408,7 @@ def save_results(data):
 
     # -------- write new snapshot (atomic) --------
     timestamp = datetime.now().strftime("%d_%m-%Y_%H-%M-%S")
-    json_filename = os.path.join(output_dir, f"final_output_{timestamp}.json")
+    json_filename = os.path.join(write_dir, f"final_output_{timestamp}.json")
     tmp_filename = json_filename + ".tmp"
 
     logging.warning("[Save] about to write %d documents -> %s", len(new_data_canon), json_filename)
