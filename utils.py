@@ -238,6 +238,7 @@ def flatten_ko_content(doc: dict, mode: str = "flat_only", empty_sentinel: str =
     # Build ko_content_flat
     if flat_pages:
         doc["ko_content_flat"] = flat_pages
+        doc["ko_content_flat"] = clean_ko_content(flat_pages) if flat_pages else empty_sentinel
     else:
         # As requested, use a string sentinel instead of an empty list
         doc["ko_content_flat"] = empty_sentinel
@@ -509,4 +510,109 @@ def fetch_projects(
 
     return index
 
+
+def clean_ko_content(chunks: list[str]) -> str:
+    """
+    Clean a list of text fragments extracted from PDFs/JSON for search/embedding.
+    Keeps paragraphs; removes page furniture and common PDF artefacts.
+    """
+    # 1) Join and normalise Unicode (NFKC flattens compatibility forms)
+    s = " ".join(chunks)
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    s = unicodedata.normalize("NFKC", s)
+
+    # 2) Whitespace: convert NBSP & friends to regular space; remove zero-widths
+    #   \u00A0 NBSP; \u2000–\u200A various spaces; \u202F NNBSP; \u205F MMSP
+    s = re.sub(r"[\u00A0\u2000-\u200A\u202F\u205F]", " ", s)
+    #   \u200B ZWSP, \u200C ZWNJ, \u200D ZWJ, \uFEFF BOM
+    s = re.sub(r"[\u200B\u200C\u200D\uFEFF]", "", s)
+    #   U+00AD SOFT HYPHEN: remove entirely (PyCharm shows it as 'SHY')
+    s = s.replace("\u00AD", "")
+    #   HTML entity form sometimes appears in scraped text
+    s = s.replace("&shy;", "")
+
+    # 3) Remove page headers/footers like "7 / 31" at line starts
+    s = re.sub(r"(?m)^\s*\d+\s*/\s*\d+\s+", "", s)
+
+    # 4) Table-of-contents dot leaders → single space
+    s = re.sub(r"\.{2,}", " ", s)
+
+    # 5) Normalise bullets and dash spacing
+    #    lines that start with a loose "-" become bullets
+    s = re.sub(r"(?m)^\s*-\s+", "• ", s)
+    #    collapse weird spaced hyphens/dashes to " - "
+    s = re.sub(r"\s*[-–—]\s*", " - ", s)
+
+    # Normalise special hyphen/minus to ASCII hyphen so later rules behave consistently
+    s = s.replace("\u2010", "-").replace("\u2011", "-").replace("\u2212", "-")
+
+    # [NEW] Preserve true hyphenated compounds (collapse spaces around hyphen when both sides are word chars)
+    # Examples: "EIP - AGRI" -> "EIP-AGRI", "multi - actor" -> "multi-actor"
+    s = re.sub(r'(?<=\w)\s*-\s*(?=\w)', '-', s)
+
+    # [NEW] Fix occasional split at word-start like "T hese" -> "These"
+    # (Capital letter + single space + 2+ lowercase letters)
+    s = re.sub(r'\b([A-Z])\s([a-z]{2,})\b', r'\1\2', s)
+
+    # 6) Map curly quotes/ellipsis to ASCII; drop ©/®/™ clutter
+    trans = {
+        ord("“"): '"', ord("”"): '"', ord("„"): '"', ord("‟"): '"',
+        ord("‘"): "'", ord("’"): "'", ord("‚"): "'", ord("‛"): "'",
+        ord("…"): "...", ord("©"): " ", ord("®"): " ", ord("™"): " ",
+    }
+    s = s.translate(trans)
+
+    # 7) Remove control characters (except \n and \t)
+    s = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", s)
+
+    # 8) Light de-noising of obvious repeated headers (exact matches only, safe)
+    #    Here: drop duplicate standalone "Brassica Fact Sheet" lines
+    s = re.sub(r"(?m)^\s*Brassica\s+Fact\s+Sheet\s*$", "", s)
+
+    # [NEW] Deduplicate exact lines (helps when PDFs repeat headers/URLs verbatim)
+    _lines, _seen = [], set()
+    for _line in s.splitlines():
+        _key = _line.strip()
+        if _key and _key not in _seen:
+            _seen.add(_key)
+            _lines.append(_line)
+    s = "\n".join(_lines)
+
+    # De-hyphenate words split across lines: "nutricio-\nnal" -> "nutricional"
+    s = re.sub(r'(?<=\w)-\n(?=\w)', '', s)
+
+    # Belt-and-braces: if a soft hyphen survived with a newline, drop both
+    s = re.sub(r'\u00AD\n?', '', s)
+
+    # [NEW] Join intra-sentence hard wraps: replace a single newline between word chars with a space
+    # e.g., "Increase\nproductivity" -> "Increase productivity"
+    s = re.sub(r'(?<=\w)\n(?=\w)', ' ', s)
+
+    # ensure a space when lowercase is followed by Uppercase (productivityOptimize -> productivity Optimize)
+    s = re.sub(r'([a-z])([A-Z])', r'\1 \2', s)
+
+    # ensure a space after a colon (to:Developing -> to: Developing)
+    s = re.sub(r':(?!\s)', ': ', s)
+
+    # space between compact number+suffix and a 4-digit year (6,99M2018 -> 6,99M 2018)
+    s = re.sub(r'(\d[\d.,]*\s*[kKmMbB])(?=\d{4}\b)', r'\1 ', s)
+
+    # collapse duplicate "n° NN" tokens (n°19 n°19 -> n°19)
+    s = re.sub(r'\b(n°\s*\d+)\s+\1\b', r'\1', s, flags=re.IGNORECASE)
+
+    # Normalise "Nº"/"N°"/"No." variants to a single form "n°"
+    s = re.sub(r'\b[Nn][oO][\.\s]?(?=\d)', 'n° ', s)  # "No 5", "No.5" -> "n° 5"
+    s = re.sub(r'\b[Nn][º°]\s*(?=\d)', 'n° ', s)  # "Nº5", "N° 5" -> "n° 5"
+
+    # Remove spaces before punctuation (e.g., "palabra :" -> "palabra:")
+    s = re.sub(r'\s+([,.;:!?])', r'\1', s)
+
+    # 9) Trim spaces around newlines; collapse excessive blank lines and spaces
+    s = re.sub(r"[ \t]+\n", "\n", s)           # strip trailing spaces before NL
+    s = re.sub(r"\n{3,}", "\n\n", s)           # max two newlines
+    s = re.sub(r"[ \t]{2,}", " ", s)           # collapse runs of spaces/tabs
+    s = re.sub(r"\s{2,}", " ", s)              # extra safety
+    s = s.strip()
+
+    return s
 

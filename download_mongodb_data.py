@@ -489,7 +489,7 @@ def process_document(doc, projects_collection):
             )
             return None
 
-        required_pre = ["project_id", "title", "@id", "topics", "themes"]
+        required_pre = ["project_id", "title", "@id", "topics", "themes", "date_of_completion"]
         missing_pre = [f for f in required_pre if _is_blank(cleaned_doc.get(f))]
         if missing_pre:
             doc_id = doc.get("_id")
