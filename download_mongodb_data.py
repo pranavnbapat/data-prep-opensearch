@@ -449,6 +449,15 @@ def _is_blank(val) -> bool:
 
 def process_document(doc, projects_collection):
     try:
+        # Hard stop if not Published (defensive; in case other callers reuse this)
+        if str(doc.get("status", "")).strip().lower() != "published":
+            _id = doc.get("_id")
+            # normalise _id for logs: handle {"$oid": "..."} or plain values
+            if isinstance(_id, dict) and "$oid" in _id:
+                _id = _id["$oid"]
+            logging.debug("Dropping KO %r due to status=%r", _id, doc.get("status"))
+            return None
+
         cleaned_doc = clean_ko_metadata(doc)  # Remove unwanted fields
 
         # Canonicalise the KO ID
@@ -566,6 +575,15 @@ def _process_page(kos_page: List[Dict[str, Any]], workers: Optional[int] = None)
     """
     if not kos_page:
         return []
+
+    before = len(kos_page)
+    kos_page = [
+        d for d in kos_page
+        if str(d.get("status", "")).strip().lower() == "published"
+    ]
+    skipped = before - len(kos_page)
+    if skipped:
+        logging.info("Skipped %d non-published KOs on this page (kept=%d).", skipped, len(kos_page))
 
     # Collect project ids for this page
     proj_ids = []
@@ -741,11 +759,11 @@ if __name__ == "__main__":
     mw = int(os.getenv("DL_MAX_WORKERS", "10"))
     sc = int(os.getenv("DL_SORT_CRITERIA", "1"))
 
+    logging.info("Active ENV_MODE=%s; backend=%s", CURRENT_ENV_MODE, CURRENT_BACKEND["host"])
+
     get_ko_metadata(
         max_workers=mw,
         page_size=ps,
         sort_criteria=sc,
     )
-
-
 
