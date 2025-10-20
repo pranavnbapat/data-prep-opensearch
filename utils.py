@@ -1,19 +1,17 @@
+# utils.py
 
-import glob
 import json
 import logging
 import os
 import re
 import sys
-import time
 import unicodedata
 
 from bson import ObjectId
 from datetime import datetime, timezone
 from dateutil import parser as du_parser
 from html import unescape
-from types import SimpleNamespace
-from typing import Iterable, List, Optional, Callable, Dict, Any, TypedDict
+from typing import Iterable, List, Optional, Callable, Dict, Any
 from urllib.parse import urlparse, urlunparse
 from urllib3.util.retry import Retry
 

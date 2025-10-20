@@ -1,8 +1,13 @@
 # download_mongodb_data.py
 
+import glob
 import threading
+import time
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from types import SimpleNamespace
+from typing import TypedDict
+
 from requests.auth import HTTPBasicAuth
 
 from utils import *
