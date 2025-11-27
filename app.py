@@ -258,7 +258,7 @@ def _run_job(job_id: str, page_size: int, env_mode: EnvMode):
         ps = _effective_page_size(page_size)
 
         logging.info("Starting data-prep (env=%s, page_size=%s, workers=%s, sort=%s)", env_mode, ps, mw, sc)
-        summary = get_ko_metadata(max_workers=mw, page_size=ps, sort_criteria=sc)
+        summary = get_ko_metadata(max_workers=mw, page_size=ps, sort_criteria=sc) or {}
 
         with JOB_LOCK:
             job.emitted = summary.get("emitted")

@@ -1,64 +1,14 @@
 # download_mongodb_data.py
 
 import glob
-import threading
-import time
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from types import SimpleNamespace
-from typing import TypedDict
-
-from requests.auth import HTTPBasicAuth
 
 from utils import *
+from utils import  _ensure_backend, _load_backend_cfg, _tls, _MISSING_LOCK
 
 # Choose ONE of: "flat_only", "both", "original_only"
 KO_CONTENT_MODE = "flat_only"
-
-_tls = threading.local()
-
-class BackendCfg(TypedDict):
-    host: str
-    user: str
-    pwd: str
-
-ENV_CHOICES = {"DEV", "PRD"}
-
-def _load_backend_cfg(env_mode: str) -> BackendCfg:
-    env_mode = (env_mode or "DEV").upper()
-    if env_mode not in ENV_CHOICES:
-        raise ValueError(f"Invalid env_mode {env_mode!r}. Choose one of {sorted(ENV_CHOICES)}")
-
-    if env_mode == "DEV":
-        host = os.getenv("BACKEND_CORE_HOST_DEV", "")
-        user = os.getenv("BACKEND_CORE_DEV_API_USERNAME", "")
-        pwd  = os.getenv("BACKEND_CORE_DEV_API_PASSWORD", "")
-    else:  # PRD
-        host = os.getenv("BACKEND_CORE_HOST_PRD", "")
-        user = os.getenv("BACKEND_CORE_PRD_API_USERNAME", "")
-        pwd  = os.getenv("BACKEND_CORE_PRD_API_PASSWORD", "")
-
-    if not host or not user or pwd is None:
-        raise RuntimeError(
-            f"Missing required env vars for {env_mode}. "
-            f"Expected BACKEND_CORE_HOST_{env_mode}, BACKEND_CORE_{env_mode}_API_USERNAME, BACKEND_CORE_{env_mode}_API_PASSWORD"
-        )
-
-    return {"host": host.rstrip("/"), "user": user, "pwd": pwd}
-
-# --- lazy-selected backend (no env required at import) ---
-CURRENT_ENV_MODE: Optional[str] = None
-CURRENT_BACKEND: Optional[BackendCfg] = None
-
-def _ensure_backend(env_hint: Optional[str] = None) -> None:
-    """Initialise CURRENT_BACKEND the first time it's needed."""
-    global CURRENT_ENV_MODE, CURRENT_BACKEND
-    if CURRENT_BACKEND is not None:
-        return
-    # Prefer explicit hint, then ENV_MODE, else default to DEV
-    mode = (env_hint or os.getenv("ENV_MODE") or "DEV").upper()
-    CURRENT_BACKEND = _load_backend_cfg(mode)
-    CURRENT_ENV_MODE = mode
 
 def select_environment(env_mode: str) -> None:
     """Switch active environment at runtime and clear the thread-local session."""
@@ -92,70 +42,6 @@ def dedup_case_insensitive(items: Optional[List[str]]) -> List[str]:
             out.append(x)
             seen.add(k)
     return out
-
-def max_workers_global() -> int:
-    try:
-        return int(os.getenv("DL_MAX_WORKERS", "10"))
-    except Exception:
-        return 10
-
-def get_session(timeout: int = 15) -> requests.Session:
-    """
-    Return a thread-local Session. The first call in a thread creates it via requests_session().
-    Subsequent calls in the same thread reuse the same pooled session.
-    """
-    sess = getattr(_tls, "session", None)
-    if sess is None:
-        _tls.session = requests_session(timeout=timeout)
-    return _tls.session
-
-def requests_session(timeout: int = 15) -> requests.Session:
-    """
-    Create a pooled, retrying Requests Session with HTTP Basic Auth taken from Django settings.
-    - Reuses TCP connections (HTTP keep-alive) across calls
-    - Adds exponential backoff on 429/5xx
-    - Applies a default timeout to every request unless overridden
-    """
-    _ensure_backend()
-    user = CURRENT_BACKEND["user"]
-    pwd = CURRENT_BACKEND["pwd"]
-
-    if not user or pwd is None:
-        raise RuntimeError(
-            "Missing credentials in CURRENT_BACKEND (user/pwd)."
-        )
-
-    s = requests.Session()
-    s.auth = HTTPBasicAuth(user, pwd)
-    s.headers.update({
-        "accept": "application/json",
-        "Content-Type": "application/json",
-    })
-
-    # ---- Retries + connection pooling ----
-    retry = Retry(
-        total=5,                    # up to 5 total attempts
-        backoff_factor=0.5,         # 0.5s, 1s, 2s, 4s, ...
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=("GET", "POST"),
-        raise_on_status=False,
-    )
-    adapter = HTTPAdapter(
-        max_retries=retry,
-        pool_connections=100,       # connection pools per host
-        pool_maxsize=100,           # max concurrent connections per host
-    )
-    s.mount("http://", adapter)
-    s.mount("https://", adapter)
-
-    # ---- Enforce a default timeout transparently ----
-    original = s.request
-    def _with_timeout(method, url, **kw):
-        kw.setdefault("timeout", timeout)
-        return original(method, url, **kw)
-    s.request = _with_timeout
-
-    return s
 
 def api_base() -> str:
     _ensure_backend()
@@ -625,6 +511,44 @@ def _process_page(kos_page: List[Dict[str, Any]], workers: Optional[int] = None)
                 results.append(res)
     return results
 
+def write_missing_url_content_report(output_root: str = "output") -> Optional[str]:
+    """Write JSON+CSV once per run for URL-only KOs (those we skipped fetching)."""
+
+    if not MISSING_URL_CONTENT:
+        logging.warning("[Report] URL-only rows: 0 → nothing to write")
+        return None
+
+    try:
+        env_dir, write_dir, year, month = _env_and_date_paths(output_root)
+
+        report_dir = os.path.join(write_dir, "reports")
+        os.makedirs(report_dir, exist_ok=True)
+
+        ts = datetime.now().strftime("%d_%m-%Y_%H-%M-%S")
+
+        miss_json = os.path.join(report_dir, f"missing_url_content_{ts}.json")
+        with open(miss_json, "w", encoding="utf-8") as fh:
+            json.dump(
+                MISSING_URL_CONTENT,
+                fh,
+                cls=CustomJSONEncoder,
+                indent=2,
+                ensure_ascii=False,
+            )
+
+        logging.warning(
+            "[Report] URL-only rows: %d → %s (env=%s, year=%s, month=%s)",
+            len(MISSING_URL_CONTENT),
+            miss_json,
+            os.getenv("ENV_MODE", "DEV"),
+            year,
+            month,
+        )
+
+        return miss_json
+    except Exception as e:
+        logging.error("Failed to write missing URL-content report: %s", e)
+        return None
 
 def get_ko_metadata(max_workers: int = 10, page_size: Optional[int] = None, sort_criteria: int = 1):
     """
@@ -680,21 +604,46 @@ def get_ko_metadata(max_workers: int = 10, page_size: Optional[int] = None, sort
         logging.warning("[Process] emitted=%s, dropped=%s, elapsed=%.2fs",
                         total_emitted, total_dropped, time.perf_counter() - t0)
 
+        _ = patch_url_only_docs_with_extracted_text(
+            combined_results_all,
+            MISSING_URL_CONTENT,
+            max_workers=int(os.getenv("EXTRACTOR_WORKERS", "5")),
+            max_chars=None
+        )
+
+        # Keep only those that STILL lack ko_content_flat
+        remaining = []
+        by_id = {d.get("_orig_id") or d.get("_id"): d for d in combined_results_all}
+        for row in MISSING_URL_CONTENT:
+            doc = by_id.get(row.get("logical_layer_id"))
+            if not doc:
+                remaining.append(row)
+                continue
+            kcf = doc.get("ko_content_flat")
+            if (not kcf) or (isinstance(kcf, str) and kcf.strip().lower() == "no content present"):
+                remaining.append(row)
+
+        with _MISSING_LOCK:
+            MISSING_URL_CONTENT[:] = remaining
+
         # Save once at the end
+        miss_json = write_missing_url_content_report()
+
         if total_emitted == 0:
-            out_path = save_results([])
+            output_file = save_results([])
         else:
-            out_path = save_results(combined_results_all)
+            output_file = save_results(combined_results_all)
 
         return {
             "emitted": total_emitted,
             "dropped": total_dropped,
-            "output_file": out_path,
+            "output_file": output_file,
+            "missing_url_json": miss_json,
         }
 
     except Exception as e:
         logging.error(f"Error fetching metadata via API: {e}")
-        return {"emitted": 0, "dropped": 0, "output_file": None}
+        raise
 
 
 def get_ko_content(document_id: str) -> List[dict]:
@@ -703,55 +652,63 @@ def get_ko_content(document_id: str) -> List[dict]:
     API expects the original KO _id as 'document_id' (same as our pre-save _id).
     Returns a list of content docs; we then clean them as before.
     """
-    try:
-        base = api_base()
-        url = f"{base}/api/nlp/ko_content_document"
-        params = {"document_id": document_id}
+    base = api_base()
+    url = f"{base}/api/nlp/ko_content_document"
+    params = {"document_id": document_id}
 
+    try:
         s = get_session()
         r = s.get(url, params=params)
-
+        if r.status_code == 404:
+            # Benign: no extracted text available for this KO
+            if os.getenv("LOG_CONTENT_404", "0") == "1":
+                logging.info("[Content API] %s → 404 Not Found (no content)", document_id)
+            else:
+                logging.debug("[Content API] %s → 404 Not Found (no content)", document_id)
+            return []
         r.raise_for_status()
-
         body = r.json()
-
-        # Normalise to list
-        if isinstance(body, dict):
-            # pick common containers if present
-            if "data" in body and isinstance(body["data"], list):
-                items = body["data"]
-            elif "results" in body and isinstance(body["results"], list):
-                items = body["results"]
-            elif "content" in body and isinstance(body["content"], list):
-                items = body["content"]
-            else:
-                # single dict payload
-                items = [body]
-        elif isinstance(body, list):
-            items = body
-        elif isinstance(body, str):
-            items = [body]
-        else:
-            items = []
-
-        # Coerce strings → dicts with a single text field
-        normalised: List[dict] = []
-        for el in items:
-            if isinstance(el, dict):
-                normalised.append(clean_ko_content(el))
-            elif isinstance(el, str):
-                normalised.append({"content_text": el})
-            else:
-                # ignore unknown shapes
-                continue
-
-        if not normalised:
-            logging.warning(f"[Content API] {document_id} → 0 item(s) after normalisation")
-
-        return normalised
-    except Exception as e:
-        logging.error(f"Error fetching content via API for {document_id}: {e}")
+    except requests.HTTPError as e:
+        # Non-404 HTTP errors—keep them visible but don't explode the run
+        status = getattr(e.response, "status_code", None)
+        logging.error("Error fetching content via API for %s: HTTP %s %s",
+                      document_id, status, e)
         return []
+    except Exception as e:
+        logging.error("Error fetching content via API for %s: %s", document_id, e)
+        return []
+
+    # Normalise to list
+    if isinstance(body, dict):
+        if "data" in body and isinstance(body["data"], list):
+            items = body["data"]
+        elif "results" in body and isinstance(body["results"], list):
+            items = body["results"]
+        elif "content" in body and isinstance(body["content"], list):
+            items = body["content"]
+        else:
+            items = [body]
+    elif isinstance(body, list):
+        items = body
+    elif isinstance(body, str):
+        items = [body]
+    else:
+        items = []
+
+    # Coerce strings → dicts with a single text field
+    normalised: List[dict] = []
+    for el in items:
+        if isinstance(el, dict):
+            normalised.append(clean_ko_content(el))
+        elif isinstance(el, str):
+            normalised.append({"content_text": el})
+        else:
+            continue
+
+    if not normalised:
+        logging.warning("[Content API] %s → 0 item(s) after normalisation", document_id)
+
+    return normalised
 
 # Run the function
 if __name__ == "__main__":
@@ -764,7 +721,8 @@ if __name__ == "__main__":
     mw = int(os.getenv("DL_MAX_WORKERS", "10"))
     sc = int(os.getenv("DL_SORT_CRITERIA", "1"))
 
-    logging.info("Active ENV_MODE=%s; backend=%s", CURRENT_ENV_MODE, CURRENT_BACKEND["host"])
+    backend_host = CURRENT_BACKEND["host"] if CURRENT_BACKEND else "<unset>"
+    logging.info("Active ENV_MODE=%s; backend=%s", CURRENT_ENV_MODE, backend_host)
 
     get_ko_metadata(
         max_workers=mw,

@@ -3,22 +3,28 @@
 import json
 import logging
 import os
+import random
 import re
 import sys
+import threading
+import time
 import unicodedata
-
-from bson import ObjectId
-from datetime import datetime, timezone
-from dateutil import parser as du_parser
-from html import unescape
-from typing import Iterable, List, Optional, Callable, Dict, Any
-from urllib.parse import urlparse, urlunparse
-from urllib3.util.retry import Retry
 
 import requests
 
-from requests.adapters import HTTPAdapter
+from bson import ObjectId
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+from dateutil import parser as du_parser
+from html import unescape
+from typing import Iterable, List, Optional, Callable, Dict, Any, TypedDict, Tuple
+from urllib.parse import urlparse, urlunparse, parse_qs
+from urllib3.util.retry import Retry
 
+from requests import Session
+from requests.adapters import HTTPAdapter
+from requests.auth import HTTPBasicAuth
+from youtube_transcript_api import  YouTubeTranscriptApi
 
 # Logging
 log_level = getattr(logging, os.getenv("LOG_LEVEL", "WARNING").upper(), logging.WARNING)
@@ -29,6 +35,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+_YT_ID_RE = re.compile(
+    r'(?:youtu\.be/|youtube\.com/(?:watch\?v=|embed/|shorts/))([0-9A-Za-z_-]{11})'
+)
 
 _ZW     = re.compile(r'[\u200B-\u200D\uFEFF]')                 # zero-width
 _CTRL   = re.compile(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]')      # control chars + DEL
@@ -42,6 +51,23 @@ _SPACE_MAP = {
     "\u200A": " ",  # hair space
 }
 
+# ---- Report for KOs that are URL-based but have no ko_content_document ----
+MISSING_URL_CONTENT = []          # list of dict rows for CSV/JSON report
+_MISSING_LOCK = threading.Lock()  # protect appends across worker threads
+
+_tls = threading.local()
+
+ENV_CHOICES = {"DEV", "PRD"}
+
+class BackendCfg(TypedDict):
+    host: str
+    user: str
+    pwd: str
+
+# --- lazy-selected backend (no env required at import) ---
+CURRENT_ENV_MODE: Optional[str] = None
+CURRENT_BACKEND: Optional[BackendCfg] = None
+
 # Custom JSON Encoder for ObjectId and datetime
 class CustomJSONEncoder(json.JSONEncoder):
     """Custom JSON encoder for ObjectId and datetime objects."""
@@ -51,6 +77,102 @@ class CustomJSONEncoder(json.JSONEncoder):
         if isinstance(obj, datetime):
             return obj.isoformat()      # Convert datetime to ISO 8601 format
         return super().default(obj)
+
+def max_workers_global() -> int:
+    try:
+        return int(os.getenv("DL_MAX_WORKERS", "10"))
+    except Exception:
+        return 10
+
+def get_session(timeout: int = 15) -> requests.Session:
+    """
+    Return a thread-local Session. The first call in a thread creates it via requests_session().
+    Subsequent calls in the same thread reuse the same pooled session.
+    """
+    sess = getattr(_tls, "session", None)
+    if sess is None:
+        _tls.session = requests_session(timeout=timeout)
+    return _tls.session
+
+def _load_backend_cfg(env_mode: str) -> BackendCfg:
+    env_mode = (env_mode or "DEV").upper()
+    if env_mode not in ENV_CHOICES:
+        raise ValueError(f"Invalid env_mode {env_mode!r}. Choose one of {sorted(ENV_CHOICES)}")
+
+    if env_mode == "DEV":
+        host = os.getenv("BACKEND_CORE_HOST_DEV", "")
+        user = os.getenv("BACKEND_CORE_DEV_API_USERNAME", "")
+        pwd  = os.getenv("BACKEND_CORE_DEV_API_PASSWORD", "")
+    else:  # PRD
+        host = os.getenv("BACKEND_CORE_HOST_PRD", "")
+        user = os.getenv("BACKEND_CORE_PRD_API_USERNAME", "")
+        pwd  = os.getenv("BACKEND_CORE_PRD_API_PASSWORD", "")
+
+    if not host or not user or pwd is None:
+        raise RuntimeError(
+            f"Missing required env vars for {env_mode}. "
+            f"Expected BACKEND_CORE_HOST_{env_mode}, BACKEND_CORE_{env_mode}_API_USERNAME, BACKEND_CORE_{env_mode}_API_PASSWORD"
+        )
+
+    return {"host": host.rstrip("/"), "user": user, "pwd": pwd}
+
+def _ensure_backend(env_hint: Optional[str] = None) -> None:
+    """Initialise CURRENT_BACKEND the first time it's needed."""
+    global CURRENT_ENV_MODE, CURRENT_BACKEND
+    if CURRENT_BACKEND is not None:
+        return
+    # Prefer explicit hint, then ENV_MODE, else default to DEV
+    mode = (env_hint or os.getenv("ENV_MODE") or "DEV").upper()
+    CURRENT_BACKEND = _load_backend_cfg(mode)
+    CURRENT_ENV_MODE = mode
+
+def requests_session(timeout: int = 15) -> requests.Session:
+    """
+    Create a pooled, retrying Requests Session with HTTP Basic Auth taken from Django settings.
+    - Reuses TCP connections (HTTP keep-alive) across calls
+    - Adds exponential backoff on 429/5xx
+    - Applies a default timeout to every request unless overridden
+    """
+    _ensure_backend()
+    user = CURRENT_BACKEND["user"]
+    pwd = CURRENT_BACKEND["pwd"]
+
+    if not user or pwd is None:
+        raise RuntimeError(
+            "Missing credentials in CURRENT_BACKEND (user/pwd)."
+        )
+
+    s = requests.Session()
+    s.auth = HTTPBasicAuth(user, pwd)
+    s.headers.update({
+        "accept": "application/json",
+        "Content-Type": "application/json",
+    })
+
+    # ---- Retries + connection pooling ----
+    retry = Retry(
+        total=5,                    # up to 5 total attempts
+        backoff_factor=0.5,         # 0.5s, 1s, 2s, 4s, ...
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET", "POST"),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(
+        max_retries=retry,
+        pool_connections=100,       # connection pools per host
+        pool_maxsize=100,           # max concurrent connections per host
+    )
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+
+    # ---- Enforce a default timeout transparently ----
+    original = s.request
+    def _with_timeout(method, url, **kw):
+        kw.setdefault("timeout", timeout)
+        return original(method, url, **kw)
+    s.request = _with_timeout
+
+    return s
 
 def canonical_url(u: Optional[str]) -> Optional[str]:
     """
@@ -613,4 +735,372 @@ def clean_ko_content(chunks: list[str]) -> str:
     s = s.strip()
 
     return s
+
+def _is_video_url(u: str) -> bool:
+    if not isinstance(u, str):
+        return False
+    u = u.lower()
+    return any(host in u for host in (
+        "youtube.com", "youtu.be", "vimeo.com", "dailymotion.com"
+    ))
+
+def fetch_url_text_with_extractor(
+    url: str,
+    timeout: Optional[int] = None,
+    retries: int = None,
+    backoff: float = None,
+    min_chars: int = None,
+    session: Optional[requests.Session] = None,
+) -> Optional[str]:
+    """
+    Calls your text-extractor:
+      GET {EXTRACTOR_BASE}/api/extract?url=<encoded>
+    Returns raw extracted text (str) or None on failure.
+    """
+    base = os.getenv("URL_CONTENT_EXTRACTOR_BASE", "https://pagesense.nexavion.com").rstrip("/")
+    endpoint = f"{base}/api/extract"
+    timeout = int(os.getenv("EXTRACTOR_TIMEOUT", str(timeout or 720)))
+    retries = int(os.getenv("EXTRACTOR_RETRIES", str(retries or 3)))
+    backoff = float(os.getenv("EXTRACTOR_BACKOFF", str(backoff or 1.6)))
+    min_chars = int(os.getenv("EXTRACTOR_MIN_CHARS", str(min_chars or 100)))
+
+    sess = session or requests.Session()
+
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            # small pre-call jitter to avoid thundering herd
+            time.sleep(random.uniform(0.15, 0.45))
+
+            r = sess.get(endpoint, params={"url": url}, timeout=timeout)
+            if r.status_code == 429 or 500 <= r.status_code < 600:
+                raise requests.HTTPError(f"HTTP {r.status_code}", response=r)
+            if r.status_code != 200:
+                return None
+
+            body = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+            if not body or not body.get("ok"):
+                return None
+
+            text = (body.get("text") or "").strip()
+            if len(text) < min_chars:
+                return None
+            return text
+
+        except (requests.Timeout, requests.ConnectionError, requests.HTTPError) as e:
+            last_err = e
+            if attempt < retries:
+                # exponential backoff + jitter
+                delay = (backoff ** attempt) + random.uniform(0.2, 0.6)
+                time.sleep(delay)
+                continue
+            return None
+        except Exception as e:
+            last_err = e
+            return None
+
+def fetch_transcript_segments(
+    video_id: str,
+    preferred_langs: Optional[List[str]] = None,
+    translate_to: Optional[str] = None,
+    http_client: Optional[Session] = None,
+) -> Tuple[List[Dict], str]:
+    """
+    Returns (segments, lang_code). Each segment is {text, start, duration}.
+    May raise TranscriptsDisabled / NoTranscriptFound / CouldNotRetrieveTranscript.
+    """
+    preferred_langs = preferred_langs or ["en"]
+    ytt = YouTubeTranscriptApi(http_client=http_client)
+
+    if translate_to:
+        # Ask YT to translate an existing track server-side
+        tl = ytt.list(video_id).find_transcript(preferred_langs)
+        tl = tl.translate(translate_to)
+        segs = tl.fetch().to_raw_data()
+        return segs, translate_to
+
+    # Normal: fetch one of the preferred languages
+    fetched = ytt.fetch(video_id, languages=preferred_langs)
+    # .fetch(...) in recent versions returns a FetchedTranscript; use .to_raw_data()
+    segs = fetched.to_raw_data()
+    # Best-effort lang code; fall back to the first preferred
+    lang_code = getattr(fetched, "language_code", preferred_langs[0])
+    return segs, lang_code
+
+def _parse_yt_time(t: str) -> int:
+    """
+    Parse YouTube-style time fragments into seconds.
+    Accepts e.g. '55', '55s', '1m30s', '2h3m', '90', 'start=75', etc.
+    """
+    if not isinstance(t, str):
+        return 0
+    t = t.strip().lower()
+    if t.isdigit():  # plain seconds like "55" or "90"
+        return int(t)
+
+    total = 0
+    # match sequences like 2h, 3m, 45s in any order
+    for val, unit in re.findall(r'(\d+)([hms])', t):
+        n = int(val)
+        if unit == 'h':
+            total += n * 3600
+        elif unit == 'm':
+            total += n * 60
+        else:
+            total += n
+
+    if total:
+        return total
+
+    # last-ditch: pull first integer substring
+    m = re.search(r'\d+', t)
+    return int(m.group(0)) if m else 0
+
+def parse_youtube_value(value: str) -> tuple[str | None, int | None]:
+    """
+    Accepts raw ID or any common YT URL (optionally with t=/start=) and returns (video_id, start_seconds).
+    """
+    value = (value or "").strip()
+    if not value:
+        return None, None
+
+    # Full URL?
+    if value.startswith(("http://", "https://")):
+        u = urlparse(value)
+        qs = parse_qs(u.query)
+        vid = (qs.get("v") or [None])[0]
+        if not vid:
+            m = _YT_ID_RE.search(value)
+            if m:
+                vid = m.group(1)
+        start = None
+        t = (qs.get("t") or qs.get("start") or [None])[0]
+        if t:
+            start = _parse_yt_time(str(t))
+        return vid, start
+
+    # Raw "ID&t=..."?
+    if "&" in value:
+        head, tail = value.split("&", 1)
+        vid = head if re.fullmatch(r"[0-9A-Za-z_-]{11}", head) else None
+        qs = parse_qs(tail)
+        t = (qs.get("t") or qs.get("start") or [None])[0]
+        start = _parse_yt_time(str(t)) if t else None
+        if vid:
+            return vid, start
+        m = _YT_ID_RE.search(value)
+        return (m.group(1) if m else None), start
+
+    # Plain ID?
+    if re.fullmatch(r"[0-9A-Za-z_-]{11}", value):
+        return value, None
+
+    m = _YT_ID_RE.search(value)
+    return (m.group(1) if m else None), None
+
+def is_youtube_url(u: str) -> bool:
+    """Return True for YouTube/YouTu.be watch/shorts/live urls."""
+    if not isinstance(u, str):
+        return False
+    v = u.lower()
+    return (
+        "youtube.com/watch" in v or
+        "youtube.com/live" in v or
+        "youtube.com/shorts" in v or
+        "youtu.be/" in v
+    )
+
+def patch_url_only_docs_with_extracted_text(docs: List[Dict[str, Any]],
+                                           url_rows: List[Dict[str, Any]],
+                                           max_workers: int = 5,
+                                           max_chars: Optional[int] = None) -> int:
+    """
+    For each URL-only KO (from MISSING_URL_CONTENT), fetch text and set ko_content_flat.
+    - docs: the already-emitted combined (and flattened) docs list
+    - url_rows: rows from MISSING_URL_CONTENT (logical_layer_id, first_url, ...)
+    - max_workers: parallelism for extractor calls (be nice to the service)
+    - max_chars: if set, truncate ko_content_flat to this many chars
+    Returns number of docs patched.
+    """
+    if not docs or not url_rows:
+        return 0
+
+    max_conc = int(os.getenv("EXTRACTOR_MAX_CONCURRENCY", "4"))
+    _sema = threading.BoundedSemaphore(max_conc)
+
+    # index docs by _orig_id for fast patching
+    index: Dict[str, Dict[str, Any]] = {}
+    for d in docs:
+        key = d.get("_orig_id") or d.get("_id")  # prefer _orig_id
+        if isinstance(key, str) and key:
+            index[key] = d
+
+    # build tasks (skip duplicates by logical_layer_id)
+    tasks = []
+    seen = set()
+    for row in url_rows:
+        llid = row.get("logical_layer_id")
+        first_url = row.get("first_url")
+        if not llid or not first_url or llid in seen:
+            continue
+        if llid not in index:
+            logging.info("[Patch] No matching doc in memory for _orig_id=%s (title=%r)", llid, row.get("title"))
+            continue
+        seen.add(llid)
+        tasks.append((llid, first_url))
+
+    if not tasks:
+        return 0
+
+    patched = 0
+
+    def _work(item):
+        llid, url = item
+        # stagger starts slightly to avoid burst
+        time.sleep(random.uniform(0.2, 0.8))
+        _sema.acquire()
+        try:
+            # You can reuse the global session you already have if desired:
+            sess = get_session(timeout=int(os.getenv("EXTRACTOR_HTTP_TIMEOUT", "35")))
+            # --- 1) YouTube: try captions first (fast, no download) ---
+            if is_youtube_url(url):
+                vid, _ = parse_youtube_value(url)
+                if vid:
+                    try:
+                        # env overrides are optional; commas allowed
+                        pref = [s.strip() for s in os.getenv("YT_CAP_PREF_LANGS", "en").split(",") if s.strip()]
+                        # if you prefer server-side EN translation first, set YT_CAP_TRANSLATE_TO=en
+                        translate_to = os.getenv("YT_CAP_TRANSLATE_TO") or None
+
+                        segs, lang_code = fetch_transcript_segments(
+                            vid,
+                            preferred_langs=pref,
+                            translate_to=translate_to,
+                            http_client=sess,
+                        )
+                        # Convert to plain text (your STT format uses start/end; mirror that)
+                        text_from_caps = "\n".join(s["text"] for s in segs if s.get("text"))
+                        # Return a tagged payload so the main loop can set source fields
+                        return (llid, url, text_from_caps, "youtube_captions")
+                    except Exception as cap_err:
+                        # Fall back to HTML extractor for YT pages if captions blocked/missing
+                        logging.info("[Patch] Captions unavailable for %s (%s): %s", llid, url, cap_err)
+
+            # --- 2) Generic HTML/article extraction path (your existing service) ---
+            text = fetch_url_text_with_extractor(
+                url,
+                timeout=int(os.getenv("EXTRACTOR_TIMEOUT", "150")),
+                retries=int(os.getenv("EXTRACTOR_RETRIES", "3")),
+                backoff=float(os.getenv("EXTRACTOR_BACKOFF", "1.6")),
+                min_chars=int(os.getenv("EXTRACTOR_MIN_CHARS", "100")),
+                session=sess,
+            )
+            return (llid, url, text, "external_url_extractor")
+        finally:
+            _sema.release()
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = [ex.submit(_work, t) for t in tasks]
+        for fut in as_completed(futures):
+            try:
+                res = fut.result()
+                if not isinstance(res, tuple):
+                    logging.error("[Patch] Unexpected worker result type: %r", type(res))
+                    continue
+
+                if len(res) == 3:
+                    llid, url, text = res
+                    source_tag = "external_url_extractor"  # sensible default
+                elif len(res) == 4:
+                    llid, url, text, source_tag = res
+                else:
+                    logging.error("[Patch] Unexpected worker result length: %d (res=%r)", len(res), res)
+                    continue
+            except Exception as e:
+                logging.error("[Patch] Worker error: %s", e)
+                continue
+
+            doc = index.get(llid)
+            if not doc:
+                continue
+
+            if not text:
+                # Mark well-known video hosts explicitly so downstream can treat them specially
+                if _is_video_url(url):
+                    doc["is_url_only"] = True
+                    doc["ko_content_source"] = "video_redirect"
+                    doc["ko_content_url"] = url
+
+                    # overwrite only if empty or the default placeholder from flattening
+                    existing = doc.get("ko_content_flat")
+                    if not existing or (isinstance(existing, str) and existing.strip().lower() == "no content present"):
+                        doc["ko_content_flat"] = "External video (no extractable page text)"
+
+                logging.info("[Patch] No text extracted for %s (%s)", llid, url)
+                continue
+
+            if isinstance(max_chars, int) and max_chars > 0:
+                text = text[:max_chars]
+
+            doc["ko_content_flat"] = text
+            doc["ko_content_source"] = "external_url_extractor"
+            doc["ko_content_url"] = url
+            patched += 1
+
+def is_url_based_ko(orig_doc: dict) -> tuple[bool, list[str]]:
+    """
+    Return (is_url_based, url_list).
+    A KO is URL-based if ANY resource item:
+      - has display_metadata.is_hosted == False, OR
+      - contains url/URL/link/href, OR
+      - has @id that is NOT one of your S3/self-hosted origins.
+    """
+    kor = orig_doc.get("knowledge_object_resources")
+    if not isinstance(kor, list):
+        return (False, [])
+
+    # Allow runtime configuration of what counts as "hosted by us"
+    host_hints = os.getenv("HOSTED_ORIGINS_HINTS",
+                           "s3.ugent.be,knowledge-object-prd,knowledge-object-dev").split(",")
+
+    def _looks_hosted(val: str) -> bool:
+        if not isinstance(val, str):
+            return False
+        v = val.lower()
+        return any(h.strip().lower() in v for h in host_hints if h.strip())
+
+    urls: list[str] = []
+
+    for item in kor:
+        if not isinstance(item, dict):
+            continue
+
+        # Explicit switch
+        dm = item.get("display_metadata") or {}
+        if dm.get("is_hosted") is False:
+            # harvest any link-like values for reporting
+            for k in ("url", "URL", "link", "href", "@id"):
+                v = item.get(k)
+                if isinstance(v, str) and v.strip():
+                    urls.append(v.strip())
+            return (True, urls or ["<no explicit URL field>"])
+
+        # Link-ish fields => URL-based
+        for k in ("url", "URL", "link", "href"):
+            v = item.get(k)
+            if isinstance(v, str) and v.strip():
+                urls.append(v.strip())
+
+        # @id that doesn't look like our hosted origin => URL-based
+        aid = item.get("@id")
+        if isinstance(aid, str) and aid.strip() and not _looks_hosted(aid):
+            urls.append(aid.strip())
+
+    return (len(urls) > 0, urls)
+
+def combine_metadata_and_content(metadata, content_list):
+    metadata_copy = metadata.copy()
+    metadata_copy['ko_content'] = content_list
+    return metadata_copy
+
 
