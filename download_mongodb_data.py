@@ -1,5 +1,6 @@
 # download_mongodb_data.py
 
+import random
 import threading
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -18,6 +19,10 @@ class BackendCfg(TypedDict):
     pwd: str
 
 ENV_CHOICES = {"DEV", "PRD"}
+
+# ---- Report for KOs that are URL-based but have no ko_content_document ----
+MISSING_URL_CONTENT = []          # list of dict rows for CSV/JSON report
+_MISSING_LOCK = threading.Lock()  # protect appends across worker threads
 
 def _load_backend_cfg(env_mode: str) -> BackendCfg:
     env_mode = (env_mode or "DEV").upper()
@@ -527,14 +532,43 @@ def process_document(doc, projects_collection):
             return None
 
         logical_layer_id = str(doc.get('_id', ''))
+
+        cleaned_doc["_orig_id"] = logical_layer_id
+
+        # ---- Skip ko_content_document for URL-only KOs (prevents 404 noise) ----
+        url_only, url_list = is_url_based_ko(doc)  # MUST use original doc
+        if url_only:
+            row = {
+                "logical_layer_id": str(doc.get("_id", "")),
+                "at_id": cleaned_doc.get("@id"),
+                "title": cleaned_doc.get("title"),
+                "first_url": (url_list[0] if url_list else None),
+                "url_count": len(url_list),
+            }
+            with _MISSING_LOCK:
+                MISSING_URL_CONTENT.append(row)
+
+            logging.warning(
+                "[URL-only KO] Skipping ko_content_document fetch; id=%r title=%r first_url=%s",
+                row["logical_layer_id"], row["title"], row["first_url"]
+            )
+
+            # Mark provenance for downstream consumers and debugging
+            cleaned_doc["is_url_only"] = True
+
+            combined = combine_metadata_and_content(cleaned_doc, [])
+            combined = flatten_ko_content(combined, mode=KO_CONTENT_MODE)
+
+            combined["_orig_id"] = logical_layer_id
+
+            return combined
+
         if not logical_layer_id:
             logging.warning("Skipping content fetch: missing _id for doc title=%r", cleaned_doc.get("title"))
             return None
 
         content_data = get_ko_content(logical_layer_id)
-
         combined = combine_metadata_and_content(cleaned_doc, content_data)
-
         combined = flatten_ko_content(combined, mode=KO_CONTENT_MODE)
 
         return combined
@@ -620,6 +654,231 @@ def _process_page(kos_page: List[Dict[str, Any]], workers: Optional[int] = None)
     return results
 
 
+def write_missing_url_content_report(output_root: str = "output") -> Optional[Dict[str, Any]]:
+    """Write JSON+CSV once per run for URL-only KOs (those we skipped fetching).
+
+    Files are saved alongside final_output_* in:
+      output/<ENV_MODE>/<YYYY>/<MM>/
+
+    Returns a small dict with:
+      - timestamp
+      - json_path
+      - csv_path
+      - count
+    or None if nothing to write.
+    """
+    try:
+        count = len(MISSING_URL_CONTENT)
+        if count == 0:
+            logging.info("[Report] No URL-only KOs to report; skipping report files.")
+            return None
+
+        # Use the same directory scheme as final_output_* files
+        env_dir, write_dir, year, month = _env_and_date_paths(output_root)
+        os.makedirs(write_dir, exist_ok=True)
+
+        ts = datetime.now().strftime("%d_%m-%Y_%H-%M-%S")
+
+        miss_json = os.path.join(write_dir, f"missing_url_content_{ts}.json")
+        miss_csv  = os.path.join(write_dir, f"missing_url_content_{ts}.csv")
+
+        logging.info(
+            "[Report] Preparing URL-only report for ENV=%s year=%s month=%s "
+            "(count=%s, dir=%s)",
+            (CURRENT_ENV_MODE or os.getenv("ENV_MODE") or "DEV"),
+            year,
+            month,
+            count,
+            write_dir,
+        )
+
+        with open(miss_json, "w", encoding="utf-8") as fh:
+            json.dump(MISSING_URL_CONTENT, fh, cls=CustomJSONEncoder, indent=2, ensure_ascii=False)
+
+        import csv
+        with open(miss_csv, "w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(
+                fh,
+                fieldnames=["logical_layer_id", "at_id", "title", "first_url", "url_count"]
+            )
+            writer.writeheader()
+            writer.writerows(MISSING_URL_CONTENT)
+
+        logging.warning(
+            "[Report] URL-only rows: %d → json=%s ; csv=%s",
+            count, miss_json, miss_csv,
+        )
+
+        return {
+            "timestamp": ts,
+            "json_path": miss_json,
+            "csv_path": miss_csv,
+            "count": count,
+        }
+    except Exception:
+        logging.exception("Failed to write missing URL-content report")
+        return None
+
+
+def _is_video_url(u: str) -> bool:
+    if not isinstance(u, str):
+        return False
+    u = u.lower()
+    return any(host in u for host in (
+        "youtube.com", "youtu.be", "vimeo.com", "dailymotion.com"
+    ))
+
+def is_youtube_url(u: str) -> bool:
+    """Return True for YouTube/YouTu.be watch/shorts/live urls."""
+    if not isinstance(u, str):
+        return False
+    v = u.lower()
+    return (
+        "youtube.com/watch" in v or
+        "youtube.com/live" in v or
+        "youtube.com/shorts" in v or
+        "youtu.be/" in v
+    )
+
+def patch_url_only_docs_with_extracted_text(docs: List[Dict[str, Any]],
+                                           url_rows: List[Dict[str, Any]],
+                                           max_workers: int = 5,
+                                           max_chars: Optional[int] = None) -> int:
+    """
+    For each URL-only KO (from MISSING_URL_CONTENT), fetch text and set ko_content_flat.
+    - docs: the already-emitted combined (and flattened) docs list
+    - url_rows: rows from MISSING_URL_CONTENT (logical_layer_id, first_url, ...)
+    - max_workers: parallelism for extractor calls (be nice to the service)
+    - max_chars: if set, truncate ko_content_flat to this many chars
+    Returns number of docs patched.
+    """
+    if not docs or not url_rows:
+        return 0
+
+    max_conc = int(os.getenv("EXTRACTOR_MAX_CONCURRENCY", "4"))
+    _sema = threading.BoundedSemaphore(max_conc)
+
+    # index docs by _orig_id for fast patching
+    index: Dict[str, Dict[str, Any]] = {}
+    for d in docs:
+        key = d.get("_orig_id") or d.get("_id")  # prefer _orig_id
+        if isinstance(key, str) and key:
+            index[key] = d
+
+    # build tasks (skip duplicates by logical_layer_id)
+    tasks = []
+    seen = set()
+    for row in url_rows:
+        llid = row.get("logical_layer_id")
+        first_url = row.get("first_url")
+        if not llid or not first_url or llid in seen:
+            continue
+        if llid not in index:
+            logging.info("[Patch] No matching doc in memory for _orig_id=%s (title=%r)", llid, row.get("title"))
+            continue
+        seen.add(llid)
+        tasks.append((llid, first_url))
+
+    if not tasks:
+        return 0
+
+    patched = 0
+
+    def _work(item):
+        llid, url = item
+        # stagger starts slightly to avoid burst
+        time.sleep(random.uniform(0.2, 0.8))
+        _sema.acquire()
+        try:
+            # You can reuse the global session you already have if desired:
+            sess = get_session(timeout=int(os.getenv("EXTRACTOR_HTTP_TIMEOUT", "35")))
+            # --- 1) YouTube: try captions first (fast, no download) ---
+            if is_youtube_url(url):
+                vid, _ = parse_youtube_value(url)
+                if vid:
+                    try:
+                        # env overrides are optional; commas allowed
+                        pref = [s.strip() for s in os.getenv("YT_CAP_PREF_LANGS", "en").split(",") if s.strip()]
+                        # if you prefer server-side EN translation first, set YT_CAP_TRANSLATE_TO=en
+                        translate_to = os.getenv("YT_CAP_TRANSLATE_TO") or None
+
+                        segs, lang_code = fetch_transcript_segments(
+                            vid,
+                            preferred_langs=pref,
+                            translate_to=translate_to,
+                            http_client=sess,  # shares cookies/proxies if you set them on the session
+                        )
+                        # Convert to plain text (your STT format uses start/end; mirror that)
+                        text_from_caps = "\n".join(s["text"] for s in segs if s.get("text"))
+                        # Return a tagged payload so the main loop can set source fields
+                        return (llid, url, text_from_caps, "youtube_captions")
+                    except Exception as cap_err:
+                        # Fall back to HTML extractor for YT pages if captions blocked/missing
+                        logging.info("[Patch] Captions unavailable for %s (%s): %s", llid, url, cap_err)
+
+            # --- 2) Generic HTML/article extraction path (your existing service) ---
+            text = fetch_url_text_with_extractor(
+                url,
+                timeout=int(os.getenv("EXTRACTOR_TIMEOUT", "150")),
+                retries=int(os.getenv("EXTRACTOR_RETRIES", "3")),
+                backoff=float(os.getenv("EXTRACTOR_BACKOFF", "1.6")),
+                min_chars=int(os.getenv("EXTRACTOR_MIN_CHARS", "100")),
+                session=sess,
+            )
+            return (llid, url, text, "external_url_extractor")
+        finally:
+            _sema.release()
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = [ex.submit(_work, t) for t in tasks]
+        for fut in as_completed(futures):
+            try:
+                res = fut.result()
+                if not isinstance(res, tuple):
+                    logging.error("[Patch] Unexpected worker result type: %r", type(res))
+                    continue
+
+                if len(res) == 3:
+                    llid, url, text = res
+                    source_tag = "external_url_extractor"  # sensible default
+                elif len(res) == 4:
+                    llid, url, text, source_tag = res
+                else:
+                    logging.error("[Patch] Unexpected worker result length: %d (res=%r)", len(res), res)
+                    continue
+            except Exception as e:
+                logging.error("[Patch] Worker error: %s", e)
+                continue
+
+            doc = index.get(llid)
+            if not doc:
+                continue
+
+            if not text:
+                # Mark well-known video hosts explicitly so downstream can treat them specially
+                if _is_video_url(url):
+                    doc["is_url_only"] = True
+                    doc["ko_content_source"] = "video_redirect"
+                    doc["ko_content_url"] = url
+
+                    # overwrite only if empty or the default placeholder from flattening
+                    existing = doc.get("ko_content_flat")
+                    if not existing or (isinstance(existing, str) and existing.strip().lower() == "no content present"):
+                        doc["ko_content_flat"] = "External video (no extractable page text)"
+
+                logging.info("[Patch] No text extracted for %s (%s)", llid, url)
+                continue
+
+            if isinstance(max_chars, int) and max_chars > 0:
+                text = text[:max_chars]
+
+            doc["ko_content_flat"] = text
+            doc["ko_content_source"] = "external_url_extractor"
+            doc["ko_content_url"] = url
+            patched += 1
+
+    return patched
+
 def get_ko_metadata(max_workers: int = 10, page_size: Optional[int] = None, sort_criteria: int = 1):
     """
     Fetch KO metadata from HTTP API (not Mongo), enrich with projects (HTTP API),
@@ -674,21 +933,52 @@ def get_ko_metadata(max_workers: int = 10, page_size: Optional[int] = None, sort
         logging.warning("[Process] emitted=%s, dropped=%s, elapsed=%.2fs",
                         total_emitted, total_dropped, time.perf_counter() - t0)
 
-        # Save once at the end
-        if total_emitted == 0:
-            out_path = save_results([])
-        else:
-            out_path = save_results(combined_results_all)
+        patched_count = patch_url_only_docs_with_extracted_text(
+            combined_results_all,
+            MISSING_URL_CONTENT,
+            max_workers=int(os.getenv("EXTRACTOR_WORKERS", "5")),
+            max_chars=None
+        )
 
-        return {
+        logging.info(
+            "[Patch] URL-only docs patched=%s; remaining_after_patch=%s",
+            patched_count, len(MISSING_URL_CONTENT),
+        )
+
+        # Keep only those that STILL lack ko_content_flat
+        remaining = []
+        by_id = {d.get("_orig_id") or d.get("_id"): d for d in combined_results_all}
+        for row in MISSING_URL_CONTENT:
+            doc = by_id.get(row.get("logical_layer_id"))
+            if not doc:
+                remaining.append(row)
+                continue
+            kcf = doc.get("ko_content_flat")
+            if (not kcf) or (isinstance(kcf, str) and kcf.strip().lower() == "no content present"):
+                remaining.append(row)
+
+        with _MISSING_LOCK:
+            MISSING_URL_CONTENT[:] = remaining
+
+        # Save once at the end
+        write_missing_url_content_report()
+
+        if total_emitted == 0:
+            saved_path = save_results([])
+        else:
+            saved_path = save_results(combined_results_all)
+
+        summary = {
             "emitted": total_emitted,
             "dropped": total_dropped,
-            "output_file": out_path,
+            "url_only_remaining": len(MISSING_URL_CONTENT),
+            "saved_path": saved_path,
         }
+        return summary
 
-    except Exception as e:
-        logging.error(f"Error fetching metadata via API: {e}")
-        return {"emitted": 0, "dropped": 0, "output_file": None}
+    except Exception:
+        logging.exception("Error in get_ko_metadata run")
+        return None
 
 
 def get_ko_content(document_id: str) -> List[dict]:
@@ -697,55 +987,63 @@ def get_ko_content(document_id: str) -> List[dict]:
     API expects the original KO _id as 'document_id' (same as our pre-save _id).
     Returns a list of content docs; we then clean them as before.
     """
-    try:
-        base = api_base()
-        url = f"{base}/api/nlp/ko_content_document"
-        params = {"document_id": document_id}
+    base = api_base()
+    url = f"{base}/api/nlp/ko_content_document"
+    params = {"document_id": document_id}
 
+    try:
         s = get_session()
         r = s.get(url, params=params)
-
+        if r.status_code == 404:
+            # Benign: no extracted text available for this KO
+            if os.getenv("LOG_CONTENT_404", "0") == "1":
+                logging.info("[Content API] %s → 404 Not Found (no content)", document_id)
+            else:
+                logging.debug("[Content API] %s → 404 Not Found (no content)", document_id)
+            return []
         r.raise_for_status()
-
         body = r.json()
-
-        # Normalise to list
-        if isinstance(body, dict):
-            # pick common containers if present
-            if "data" in body and isinstance(body["data"], list):
-                items = body["data"]
-            elif "results" in body and isinstance(body["results"], list):
-                items = body["results"]
-            elif "content" in body and isinstance(body["content"], list):
-                items = body["content"]
-            else:
-                # single dict payload
-                items = [body]
-        elif isinstance(body, list):
-            items = body
-        elif isinstance(body, str):
-            items = [body]
-        else:
-            items = []
-
-        # Coerce strings → dicts with a single text field
-        normalised: List[dict] = []
-        for el in items:
-            if isinstance(el, dict):
-                normalised.append(clean_ko_content(el))
-            elif isinstance(el, str):
-                normalised.append({"content_text": el})
-            else:
-                # ignore unknown shapes
-                continue
-
-        if not normalised:
-            logging.warning(f"[Content API] {document_id} → 0 item(s) after normalisation")
-
-        return normalised
-    except Exception as e:
-        logging.error(f"Error fetching content via API for {document_id}: {e}")
+    except requests.HTTPError as e:
+        # Non-404 HTTP errors—keep them visible but don't explode the run
+        status = getattr(e.response, "status_code", None)
+        logging.error("Error fetching content via API for %s: HTTP %s %s",
+                      document_id, status, e)
         return []
+    except Exception as e:
+        logging.error("Error fetching content via API for %s: %s", document_id, e)
+        return []
+
+    # Normalise to list
+    if isinstance(body, dict):
+        if "data" in body and isinstance(body["data"], list):
+            items = body["data"]
+        elif "results" in body and isinstance(body["results"], list):
+            items = body["results"]
+        elif "content" in body and isinstance(body["content"], list):
+            items = body["content"]
+        else:
+            items = [body]
+    elif isinstance(body, list):
+        items = body
+    elif isinstance(body, str):
+        items = [body]
+    else:
+        items = []
+
+    # Coerce strings → dicts with a single text field
+    normalised: List[dict] = []
+    for el in items:
+        if isinstance(el, dict):
+            normalised.append(clean_ko_content(el))
+        elif isinstance(el, str):
+            normalised.append({"content_text": el})
+        else:
+            continue
+
+    if not normalised:
+        logging.warning("[Content API] %s → 0 item(s) after normalisation", document_id)
+
+    return normalised
 
 # Run the function
 if __name__ == "__main__":
@@ -758,7 +1056,13 @@ if __name__ == "__main__":
     mw = int(os.getenv("DL_MAX_WORKERS", "10"))
     sc = int(os.getenv("DL_SORT_CRITERIA", "1"))
 
-    logging.info("Active ENV_MODE=%s; backend=%s", CURRENT_ENV_MODE, CURRENT_BACKEND["host"])
+    backend_host = None
+    try:
+        backend_host = (CURRENT_BACKEND or {}).get("host")
+    except Exception:
+        backend_host = "<unknown>"
+
+    logging.info("Active ENV_MODE=%s; backend=%s", CURRENT_ENV_MODE, backend_host)
 
     get_ko_metadata(
         max_workers=mw,

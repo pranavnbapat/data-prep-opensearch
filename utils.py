@@ -4,6 +4,7 @@ import glob
 import json
 import logging
 import os
+import random
 import re
 import sys
 import time
@@ -14,12 +15,14 @@ from datetime import datetime, timezone
 from dateutil import parser as du_parser
 from html import unescape
 from types import SimpleNamespace
-from typing import Iterable, List, Optional, Callable, Dict, Any, TypedDict
-from urllib.parse import urlparse, urlunparse
+from typing import Iterable, List, Optional, Callable, Dict, Any, TypedDict, Tuple
+from urllib.parse import urlparse, urlunparse, parse_qs
 from urllib3.util.retry import Retry
+from youtube_transcript_api import YouTubeTranscriptApi
 
 import requests
 
+from requests import Session
 from requests.adapters import HTTPAdapter
 
 
@@ -239,7 +242,7 @@ def flatten_ko_content(doc: dict, mode: str = "flat_only", empty_sentinel: str =
     # Build ko_content_flat
     if flat_pages:
         doc["ko_content_flat"] = flat_pages
-        doc["ko_content_flat"] = clean_ko_content(flat_pages) if flat_pages else empty_sentinel
+        doc["ko_content_flat"] = clean_ko_content_chunks(flat_pages) if flat_pages else empty_sentinel
     else:
         # As requested, use a string sentinel instead of an empty list
         doc["ko_content_flat"] = empty_sentinel
@@ -512,7 +515,7 @@ def fetch_projects(
     return index
 
 
-def clean_ko_content(chunks: list[str]) -> str:
+def clean_ko_content_chunks(chunks: list[str]) -> str:
     """
     Clean a list of text fragments extracted from PDFs/JSON for search/embedding.
     Keeps paragraphs; removes page furniture and common PDF artefacts.
@@ -617,3 +620,211 @@ def clean_ko_content(chunks: list[str]) -> str:
 
     return s
 
+def fetch_url_text_with_extractor(
+    url: str,
+    timeout: Optional[int] = None,
+    retries: int = None,
+    backoff: float = None,
+    min_chars: int = None,
+    session: Optional[requests.Session] = None,
+) -> Optional[str]:
+    """
+    Calls your text-extractor:
+      GET {EXTRACTOR_BASE}/api/extract?url=<encoded>
+    Returns raw extracted text (str) or None on failure.
+    """
+    base = os.getenv("URL_CONTENT_EXTRACTOR_BASE", "https://pagesense.nexavion.com").rstrip("/")
+    endpoint = f"{base}/api/extract"
+    timeout = int(os.getenv("EXTRACTOR_TIMEOUT", str(timeout or 720)))
+    retries = int(os.getenv("EXTRACTOR_RETRIES", str(retries or 3)))
+    backoff = float(os.getenv("EXTRACTOR_BACKOFF", str(backoff or 1.6)))
+    min_chars = int(os.getenv("EXTRACTOR_MIN_CHARS", str(min_chars or 100)))
+
+    sess = session or requests.Session()
+
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            # small pre-call jitter to avoid thundering herd
+            time.sleep(random.uniform(0.15, 0.45))
+
+            r = sess.get(endpoint, params={"url": url}, timeout=timeout)
+            if r.status_code == 429 or 500 <= r.status_code < 600:
+                raise requests.HTTPError(f"HTTP {r.status_code}", response=r)
+            if r.status_code != 200:
+                return None
+
+            body = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+            if not body or not body.get("ok"):
+                return None
+
+            text = (body.get("text") or "").strip()
+            if len(text) < min_chars:
+                return None
+            return text
+
+        except (requests.Timeout, requests.ConnectionError, requests.HTTPError) as e:
+            last_err = e
+            if attempt < retries:
+                # exponential backoff + jitter
+                delay = (backoff ** attempt) + random.uniform(0.2, 0.6)
+                time.sleep(delay)
+                continue
+            return None
+        except Exception as e:
+            last_err = e
+            return None
+
+def fetch_transcript_segments(
+    video_id: str,
+    preferred_langs: Optional[List[str]] = None,
+    translate_to: Optional[str] = None,
+    http_client: Optional[Session] = None,
+) -> Tuple[List[Dict], str]:
+    """
+    Returns (segments, lang_code). Each segment is {text, start, duration}.
+    May raise TranscriptsDisabled / NoTranscriptFound / CouldNotRetrieveTranscript.
+    """
+    preferred_langs = preferred_langs or ["en"]
+    ytt = YouTubeTranscriptApi(http_client=http_client)
+
+    if translate_to:
+        # Ask YT to translate an existing track server-side
+        tl = ytt.list(video_id).find_transcript(preferred_langs)
+        tl = tl.translate(translate_to)
+        segs = tl.fetch().to_raw_data()
+        return segs, translate_to
+
+    # Normal: fetch one of the preferred languages
+    fetched = ytt.fetch(video_id, languages=preferred_langs)
+    # .fetch(...) in recent versions returns a FetchedTranscript; use .to_raw_data()
+    segs = fetched.to_raw_data()
+    # Best-effort lang code; fall back to the first preferred
+    lang_code = getattr(fetched, "language_code", preferred_langs[0])
+    return segs, lang_code
+
+_YT_ID_RE = re.compile(
+    r'(?:youtu\.be/|youtube\.com/(?:watch\?v=|embed/|shorts/))([0-9A-Za-z_-]{11})'
+)
+
+def _parse_yt_time(t: str) -> int:
+    """
+    Parse YouTube-style time fragments into seconds.
+    Accepts e.g. '55', '55s', '1m30s', '2h3m', '90', 'start=75', etc.
+    """
+    if not isinstance(t, str):
+        return 0
+    t = t.strip().lower()
+    if t.isdigit():  # plain seconds like "55" or "90"
+        return int(t)
+
+    total = 0
+    # match sequences like 2h, 3m, 45s in any order
+    for val, unit in re.findall(r'(\d+)([hms])', t):
+        n = int(val)
+        if unit == 'h':
+            total += n * 3600
+        elif unit == 'm':
+            total += n * 60
+        else:
+            total += n
+
+    if total:
+        return total
+
+    # last-ditch: pull first integer substring
+    m = re.search(r'\d+', t)
+    return int(m.group(0)) if m else 0
+
+def parse_youtube_value(value: str) -> tuple[str | None, int | None]:
+    """
+    Accepts raw ID or any common YT URL (optionally with t=/start=) and returns (video_id, start_seconds).
+    """
+    value = (value or "").strip()
+    if not value:
+        return None, None
+
+    # Full URL?
+    if value.startswith(("http://", "https://")):
+        u = urlparse(value)
+        qs = parse_qs(u.query)
+        vid = (qs.get("v") or [None])[0]
+        if not vid:
+            m = _YT_ID_RE.search(value)
+            if m:
+                vid = m.group(1)
+        start = None
+        t = (qs.get("t") or qs.get("start") or [None])[0]
+        if t:
+            start = _parse_yt_time(str(t))
+        return vid, start
+
+    # Raw "ID&t=..."?
+    if "&" in value:
+        head, tail = value.split("&", 1)
+        vid = head if re.fullmatch(r"[0-9A-Za-z_-]{11}", head) else None
+        qs = parse_qs(tail)
+        t = (qs.get("t") or qs.get("start") or [None])[0]
+        start = _parse_yt_time(str(t)) if t else None
+        if vid:
+            return vid, start
+        m = _YT_ID_RE.search(value)
+        return (m.group(1) if m else None), start
+
+    # Plain ID?
+    if re.fullmatch(r"[0-9A-Za-z_-]{11}", value):
+        return value, None
+
+    m = _YT_ID_RE.search(value)
+    return (m.group(1) if m else None), None
+
+def is_url_based_ko(orig_doc: dict) -> tuple[bool, list[str]]:
+    """
+    Return (is_url_based, url_list).
+    A KO is URL-based if ANY resource item:
+      - has display_metadata.is_hosted == False, OR
+      - contains url/URL/link/href, OR
+      - has @id that is NOT one of  S3/self-hosted origins.
+    """
+    kor = orig_doc.get("knowledge_object_resources")
+    if not isinstance(kor, list):
+        return (False, [])
+
+    # Allow runtime configuration
+    host_hints = os.getenv("HOSTED_ORIGINS_HINTS",
+                           "s3.ugent.be,knowledge-object-prd,knowledge-object-dev").split(",")
+
+    def _looks_hosted(val: str) -> bool:
+        if not isinstance(val, str):
+            return False
+        v = val.lower()
+        return any(h.strip().lower() in v for h in host_hints if h.strip())
+
+    urls: list[str] = []
+
+    for item in kor:
+        if not isinstance(item, dict):
+            continue
+
+        # Explicit switch
+        dm = item.get("display_metadata") or {}
+        if dm.get("is_hosted") is False:
+            # harvest any link-like values for reporting
+            for k in ("url", "URL", "link", "href", "@id"):
+                v = item.get(k)
+                if isinstance(v, str) and v.strip():
+                    urls.append(v.strip())
+            return (True, urls or ["<no explicit URL field>"])
+
+        # Link-ish fields => URL-based
+        for k in ("url", "URL", "link", "href"):
+            v = item.get(k)
+            if isinstance(v, str) and v.strip():
+                urls.append(v.strip())
+
+        # @id that doesn't look like our hosted origin => URL-based
+        aid = item.get("@id")
+        if isinstance(aid, str) and aid.strip() and not _looks_hosted(aid):
+            urls.append(aid.strip())
+
+    return (len(urls) > 0, urls)
