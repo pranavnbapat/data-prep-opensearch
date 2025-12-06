@@ -654,6 +654,42 @@ def _process_page(kos_page: List[Dict[str, Any]], workers: Optional[int] = None)
     return results
 
 
+def load_latest_snapshot_index(output_root: str = "output") -> Dict[str, Dict[str, Any]]:
+    """
+    Load the latest final_output_* snapshot (if any) and return an index by _orig_id.
+    Used as a cache so we can reuse previously extracted ko_content_flat for URL-only KOs.
+
+    Returns: { "<logical_layer_id>": doc, ... }
+    """
+    env_dir, _, _, _ = _env_and_date_paths(output_root)
+
+    existing_files = sorted(
+        glob.glob(os.path.join(env_dir, "**", "final_output_*.json"), recursive=True),
+        reverse=True,
+    )
+    if not existing_files:
+        return {}
+
+    latest_file = existing_files[0]
+    try:
+        with open(latest_file, "r", encoding="utf-8") as fh:
+            docs = json.load(fh) or []
+    except Exception as e:
+        logging.warning("Could not load latest snapshot %s for cache reuse: %s", latest_file, e)
+        return {}
+
+    index: Dict[str, Dict[str, Any]] = {}
+    for d in docs:
+        if not isinstance(d, dict):
+            continue
+        key = d.get("_orig_id") or d.get("_id")
+        if isinstance(key, str) and key:
+            index[key] = d
+
+    logging.info("Loaded %d docs from latest snapshot cache %s", len(index), latest_file)
+    return index
+
+
 def write_missing_url_content_report(output_root: str = "output") -> Optional[Dict[str, Any]]:
     """Write JSON+CSV once per run for URL-only KOs (those we skipped fetching).
 
@@ -740,10 +776,13 @@ def is_youtube_url(u: str) -> bool:
         "youtu.be/" in v
     )
 
-def patch_url_only_docs_with_extracted_text(docs: List[Dict[str, Any]],
-                                           url_rows: List[Dict[str, Any]],
-                                           max_workers: int = 5,
-                                           max_chars: Optional[int] = None) -> int:
+def patch_url_only_docs_with_extracted_text(
+    docs: List[Dict[str, Any]],
+    url_rows: List[Dict[str, Any]],
+    max_workers: int = 5,
+    max_chars: Optional[int] = None,
+    previous_index: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> int:
     """
     For each URL-only KO (from MISSING_URL_CONTENT), fetch text and set ko_content_flat.
     - docs: the already-emitted combined (and flattened) docs list
@@ -759,28 +798,59 @@ def patch_url_only_docs_with_extracted_text(docs: List[Dict[str, Any]],
     _sema = threading.BoundedSemaphore(max_conc)
 
     # index docs by _orig_id for fast patching
+    # index docs by _orig_id for fast patching
     index: Dict[str, Dict[str, Any]] = {}
     for d in docs:
         key = d.get("_orig_id") or d.get("_id")  # prefer _orig_id
         if isinstance(key, str) and key:
             index[key] = d
 
+    prev_index = previous_index or {}
+
     # build tasks (skip duplicates by logical_layer_id)
     tasks = []
     seen = set()
+    reused = 0
+
     for row in url_rows:
         llid = row.get("logical_layer_id")
         first_url = row.get("first_url")
         if not llid or not first_url or llid in seen:
             continue
-        if llid not in index:
+
+        cur_doc = index.get(llid)
+        if not cur_doc:
             logging.info("[Patch] No matching doc in memory for _orig_id=%s (title=%r)", llid, row.get("title"))
             continue
+
+        # ---- Reuse cached content if we already have text for the same URL ----
+        prev_doc = prev_index.get(str(llid))
+        if prev_doc:
+            prev_flat = prev_doc.get("ko_content_flat")
+            prev_url = prev_doc.get("ko_content_url") or prev_doc.get("first_url")
+
+            # Reuse only when:
+            #   - we have non-empty ko_content_flat, and
+            #   - URL did not change
+            if prev_flat and (not prev_url or prev_url == first_url):
+                cur_doc["ko_content_flat"] = prev_flat
+                if prev_doc.get("ko_content_source"):
+                    cur_doc["ko_content_source"] = prev_doc["ko_content_source"]
+                if prev_url:
+                    cur_doc["ko_content_url"] = prev_url
+                reused += 1
+                seen.add(llid)
+                continue  # no PageSense hit for this KO
+
         seen.add(llid)
         tasks.append((llid, first_url))
 
+    if reused:
+        logging.info("[Patch] Reused cached extracted text for %d URL-only KOs (no extractor call).", reused)
+
     if not tasks:
-        return 0
+        # Nothing left that actually needs extraction
+        return reused
 
     patched = 0
 
@@ -887,6 +957,9 @@ def get_ko_metadata(max_workers: int = 10, page_size: Optional[int] = None, sort
     - max_pages: None -> walk all pages; else stop after N pages
     """
     try:
+        # Load latest snapshot as a cache to avoid re-hitting the extractor
+        previous_index = load_latest_snapshot_index()
+
         page = 1
         pages_seen = set()
         total_emitted = 0
@@ -937,7 +1010,8 @@ def get_ko_metadata(max_workers: int = 10, page_size: Optional[int] = None, sort
             combined_results_all,
             MISSING_URL_CONTENT,
             max_workers=int(os.getenv("EXTRACTOR_WORKERS", "5")),
-            max_chars=None
+            max_chars=None,
+            previous_index=previous_index,
         )
 
         logging.info(
