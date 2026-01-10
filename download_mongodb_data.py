@@ -865,6 +865,15 @@ def patch_url_only_docs_with_extracted_text(
         if not llid or not first_url or llid in seen:
             continue
 
+        # ---- ignore video hosts entirely (no extractor calls) ----
+        # These typically don't have extractable article text and often trigger browser fallbacks.
+        if _is_video_url(first_url):
+            logging.info(
+                "[Patch] Skipping video URL-only KO: id=%s title=%r url=%s",
+                llid, row.get("title"), first_url
+            )
+            continue
+
         cur_doc = index.get(llid)
         if not cur_doc:
             logging.info("[Patch] No matching doc in memory for _orig_id=%s (title=%r)", llid, row.get("title"))
