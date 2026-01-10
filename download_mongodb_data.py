@@ -239,6 +239,50 @@ def _valid_year(yyyy: str, min_year=1000, max_year=2100) -> bool:
         return False
 
 
+def extract_first_resource_file_info(doc: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Pull file metadata (extension/mimetype/size/name) from the first knowledge_object_resources item.
+    Returns a flat dict suitable to merge into cleaned metadata.
+
+    We intentionally only look at index 0 to keep output stable and small.
+    """
+    kor = doc.get("knowledge_object_resources")
+    if not isinstance(kor, list) or not kor:
+        return {}
+
+    first = kor[0]
+    if not isinstance(first, dict):
+        return {}
+
+    dm = first.get("display_metadata") or {}
+    kfd = first.get("ko_file_details") or {}
+
+    out: Dict[str, Any] = {}
+
+    # Prefer ko_file_details when present (it’s the most explicit)
+    if isinstance(kfd, dict):
+        out["ko_object_name"] = kfd.get("object_name")
+        out["ko_object_extension"] = kfd.get("object_extension")
+        out["ko_object_size"] = kfd.get("object_size")
+        out["ko_object_mimetype"] = kfd.get("object_mimetype")
+        # out["ko_object_hash"] = kfd.get("object_hash")
+        out["ko_upload_source"] = kfd.get("upload_source")
+        out["ko_file_id"] = kfd.get("@id")  # often same as resource @id
+
+    # Also capture hosted/external info (useful for URL-only vs hosted)
+    if isinstance(dm, dict):
+        out["ko_is_hosted"] = dm.get("is_hosted")
+        out["ko_hosted_mime_type"] = dm.get("hosted_mime_type")
+        out["ko_external_content_type"] = dm.get("external_content_type")
+
+    # Resource @id can be useful even when ko_file_details is missing
+    # out["ko_resource_at_id"] = first.get("@id")
+    out["ko_resource_language"] = first.get("language")
+
+    # Drop blanks
+    return {k: v for k, v in out.items() if not _is_blank(v)}
+
+
 def clean_ko_metadata(doc):
     """
     Cleans metadata fields while preserving original case.
@@ -252,6 +296,9 @@ def clean_ko_metadata(doc):
     }
 
     cleaned = {key: value for key, value in doc.items() if key not in fields_to_exclude}
+
+    # ---- NEW: preserve file info from first knowledge_object_resources item ----
+    cleaned.update(extract_first_resource_file_info(doc))
 
     raw_date = doc.get("date_of_completion")
     parsed = normalize_date_to_yyyy_mm_dd(raw_date)
@@ -943,7 +990,7 @@ def patch_url_only_docs_with_extracted_text(
                 text = text[:max_chars]
 
             doc["ko_content_flat"] = text
-            doc["ko_content_source"] = "external_url_extractor"
+            doc["ko_content_source"] = source_tag
             doc["ko_content_url"] = url
             patched += 1
 
