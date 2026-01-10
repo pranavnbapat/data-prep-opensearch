@@ -9,7 +9,8 @@ services:
       - .env
     volumes:
       - ./output:/app/output
-    restart: unless-stopped
+    restart: always
+    user: "${UID}:${GID}"
     healthcheck:
       test: [ "CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0) if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3).status==200 else sys.exit(1)\"" ]
       interval: 30s
@@ -26,5 +27,6 @@ services:
       - data-prep-opensearch
     env_file:
       - .env
-    restart: unless-stopped
+    restart: always
+    user: "${UID}:${GID}"
 
