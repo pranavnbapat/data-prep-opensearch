@@ -24,6 +24,10 @@ ENV_CHOICES = {"DEV", "PRD"}
 MISSING_URL_CONTENT = []          # list of dict rows for CSV/JSON report
 _MISSING_LOCK = threading.Lock()  # protect appends across worker threads
 
+MISSING_MEDIA_TRANSCRIPT = []     # list of dict rows
+_MEDIA_LOCK = threading.Lock()
+
+
 def _load_backend_cfg(env_mode: str) -> BackendCfg:
     env_mode = (env_mode or "DEV").upper()
     if env_mode not in ENV_CHOICES:
@@ -614,6 +618,41 @@ def process_document(doc, projects_collection):
             logging.warning("Skipping content fetch: missing _id for doc title=%r", cleaned_doc.get("title"))
             return None
 
+        # ---- media transcription for hosted video/audio ----
+        mimetype = cleaned_doc.get("ko_object_mimetype")
+        if _is_media_mimetype(mimetype):
+            media_url = extract_first_resource_url(doc)  # must use original doc for resources
+            # Skip YouTube explicitly even if it appears here
+            if media_url and is_youtube_url(media_url):
+                logging.info("[Media] Skipping YouTube media KO id=%s title=%r url=%s",
+                             logical_layer_id, cleaned_doc.get("title"), media_url)
+            elif media_url:
+                row = {
+                    "logical_layer_id": str(doc.get("_id", "")),
+                    "at_id": cleaned_doc.get("@id"),
+                    "title": cleaned_doc.get("title"),
+                    "media_url": media_url,
+                    "mimetype": mimetype,
+                }
+                with _MEDIA_LOCK:
+                    MISSING_MEDIA_TRANSCRIPT.append(row)
+
+                logging.warning("[Media] Enqueued for transcription id=%s title=%r mimetype=%s url=%s",
+                                row["logical_layer_id"], row["title"], row["mimetype"], row["media_url"])
+
+                # Mark provenance
+                cleaned_doc["is_media"] = True
+                cleaned_doc["media_mimetype"] = mimetype
+
+                combined = combine_metadata_and_content(cleaned_doc, [])
+                combined = flatten_ko_content(combined, mode=KO_CONTENT_MODE)
+                combined["_orig_id"] = logical_layer_id
+                return combined
+            else:
+                logging.warning("[Media] No media_url found for KO id=%s title=%r mimetype=%s; falling back to ko_content_document",
+                                logical_layer_id, cleaned_doc.get("title"), mimetype)
+
+
         content_data = get_ko_content(logical_layer_id)
         combined = combine_metadata_and_content(cleaned_doc, content_data)
         combined = flatten_ko_content(combined, mode=KO_CONTENT_MODE)
@@ -802,6 +841,45 @@ def write_missing_url_content_report(output_root: str = "output") -> Optional[Di
         logging.exception("Failed to write missing URL-content report")
         return None
 
+def _is_media_mimetype(m: Any) -> bool:
+    if not isinstance(m, str):
+        return False
+    m = m.lower().strip()
+    return (m == "video/mp4") or m.startswith("audio/")
+
+def extract_first_resource_url(doc: Dict[str, Any]) -> Optional[str]:
+    """
+    Best-effort: pull a usable URL from the first knowledge_object_resources item.
+    We try common fields used in KO resources / display_metadata.
+    """
+    kor = doc.get("knowledge_object_resources")
+    if not isinstance(kor, list) or not kor:
+        return None
+
+    first = kor[0]
+    if not isinstance(first, dict):
+        return None
+
+    dm = first.get("display_metadata") or {}
+    if not isinstance(dm, dict):
+        dm = {}
+
+    # Try common patterns (adjust as per your real schema if you know the exact field)
+    candidates = [
+        first.get("url"),
+        first.get("download_url"),
+        first.get("href"),
+        first.get("link"),
+        dm.get("hosted_url"),
+        dm.get("external_url"),
+        dm.get("resource_url"),
+        first.get("@id"),  # sometimes this is a resolvable URL
+    ]
+    for u in candidates:
+        if isinstance(u, str) and u.strip():
+            return u.strip()
+
+    return None
 
 def _is_video_url(u: str) -> bool:
     if not isinstance(u, str):
@@ -822,6 +900,129 @@ def is_youtube_url(u: str) -> bool:
         "youtube.com/shorts" in v or
         "youtu.be/" in v
     )
+
+def transcribe_media_url(url: str, session: requests.Session) -> str:
+    """
+    Calls your transcription endpoint. Assumes it accepts JSON: {"url": "..."}.
+    Adjust request/response parsing to match your service.
+    """
+    endpoint = os.getenv("TRANSCRIBE_ENDPOINT_URL", "https://media-transcriber.nexavion.com/transcribe").strip()
+    if not endpoint:
+        raise RuntimeError("TRANSCRIBE_ENDPOINT_URL env var is not set")
+
+    # You want to skip YouTube completely
+    if is_youtube_url(url):
+        return ""
+
+    whisper_model = os.getenv("WHISPER_MODEL", "large-v1").strip()
+
+    r = session.post(
+        endpoint,
+        json={"url": url, "whisper_model": whisper_model},
+        timeout=int(os.getenv("TRANSCRIBE_HTTP_TIMEOUT", "3600")),
+    )
+    r.raise_for_status()
+
+    # Be defensive: response might not be JSON even on 200
+    try:
+        body = r.json()
+    except ValueError:
+        return ""
+
+    # ---- service-specific response shape ----
+    if isinstance(body, dict):
+        whisper = body.get("whisper")
+        if isinstance(whisper, dict):
+            text = whisper.get("text")
+            if isinstance(text, str) and text.strip():
+                return text.strip()
+
+        # Fallbacks (in case service changes / other endpoints)
+        text = body.get("text")
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+
+        data = body.get("data")
+        if isinstance(data, dict):
+            text2 = data.get("text")
+            if isinstance(text2, str) and text2.strip():
+                return text2.strip()
+
+    return ""
+
+
+def patch_media_docs_with_transcripts(
+    docs: List[Dict[str, Any]],
+    media_rows: List[Dict[str, Any]],
+    max_workers: int = 3,
+    max_chars: Optional[int] = None,
+) -> int:
+    if not docs or not media_rows:
+        return 0
+
+    index: Dict[str, Dict[str, Any]] = {}
+    for d in docs:
+        key = d.get("_orig_id") or d.get("_id")
+        if isinstance(key, str) and key:
+            index[key] = d
+
+    tasks = []
+    seen = set()
+    for row in media_rows:
+        llid = row.get("logical_layer_id")
+        url = row.get("media_url")
+        if not llid or not url or llid in seen:
+            continue
+        seen.add(llid)
+
+        # Skip YouTube completely
+        if is_youtube_url(url):
+            continue
+
+        if llid not in index:
+            continue
+
+        tasks.append((llid, url))
+
+    if not tasks:
+        return 0
+
+    patched = 0
+
+    def _work(item):
+        llid, url = item
+        time.sleep(random.uniform(0.2, 0.8))
+        sess = get_session(timeout=int(os.getenv("TRANSCRIBE_HTTP_TIMEOUT", "300")))
+        text = transcribe_media_url(url, sess)
+        return (llid, url, text)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = [ex.submit(_work, t) for t in tasks]
+        for fut in as_completed(futures):
+            try:
+                llid, url, text = fut.result()
+            except Exception as e:
+                logging.error("[MediaPatch] Worker error: %s", e)
+                continue
+
+            doc = index.get(llid)
+            if not doc:
+                continue
+
+            if not text:
+                logging.info("[MediaPatch] No transcript for %s (%s)", llid, url)
+                continue
+
+            if isinstance(max_chars, int) and max_chars > 0:
+                text = text[:max_chars]
+
+            doc["ko_content_flat"] = text
+            doc["ko_content_source"] = "media_transcription_endpoint"
+            doc["ko_content_url"] = url
+            doc["is_media"] = True
+            patched += 1
+
+    return patched
 
 def patch_url_only_docs_with_extracted_text(
     docs: List[Dict[str, Any]],
@@ -1070,10 +1271,20 @@ def get_ko_metadata(max_workers: int = 10, page_size: Optional[int] = None, sort
             previous_index=previous_index,
         )
 
+        media_patched = patch_media_docs_with_transcripts(
+            combined_results_all,
+            MISSING_MEDIA_TRANSCRIPT,
+            max_workers=int(os.getenv("TRANSCRIBE_WORKERS", "3")),
+            max_chars=None,
+        )
+
         logging.info(
             "[Patch] URL-only docs patched=%s; remaining_after_patch=%s",
             patched_count, len(MISSING_URL_CONTENT),
         )
+
+        logging.info("[MediaPatch] media docs patched=%s; queued=%s",
+                     media_patched, len(MISSING_MEDIA_TRANSCRIPT))
 
         # Keep only those that STILL lack ko_content_flat
         remaining = []
