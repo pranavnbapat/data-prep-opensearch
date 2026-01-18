@@ -17,8 +17,10 @@ import requests
 from requests.adapters import HTTPAdapter
 from requests.auth import HTTPBasicAuth
 
+from io_helpers import run_stamp, output_dir, atomic_write_json, update_latest_pointer, resolve_latest_pointer
+from job_lock import acquire_job_lock, release_job_lock
 from utils import (CustomJSONEncoder, normalize_date_to_yyyy_mm_dd, strip_html_light, clean_list, get_ko_id,
-                   extract_location_names, is_url_based_ko, flatten_ko_content,)
+                   extract_location_names, flatten_ko_content, set_enrich_via)
 
 try:
     from dotenv import load_dotenv
@@ -146,6 +148,71 @@ def api_base(backend_cfg: BackendCfg) -> str:
 
 
 # ---------------- Small helpers ----------------
+def _stable_value(v: Any) -> Any:
+    """
+    Convert values into a deterministic, JSON-serialisable form so hashes are stable across runs.
+
+    - str: stripped
+    - list: recursively stable + sorted (order-insensitive)
+    - dict: recursively stable with sorted keys (via json.dumps in _sha256_obj)
+    - numbers/bool/None: kept
+    - anything else: stringified
+    """
+    if v is None:
+        return None
+    if isinstance(v, str):
+        s = v.strip()
+        return s
+    if isinstance(v, (bool, int, float)):
+        return v
+    if isinstance(v, list):
+        # make list order-insensitive for hashing (important for keywords/topics/etc.)
+        stable_items = [_stable_value(x) for x in v]
+        # remove empty strings / Nones to avoid noise
+        stable_items = [x for x in stable_items if x not in (None, "")]
+        # sort deterministically (string representation is the safest cross-type key)
+        return sorted(stable_items, key=lambda x: str(x).casefold())
+    if isinstance(v, dict):
+        # keep structure; keys sorted later by _sha256_obj via json.dumps(sort_keys=True)
+        return {str(k): _stable_value(val) for k, val in v.items()}
+    return str(v)
+
+def compute_field_hashes(doc: Dict[str, Any]) -> Dict[str, str]:
+    """
+    Hash a curated set of KO fields (metadata + derived text), per-field.
+    """
+    fields = [
+        "@id",
+        "_orig_id",
+        "title",
+        "subtitle",
+        "description",
+        "keywords",
+        "topics",
+        "themes",
+        "intended_purposes",
+        "locations_flat",
+        "languages",
+        "category",
+        "subcategories",
+        "license",
+        "project_id",
+        "project_name",
+        "project_acronym",
+        "date_of_completion",
+        "ko_content_flat",
+
+        # optional but often useful “resource identity” / media routing
+        "ko_is_hosted",
+        "ko_object_mimetype",
+        "ko_file_id",
+    ]
+
+    out: Dict[str, str] = {}
+    for f in fields:
+        v = _stable_value(doc.get(f))
+        out[f] = _sha256_obj(v)
+    return out
 
 def _stable_list(v: Any) -> List[str]:
     """Normalise list-like fields to a deterministic list of strings."""
@@ -247,44 +314,6 @@ def dedup_case_insensitive(items: Optional[List[str]]) -> List[str]:
             seen.add(k)
     return out
 
-def _is_image_mimetype(m: Any) -> bool:
-    if not isinstance(m, str):
-        return False
-    return m.lower().strip().startswith("image/")
-
-def _is_video_mimetype(m: Any) -> bool:
-    if not isinstance(m, str):
-        return False
-    return m.lower().strip().startswith("video/")
-
-def _is_audio_mimetype(m: Any) -> bool:
-    if not isinstance(m, str):
-        return False
-    return m.lower().strip().startswith("audio/")
-
-def _is_media_any(m: Any) -> bool:
-    return _is_video_mimetype(m) or _is_audio_mimetype(m) or _is_image_mimetype(m)
-
-def _looks_like_url(s: Any) -> bool:
-    return isinstance(s, str) and (s.startswith("http://") or s.startswith("https://"))
-
-def _as_bool(v: Any) -> bool:
-    """Normalise common truthy/falsey representations."""
-    if isinstance(v, bool):
-        return v
-    if v is None:
-        return False
-    if isinstance(v, (int, float)):
-        return v != 0
-    if isinstance(v, str):
-        s = v.strip().lower()
-        if s in {"1", "true", "yes", "y", "on"}:
-            return True
-        if s in {"0", "false", "no", "n", "off", ""}:
-            return False
-    # last resort: Python truthiness
-    return bool(v)
-
 def extract_first_resource_file_info(doc: Dict[str, Any]) -> Dict[str, Any]:
     """
     Pull file metadata from doc['knowledge_object_resources'][0].
@@ -312,7 +341,6 @@ def extract_first_resource_file_info(doc: Dict[str, Any]) -> Dict[str, Any]:
 
     if isinstance(dm, dict):
         out["ko_is_hosted"] = dm.get("is_hosted")
-        out["ko_hosted_mime_type"] = dm.get("hosted_mime_type")
         out["ko_external_content_type"] = dm.get("external_content_type")
 
     out["ko_resource_language"] = first.get("language")
@@ -321,47 +349,47 @@ def extract_first_resource_file_info(doc: Dict[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in out.items() if not _is_blank(v)}
 
 
-def extract_first_resource_url(doc: Dict[str, Any]) -> Optional[str]:
-    """
-    Best-effort URL from first resource.
-    """
-    kor = doc.get("knowledge_object_resources")
-    if not isinstance(kor, list) or not kor:
-        return None
+# def extract_first_resource_url(doc: Dict[str, Any]) -> Optional[str]:
+#     """
+#     Best-effort URL from first resource.
+#     """
+#     kor = doc.get("knowledge_object_resources")
+#     if not isinstance(kor, list) or not kor:
+#         return None
+#
+#     first = kor[0]
+#     if not isinstance(first, dict):
+#         return None
+#
+#     dm = first.get("display_metadata") or {}
+#     if not isinstance(dm, dict):
+#         dm = {}
+#
+#     candidates = [
+#         first.get("url"),
+#         first.get("download_url"),
+#         first.get("href"),
+#         first.get("link"),
+#         dm.get("hosted_url"),
+#         dm.get("external_url"),
+#         dm.get("resource_url"),
+#         first.get("@id"),
+#     ]
+#     for u in candidates:
+#         if isinstance(u, str) and u.strip():
+#             return u.strip()
+#     return None
 
-    first = kor[0]
-    if not isinstance(first, dict):
-        return None
-
-    dm = first.get("display_metadata") or {}
-    if not isinstance(dm, dict):
-        dm = {}
-
-    candidates = [
-        first.get("url"),
-        first.get("download_url"),
-        first.get("href"),
-        first.get("link"),
-        dm.get("hosted_url"),
-        dm.get("external_url"),
-        dm.get("resource_url"),
-        first.get("@id"),
-    ]
-    for u in candidates:
-        if isinstance(u, str) and u.strip():
-            return u.strip()
-    return None
-
-def is_youtube_url(u: str) -> bool:
-    if not isinstance(u, str):
-        return False
-    v = u.lower()
-    return (
-        "youtube.com/watch" in v or
-        "youtube.com/live" in v or
-        "youtube.com/shorts" in v or
-        "youtu.be/" in v
-    )
+# def is_youtube_url(u: str) -> bool:
+#     if not isinstance(u, str):
+#         return False
+#     v = u.lower()
+#     return (
+#         "youtube.com/watch" in v or
+#         "youtube.com/live" in v or
+#         "youtube.com/shorts" in v or
+#         "youtu.be/" in v
+#     )
 
 
 # ---------------- API calls ----------------
@@ -690,17 +718,9 @@ def prepare_one_doc(
 
         cleaned["_orig_id"] = logical_layer_id
 
-        # ---------------- Classification for enrichment ----------------
-        ko_id_url = cleaned.get("@id")  # canonical KO id
-        ko_is_hosted = _as_bool(cleaned.get("ko_is_hosted"))
-        mimetype = cleaned.get("ko_object_mimetype")
-        hosted_url = extract_first_resource_url(doc)  # best effort for hosted media/file access
-
-        # Default flags
-        cleaned.pop("is_url_only", None)
-        cleaned.pop("is_media", None)
-        cleaned.pop("first_url", None)
-        cleaned.pop("media_url", None)
+        def _ensure_stage_flags(d: Dict[str, Any]) -> None:
+            d.setdefault("enriched", 0)
+            d.setdefault("improved", 0)
 
         def _compute_fps(cleaned_doc: Dict[str, Any]) -> Tuple[str, str, str]:
             # ---- Improver inputs ----
@@ -715,11 +735,13 @@ def prepare_one_doc(
 
             # ---- Enricher inputs (only identity of external targets) ----
             enricher_obj = {
-                "is_url_only": bool(cleaned_doc.get("is_url_only")),
-                "is_media": bool(cleaned_doc.get("is_media")),
-                "first_url": _stable_str(cleaned_doc.get("first_url")),  # we'll set this below when relevant
-                "media_url": _stable_str(cleaned_doc.get("media_url")),  # we'll set this below when relevant
-                "media_mimetype": _stable_str(cleaned_doc.get("media_mimetype")),
+                "policy": {
+                    "router_version": _stable_str(os.getenv("ENRICHER_ROUTER_VERSION", "1")),
+                    "enable_url_extract": _stable_str(os.getenv("ENRICH_ENABLE_URL_EXTRACT", "1")),
+                    "enable_transcribe": _stable_str(os.getenv("ENRICH_ENABLE_TRANSCRIBE", "0")),
+                    "enable_deapi_transcribe": _stable_str(os.getenv("ENRICH_ENABLE_DEAPI_TRANSCRIBE", "0")),
+                    "deapi_model": _stable_str(os.getenv("DEAPI_TRANSCRIBE_MODEL", "WhisperLargeV3")),
+                }
             }
             enricher_fp = _sha256_obj(enricher_obj)
 
@@ -738,12 +760,7 @@ def prepare_one_doc(
                 "ko_object_size": cleaned_doc.get("ko_object_size"),
                 "ko_updated_at": _stable_str(cleaned_doc.get("ko_updated_at")),
                 "proj_updated_at": _stable_str(cleaned_doc.get("proj_updated_at")),
-                # include content signal that you actually use downstream
                 "ko_content_flat": _stable_str(cleaned_doc.get("ko_content_flat")),
-                # include external identity as part of source truth too
-                "first_url": _stable_str(cleaned_doc.get("first_url")),
-                "media_url": _stable_str(cleaned_doc.get("media_url")),
-                "media_mimetype": _stable_str(cleaned_doc.get("media_mimetype")),
             }
             dl_fp = _sha256_obj(dl_obj)
 
@@ -767,6 +784,10 @@ def prepare_one_doc(
                 merged.update(cleaned)   # ensure current core metadata is up-to-date
                 merged["_orig_id"] = logical_layer_id
 
+                set_enrich_via(merged)
+
+                _ensure_stage_flags(merged)
+
                 if os.getenv("LOG_LEVEL", "").upper() == "DEBUG":
                     logging.debug("[ReuseUnchanged] llid=%s ko_updated_at=%s", logical_layer_id, cleaned.get("ko_updated_at"))
 
@@ -774,6 +795,8 @@ def prepare_one_doc(
                 merged["_dl_fp"] = dl_fp
                 merged["_enricher_fp"] = enr_fp
                 merged["_improver_fp"] = imp_fp
+                merged["_field_hashes"] = compute_field_hashes(merged)
+                merged["_fields_fp"] = _sha256_obj(merged["_field_hashes"])
 
                 prev_dl_fp = None
                 if prev_index and isinstance(prev_index.get(logical_layer_id), dict):
@@ -782,105 +805,6 @@ def prepare_one_doc(
 
                 return merged, None, None, "emitted", None, source_changed, dl_fp, enr_fp, imp_fp
 
-        # --- classify URL-only first (skip content API; create URL task) ---
-        url_only, url_list = is_url_based_ko(doc)
-
-        # Fallback: if @id is a URL and not hosted
-        if not url_only and not ko_is_hosted and _looks_like_url(ko_id_url):
-            url_only = True
-            url_list = [ko_id_url]
-
-        if url_only:
-            target_url = (url_list[0] if url_list else None) or ko_id_url
-
-            cleaned["first_url"] = target_url
-            cleaned["is_url_only"] = True
-
-            combined = combine_metadata_and_content(cleaned, [])
-            combined = flatten_ko_content(combined, mode=KO_CONTENT_MODE)
-            combined["_orig_id"] = logical_layer_id
-
-            if target_url and is_youtube_url(target_url):
-                url_task = {
-                    "kind": "youtube",
-                    "logical_layer_id": logical_layer_id,
-                    "at_id": combined.get("@id"),
-                    "title": combined.get("title"),
-                    "url": target_url,
-                    "route": "youtube:disabled",
-                }
-
-                dl_fp, enr_fp, imp_fp = _compute_fps(combined)
-                combined["_dl_fp"] = dl_fp
-                combined["_enricher_fp"] = enr_fp
-                combined["_improver_fp"] = imp_fp
-
-                prev_dl_fp = None
-                if prev_index and isinstance(prev_index.get(logical_layer_id), dict):
-                    prev_dl_fp = prev_index[logical_layer_id].get("_dl_fp")
-                source_changed = True if prev_dl_fp is None else (prev_dl_fp != dl_fp)
-
-                return combined, url_task, None, "emitted", None, source_changed, dl_fp, enr_fp, imp_fp
-
-            # Normal URL extraction branch (PageSense)
-            url_task = {
-                "kind": "url",
-                "logical_layer_id": logical_layer_id,
-                "at_id": cleaned.get("@id"),
-                "title": cleaned.get("title"),
-                "url": target_url,
-                "route": "pagesense",
-            }
-
-            dl_fp, enr_fp, imp_fp = _compute_fps(combined)
-            combined["_dl_fp"] = dl_fp
-            combined["_enricher_fp"] = enr_fp
-            combined["_improver_fp"] = imp_fp
-
-            prev_dl_fp = None
-            if prev_index and isinstance(prev_index.get(logical_layer_id), dict):
-                prev_dl_fp = prev_index[logical_layer_id].get("_dl_fp")
-
-            source_changed = True if prev_dl_fp is None else (prev_dl_fp != dl_fp)
-
-            return combined, url_task, None, "emitted", None, source_changed, dl_fp, enr_fp, imp_fp
-
-        # 2) Hosted file KO: decide media transcribe vs content API
-        if ko_is_hosted:
-            # If hosted file is media, create media task and STOP here
-            if _is_media_any(mimetype):
-                cleaned["is_media"] = True
-                cleaned["media_mimetype"] = mimetype
-                cleaned["media_url"] = hosted_url  # best effort
-                # Optional: keep first_url aligned for downstream logs/debug
-                cleaned["first_url"] = hosted_url
-
-                combined = combine_metadata_and_content(cleaned, [])
-                combined = flatten_ko_content(combined, mode=KO_CONTENT_MODE)
-                combined["_orig_id"] = logical_layer_id
-
-                media_task = {
-                    "kind": "media",
-                    "logical_layer_id": logical_layer_id,
-                    "at_id": combined.get("@id"),
-                    "title": combined.get("title"),
-                    "media_url": hosted_url,
-                    "mimetype": mimetype,
-                    "route": "transcribe",
-                }
-
-                dl_fp, enr_fp, imp_fp = _compute_fps(combined)
-                combined["_dl_fp"] = dl_fp
-                combined["_enricher_fp"] = enr_fp
-                combined["_improver_fp"] = imp_fp
-
-                prev_dl_fp = None
-                if prev_index and isinstance(prev_index.get(logical_layer_id), dict):
-                    prev_dl_fp = prev_index[logical_layer_id].get("_dl_fp")
-                source_changed = True if prev_dl_fp is None else (prev_dl_fp != dl_fp)
-
-                return combined, None, media_task, "emitted", None, source_changed, dl_fp, enr_fp, imp_fp
-
 
         # --- hosted content fetch via content API ---
         content_list = get_ko_content(backend_cfg, logical_layer_id)
@@ -888,10 +812,16 @@ def prepare_one_doc(
         combined = flatten_ko_content(combined, mode=KO_CONTENT_MODE)
         combined["_orig_id"] = logical_layer_id
 
+        set_enrich_via(combined)
+
+        _ensure_stage_flags(combined)
+
         dl_fp, enr_fp, imp_fp = _compute_fps(combined)
         combined["_dl_fp"] = dl_fp
         combined["_enricher_fp"] = enr_fp
         combined["_improver_fp"] = imp_fp
+        combined["_field_hashes"] = compute_field_hashes(combined)
+        combined["_fields_fp"] = _sha256_obj(combined["_field_hashes"])
 
         prev_dl_fp = None
         if prev_index and isinstance(prev_index.get(logical_layer_id), dict):
@@ -1035,6 +965,7 @@ def download_and_prepare(
     sort_criteria: int = 1,
     max_workers: int = 10,
     prev_index: Optional[Dict[str, Dict[str, Any]]] = None,
+    use_lock: bool = True
 ) -> DownloadResult:
     """
     End-to-end Step 1:
@@ -1042,152 +973,192 @@ def download_and_prepare(
       - clean + enrich + classify
       - fetch hosted content (internal API) for hosted docs
     """
-    backend_cfg = load_backend_cfg(env_mode)
+    output_root = os.getenv("OUTPUT_ROOT", "output")
+    lock = None
+    if use_lock:
+        lock = acquire_job_lock(env_mode=env_mode, output_root=output_root, entrypoint="downloader")
 
-    page = 1
-    pages_seen = set()
+    try:
+        backend_cfg = load_backend_cfg(env_mode)
 
-    emitted_total = 0
-    dropped_total = 0
-    url_task_total = 0
-    media_task_total = 0
-    changed_total = 0
-    unchanged_total = 0
+        page = 1
+        pages_seen = set()
 
-    docs_all: List[Dict[str, Any]] = []
-    url_tasks_all: List[Dict[str, Any]] = []
-    media_tasks_all: List[Dict[str, Any]] = []
+        emitted_total = 0
+        dropped_total = 0
+        url_task_total = 0
+        media_task_total = 0
+        changed_total = 0
+        unchanged_total = 0
 
-    t0 = time.perf_counter()
+        docs_all: List[Dict[str, Any]] = []
+        url_tasks_all: List[Dict[str, Any]] = []
+        media_tasks_all: List[Dict[str, Any]] = []
 
-    while True:
-        if page in pages_seen:
-            logging.warning("Breaking due to repeated page indicator: %s", page)
-            break
-        pages_seen.add(page)
+        t0 = time.perf_counter()
 
-        t_page = time.perf_counter()
+        while True:
+            if page in pages_seen:
+                logging.warning("Breaking due to repeated page indicator: %s", page)
+                break
+            pages_seen.add(page)
 
-        t_fetch = time.perf_counter()
+            t_page = time.perf_counter()
 
-        payload = fetch_ko_metadata_api(
-            backend_cfg,
-            limit=page_size,
-            page=page,
-            sort_criteria=sort_criteria,
+            t_fetch = time.perf_counter()
+
+            payload = fetch_ko_metadata_api(
+                backend_cfg,
+                limit=page_size,
+                page=page,
+                sort_criteria=sort_criteria,
+            )
+
+            dt_fetch = time.perf_counter() - t_fetch
+            if dt_fetch > float(os.getenv("SLOW_PAGE_FETCH_SEC", "1.0")):
+                logging.warning("[SlowPageFetch] env=%s page=%s dt=%.2fs", env_mode, page, dt_fetch)
+
+            kos_page = payload.get("data", []) or payload.get("results", []) or []
+            if not kos_page:
+                break
+
+            pagination = payload.get("pagination") or {}
+            next_page = pagination.get("next_page")
+
+            logging.info("[KO API] env=%s page=%s fetched=%s next=%r", env_mode, page, len(kos_page), next_page)
+
+            docs_p, url_p, media_p, emitted_p, dropped_p, drop_reasons, dropped_items, changed_p, unchanged_p = _process_page(
+                backend_cfg,
+                kos_page,
+                workers=max_workers,
+                prev_index=prev_index,
+            )
+
+            logging.info(
+                "[PageDone] env=%s page=%s emitted=%s dropped=%s url_tasks=%s media_tasks=%s dt=%.2fs",
+                env_mode, page, emitted_p, dropped_p, len(url_p), len(media_p),
+                time.perf_counter() - t_page
+            )
+
+            if drop_reasons:
+                logging.info("[PageDrops] env=%s page=%s reasons=%s", env_mode, page, drop_reasons)
+
+            max_show = int(os.getenv("DROP_LOG_MAX", "100"))
+            if dropped_items:
+                total = len(dropped_items)
+                show_n = min(max_show, total)
+
+                # One KO per line for readability in logs
+                for i, item in enumerate(dropped_items[:show_n], start=1):
+                    logging.info(
+                        "[DroppedKOs] env=%s page=%s showing=%s/%s reason=%r logical_layer_id=%r title=%r",
+                        env_mode,
+                        page,
+                        i,
+                        total,
+                        item.get("reason"),
+                        item.get("logical_layer_id"),
+                        item.get("title"),
+                    )
+
+                # Optional: make it explicit if we truncated the list
+                if show_n < total:
+                    logging.info(
+                        "[DroppedKOs] env=%s page=%s truncated (showing %s/%s). Increase DROP_LOG_MAX to see more.",
+                        env_mode,
+                        page,
+                        show_n,
+                        total,
+                    )
+
+            docs_all.extend(docs_p)
+            url_tasks_all.extend(url_p)
+            media_tasks_all.extend(media_p)
+
+            emitted_total += emitted_p
+            dropped_total += dropped_p
+
+            changed_total += changed_p
+            unchanged_total += unchanged_p
+
+            url_task_total += len(url_p)
+            media_task_total += len(media_p)
+
+            if not next_page:
+                break
+            try:
+                next_page_int = int(next_page)
+            except Exception:
+                break
+            if next_page_int == page:
+                break
+            page = next_page_int
+
+        elapsed = time.perf_counter() - t0
+
+        stats = {
+            "env_mode": env_mode.upper(),
+            "emitted": emitted_total,
+            "dropped": dropped_total,
+            "url_tasks": url_task_total,
+            "media_tasks": media_task_total,
+            "changed": changed_total,
+            "unchanged_reused": unchanged_total,
+            "elapsed_sec": round(elapsed, 2),
+        }
+
+        logging.warning(
+            "[Downloader] env=%s emitted=%s dropped=%s changed=%s unchanged=%s url_tasks=%s media_tasks=%s elapsed=%.2fs",
+            stats["env_mode"],
+            emitted_total,
+            dropped_total,
+            changed_total,
+            unchanged_total,
+            url_task_total,
+            media_task_total,
+            elapsed,
         )
 
-        dt_fetch = time.perf_counter() - t_fetch
-        if dt_fetch > float(os.getenv("SLOW_PAGE_FETCH_SEC", "1.0")):
-            logging.warning("[SlowPageFetch] env=%s page=%s dt=%.2fs", env_mode, page, dt_fetch)
+        # --- Optional: persist downloader output for independent stage runs ---
+        should_write_output = os.getenv("DL_WRITE_OUTPUT", "1").strip().lower() in {"1", "true", "yes", "y", "on"}
+        prev_count = len(prev_index) if prev_index is not None else None
+        has_meaningful_changes = (changed_total > 0) or (prev_count is not None and len(docs_all) != prev_count)
 
-        kos_page = payload.get("data", []) or payload.get("results", []) or []
-        if not kos_page:
-            break
+        if should_write_output and has_meaningful_changes:
+            run_id = run_stamp()
 
-        pagination = payload.get("pagination") or {}
-        next_page = pagination.get("next_page")
+            out_dir = output_dir(env_mode, root=output_root)
+            out_path = out_dir / f"final_output_{run_id}.json"
 
-        logging.info("[KO API] env=%s page=%s fetched=%s next=%r", env_mode, page, len(kos_page), next_page)
+            payload = {
+                "meta": {
+                    "env_mode": env_mode.upper(),
+                    "run_id": run_id,
+                    "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "stage": "downloader",
+                },
+                "stats": stats,
+                "docs": docs_all,
+                "url_tasks": url_tasks_all,
+                "media_tasks": media_tasks_all,
+            }
 
-        docs_p, url_p, media_p, emitted_p, dropped_p, drop_reasons, dropped_items, changed_p, unchanged_p = _process_page(
-            backend_cfg,
-            kos_page,
-            workers=max_workers,
-            prev_index=prev_index,
+            atomic_write_json(out_path, payload)
+            update_latest_pointer(env_mode, output_root, "latest_downloaded.json", out_path)
+
+        elif should_write_output and not has_meaningful_changes:
+            logging.warning("[Downloader] no_changes=True (skipping write of final_output_*)")
+
+
+        return DownloadResult(
+            docs=docs_all,
+            url_tasks=url_tasks_all,
+            media_tasks=media_tasks_all,
+            stats=stats,
         )
-
-        logging.info(
-            "[PageDone] env=%s page=%s emitted=%s dropped=%s url_tasks=%s media_tasks=%s dt=%.2fs",
-            env_mode, page, emitted_p, dropped_p, len(url_p), len(media_p),
-            time.perf_counter() - t_page
-        )
-
-        if drop_reasons:
-            logging.info("[PageDrops] env=%s page=%s reasons=%s", env_mode, page, drop_reasons)
-
-        max_show = int(os.getenv("DROP_LOG_MAX", "100"))
-        if dropped_items:
-            total = len(dropped_items)
-            show_n = min(max_show, total)
-
-            # One KO per line for readability in logs
-            for i, item in enumerate(dropped_items[:show_n], start=1):
-                logging.info(
-                    "[DroppedKOs] env=%s page=%s showing=%s/%s reason=%r logical_layer_id=%r title=%r",
-                    env_mode,
-                    page,
-                    i,
-                    total,
-                    item.get("reason"),
-                    item.get("logical_layer_id"),
-                    item.get("title"),
-                )
-
-            # Optional: make it explicit if we truncated the list
-            if show_n < total:
-                logging.info(
-                    "[DroppedKOs] env=%s page=%s truncated (showing %s/%s). Increase DROP_LOG_MAX to see more.",
-                    env_mode,
-                    page,
-                    show_n,
-                    total,
-                )
-
-        docs_all.extend(docs_p)
-        url_tasks_all.extend(url_p)
-        media_tasks_all.extend(media_p)
-
-        emitted_total += emitted_p
-        dropped_total += dropped_p
-
-        changed_total += changed_p
-        unchanged_total += unchanged_p
-
-        url_task_total += len(url_p)
-        media_task_total += len(media_p)
-
-        if not next_page:
-            break
-        try:
-            next_page_int = int(next_page)
-        except Exception:
-            break
-        if next_page_int == page:
-            break
-        page = next_page_int
-
-    elapsed = time.perf_counter() - t0
-
-    stats = {
-        "env_mode": env_mode.upper(),
-        "emitted": emitted_total,
-        "dropped": dropped_total,
-        "url_tasks": url_task_total,
-        "media_tasks": media_task_total,
-        "changed": changed_total,
-        "unchanged_reused": unchanged_total,
-        "elapsed_sec": round(elapsed, 2),
-    }
-
-    logging.warning(
-        "[Downloader] env=%s emitted=%s dropped=%s changed=%s unchanged=%s url_tasks=%s media_tasks=%s elapsed=%.2fs",
-        stats["env_mode"],
-        emitted_total,
-        dropped_total,
-        changed_total,
-        unchanged_total,
-        url_task_total,
-        media_task_total,
-        elapsed,
-    )
-
-    return DownloadResult(
-        docs=docs_all,
-        url_tasks=url_tasks_all,
-        media_tasks=media_tasks_all,
-        stats=stats,
-    )
+    finally:
+        if lock is not None:
+            release_job_lock(lock)
 
 
 # ---------------- CLI (optional) ----------------
@@ -1202,11 +1173,35 @@ if __name__ == "__main__":
     mw = int(os.getenv("DL_MAX_WORKERS", "10"))
     sc = int(os.getenv("DL_SORT_CRITERIA", "1"))
 
+    output_root = os.getenv("OUTPUT_ROOT", "output")
+    prev_path = resolve_latest_pointer(env_mode, output_root, "latest_downloaded.json")
+    prev_index = {}
+    if prev_path:
+        try:
+            payload = json.loads(prev_path.read_text(encoding="utf-8"))
+            docs = payload.get("docs", []) if isinstance(payload, dict) else (payload if isinstance(payload, list) else [])
+
+            prev_docs_len = len(docs) if isinstance(docs, list) else 0
+
+            if isinstance(docs, list):
+                tmp: Dict[str, Dict[str, Any]] = {}
+                for d in docs:
+                    if not isinstance(d, dict):
+                        continue
+                    k = d.get("_orig_id") or d.get("_id")
+                    if isinstance(k, str) and k.strip():
+                        tmp[k.strip()] = d
+                prev_index = tmp
+
+        except Exception:
+            prev_index = {}
+
     res = download_and_prepare(
         env_mode=env_mode,
         page_size=ps,
         sort_criteria=sc,
         max_workers=mw,
+        prev_index=prev_index,
     )
 
     # quick local smoke output (don’t do this in production)

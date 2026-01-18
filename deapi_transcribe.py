@@ -267,7 +267,7 @@ def transcribe_video(
 
     transcript_text = _try_extract_transcript_text(status_payload)
 
-    # If transcript not inlined, you can fetch from result_url (often a text file / json).
+    # If transcript not inlined, fetch from result_url.
     if not transcript_text and result_url and isinstance(result_url, str) and result_url.startswith("http"):
         # Try to download. If it’s not plain text, we still return the raw body as text.
         dl = _http_request_with_retry(session, "GET", result_url, timeout_s=timeout_s)

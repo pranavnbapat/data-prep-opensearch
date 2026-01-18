@@ -873,3 +873,110 @@ def transcribe_media_url(url: str, session: requests.Session) -> str:
                 return text2.strip()
 
     return ""
+
+def is_media_mimetype(m: Any) -> bool:
+    """
+    Treat image/*, audio/*, video/* as media requiring transcription.
+    """
+    if not isinstance(m, str):
+        return False
+    mm = m.strip().lower()
+    return mm.startswith("image/") or mm.startswith("audio/") or mm.startswith("video/")
+
+
+def is_video_platform_url(u: Any) -> bool:
+    """
+    True if URL is a known video/audio platform where "transcribe" makes sense.
+    Keep it conservative and domain-based (less false positives).
+    """
+    if not isinstance(u, str):
+        return False
+    s = u.strip()
+    if not s:
+        return False
+
+    try:
+        p = urlparse(s)
+        host = (p.netloc or "").lower()
+        path = (p.path or "").lower()
+    except Exception:
+        return False
+
+    # normalise common "www."
+    if host.startswith("www."):
+        host = host[4:]
+
+    # You can extend this list safely over time
+    video_hosts = {
+        "youtube.com",
+        "youtu.be",
+        "m.youtube.com",
+        "dailymotion.com",
+        "dai.ly",
+        "vimeo.com",
+        "player.vimeo.com",
+        "tiktok.com",
+        "twitter.com",
+        "x.com",
+        "facebook.com",
+        "fb.watch",
+        "instagram.com",
+        "twitch.tv",
+    }
+
+    if host in video_hosts:
+        return True
+
+    # A few platforms use subdomains heavily (e.g. *.youtube.com)
+    if host.endswith(".youtube.com"):
+        return True
+    if host.endswith(".dailymotion.com"):
+        return True
+    if host.endswith(".tiktok.com"):
+        return True
+    if host.endswith(".twitch.tv"):
+        return True
+
+    # Optional: treat direct media file URLs as transcribe-worthy even if not hosted
+    if any(path.endswith(ext) for ext in (".mp4", ".mp3", ".wav", ".m4a", ".webm", ".mov", ".mkv", ".aac", ".ogg")):
+        return True
+
+    return False
+
+def as_bool(v: Any) -> bool:
+    """Normalise common truthy/falsey representations."""
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return False
+    if isinstance(v, (int, float)):
+        return v != 0
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in {"1", "true", "yes", "y", "on"}:
+            return True
+        if s in {"0", "false", "no", "n", "off", ""}:
+            return False
+    # last resort: Python truthiness
+    return bool(v)
+
+def set_enrich_via(d: Dict[str, Any]) -> None:
+    ko_is_hosted = as_bool(d.get("ko_is_hosted"))
+    mimetype = d.get("ko_object_mimetype")
+    at_id = d.get("@id")
+
+    if ko_is_hosted and is_media_mimetype(mimetype):
+        d["enrich_via"] = "transcribe"
+        return
+
+    if (not ko_is_hosted) and is_video_platform_url(at_id):
+        d["enrich_via"] = "transcribe"
+        return
+
+    if not ko_is_hosted:
+        d["enrich_via"] = "pagesense"
+        return
+
+    # Hosted but non-media: no external enrichment route needed (keep it absent)
+    d.pop("enrich_via", None)
+

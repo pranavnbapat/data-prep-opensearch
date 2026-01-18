@@ -11,7 +11,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from downloader import download_and_prepare, DownloadResult
-from enricher import enrich_external_content
+from enricher import run_enricher_stage
+from io_helpers import run_stamp, output_dir, atomic_write_json, env_flag
+from job_lock import acquire_job_lock, release_job_lock
 from utils import CustomJSONEncoder
 
 try:
@@ -22,24 +24,6 @@ except Exception:
 
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------- Output paths ----------------
-
-def _run_stamp() -> str:
-    return datetime.now().strftime("%d_%m-%Y_%H-%M-%S")
-
-def _output_dir(env_mode: str, root: str = "output") -> Path:
-    now = datetime.now()
-    return Path(root) / env_mode.upper() / now.strftime("%Y") / now.strftime("%m")
-
-def _atomic_write_json(path: Path, payload: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with tmp.open("w", encoding="utf-8") as fh:
-        json.dump(payload, fh, indent=2, ensure_ascii=False, cls=CustomJSONEncoder)
-    tmp.replace(path)
-
 
 # ---------------- Previous snapshot reuse ----------------
 
@@ -121,167 +105,171 @@ def run_pipeline(
     max_chars: Optional[int],
     output_root: str = "output",
 ) -> PipelineResult:
-    run_id = _run_stamp()
 
-    prev_index = load_previous_index(env_mode, root=output_root)
+    lock = acquire_job_lock(env_mode=env_mode, output_root=output_root, entrypoint="pipeline")
 
-    # Step 1: download
-    dl: DownloadResult = download_and_prepare(
-        env_mode=env_mode,
-        page_size=page_size,
-        sort_criteria=sort_criteria,
-        max_workers=dl_workers,
-        prev_index=prev_index,
-    )
+    try:
+        run_id = run_stamp()
 
-    cur_index = {d.get("_orig_id"): d for d in dl.docs if isinstance(d.get("_orig_id"), str)}
+        enable_downloader = env_flag("ENABLE_DOWNLOADER", True)
+        enable_enricher = env_flag("ENABLE_ENRICHER", False)
+        enable_improver = env_flag("ENABLE_IMPROVER", False)  # stub for now
 
-    filtered_url_tasks = []
-    for t in dl.url_tasks:
-        llid = t.get("logical_layer_id")
-        cur_doc = cur_index.get(llid)
-        prev_doc = prev_index.get(llid) if prev_index else None
-        if not cur_doc:
-            continue
-        if (prev_doc or {}).get("_enricher_fp") != cur_doc.get("_enricher_fp"):
-            filtered_url_tasks.append(t)
+        # Step 1: download
+        prev_index = load_previous_index(env_mode, root=output_root)
 
-    filtered_media_tasks = []
-    for t in dl.media_tasks:
-        llid = t.get("logical_layer_id")
-        cur_doc = cur_index.get(llid)
-        prev_doc = prev_index.get(llid) if prev_index else None
-        if not cur_doc:
-            continue
-        if (prev_doc or {}).get("_enricher_fp") != cur_doc.get("_enricher_fp"):
-            filtered_media_tasks.append(t)
+        dl: Optional[DownloadResult] = None
+        if enable_downloader:
+            dl = download_and_prepare(
+                env_mode=env_mode,
+                page_size=page_size,
+                sort_criteria=sort_criteria,
+                max_workers=dl_workers,
+                prev_index=prev_index,
+                use_lock=False
+            )
+        else:
+            logger.warning("[Pipeline] Downloader disabled; downstream stages will resolve latest inputs themselves.")
 
-    # Step 2: enrich
-    enrich_stats = enrich_external_content(
-        dl.docs,
-        filtered_url_tasks,
-        filtered_media_tasks,
-        previous_index=prev_index,
-        extractor_workers=extractor_workers,
-        transcribe_workers=transcribe_workers,
-        max_chars=max_chars,
-    )
+        # Step 2: enrich (only if enabled)
+        enrich_res = None
+        enrich_stats: Dict[str, Any] = {"patched": 0, "notes": "disabled"}
+        enriched_docs: List[Dict[str, Any]] = (dl.docs if dl else [])
+        enriched_url_tasks: List[Dict[str, Any]] = (dl.url_tasks if dl else [])
+        enriched_media_tasks: List[Dict[str, Any]] = (dl.media_tasks if dl else [])
 
-    # Step 3: improver (stub)
-    improve_stats = improve_docs_stub(dl.docs)
+        if enable_enricher:
+            enrich_res = run_enricher_stage(
+                env_mode=env_mode,
+                output_root=output_root,
+                extractor_workers=extractor_workers,
+                transcribe_workers=transcribe_workers,
+                max_chars=max_chars,
+                use_lock=False,
+            )
+            enrich_stats = enrich_res["stats"]
 
-    # If nothing changed since previous snapshot, don't create new final_* files.
-    # Still refresh latest.json (optional) so reuse continues to work.
-    has_changes = _pipeline_has_changes(dl.stats, enrich_stats, improve_stats)
+            fallback_docs = (dl.docs if dl else [])
+            fallback_url_tasks = (dl.url_tasks if dl else [])
+            fallback_media_tasks = (dl.media_tasks if dl else [])
 
-    if not has_changes:
+            try:
+                enriched_payload = json.loads(Path(enrich_res["out"]).read_text(encoding="utf-8"))
+                enriched_docs = enriched_payload.get("docs", fallback_docs)
+                enriched_url_tasks = enriched_payload.get("url_tasks", fallback_url_tasks)
+                enriched_media_tasks = enriched_payload.get("media_tasks", fallback_media_tasks)
+                if not isinstance(enriched_docs, list):
+                    raise ValueError("enriched docs is not a list")
+            except Exception as e:
+                logger.warning("[Pipeline] Failed to load enriched output (%s): %s", enrich_res.get("out"), e)
+                enriched_docs = fallback_docs
+                enriched_url_tasks = fallback_url_tasks
+                enriched_media_tasks = fallback_media_tasks
+        else:
+            logger.warning("[Pipeline] Enricher disabled; using downloader output (or empty).")
+
+        enrich_res = enrich_res or {}
+
+        # Step 3: improver (stub)
+        improve_stats = improve_docs_stub(enriched_docs) if enable_improver else {"improved": 0, "notes": "disabled"}
+
+        downloader_stats = dl.stats if dl else {"changed": 0, "emitted": 0, "dropped": 0, "notes": "disabled"}
+
+        # If nothing changed since previous snapshot, don't create new final_* files.
+        # Still refresh latest.json (optional) so reuse continues to work.
+        has_changes = _pipeline_has_changes(downloader_stats, enrich_stats, improve_stats)
+
+        if not has_changes:
+            latest_path = Path(output_root) / env_mode.upper() / "latest.json"
+            latest_payload = {
+                "meta": {
+                    "env_mode": env_mode.upper(),
+                    "run_id": run_id,
+                    "created_at": datetime.now().isoformat(timespec="seconds"),
+                },
+                "stats": {
+                    "downloader": downloader_stats,
+                    "enricher": enrich_stats,
+                    "improver": improve_stats,
+                },
+                "docs": enriched_docs,
+                "url_tasks": enriched_url_tasks,
+                "media_tasks": enriched_media_tasks,
+            }
+            atomic_write_json(latest_path, latest_payload)
+
+            logger.warning(
+                "[Pipeline] env=%s run_id=%s no_changes=True (skipping final_* outputs)",
+                env_mode.upper(), run_id
+            )
+
+            # Return paths pointing to latest only
+            return PipelineResult(
+                env_mode=env_mode.upper(),
+                run_id=run_id,
+                stats=latest_payload["stats"],
+                final_path="",
+                report_path="",
+                latest_path=str(latest_path),
+            )
+
+        out_dir = output_dir(env_mode, root=output_root)
+
+        final_report_path = out_dir / f"final_report_{run_id}.json"
+
         latest_path = Path(output_root) / env_mode.upper() / "latest.json"
-        latest_payload = {
+
+        # 2) Save report (meta + stats + counts)
+        report = {
             "meta": {
                 "env_mode": env_mode.upper(),
                 "run_id": run_id,
                 "created_at": datetime.now().isoformat(timespec="seconds"),
             },
             "stats": {
-                "downloader": dl.stats,
+                "downloader": downloader_stats,
                 "enricher": enrich_stats,
                 "improver": improve_stats,
             },
-            "docs": dl.docs,
-            "url_tasks": dl.url_tasks,
-            "media_tasks": dl.media_tasks,
+            "counts": {
+                "docs": len(enriched_docs),
+                "url_tasks": len(enriched_url_tasks),
+                "media_tasks": len(enriched_media_tasks),
+            },
+            "paths": {
+                "downloader_out": enrich_res.get("in", ""),
+                "enriched_out": enrich_res.get("out", ""),
+                "final_report": str(final_report_path),
+                "latest": str(latest_path),
+            },
         }
-        _atomic_write_json(latest_path, latest_payload)
+        atomic_write_json(final_report_path, report)
+
+        # 3) Keep latest.json as the full payload for reuse
+        payload = {
+            "meta": report["meta"],
+            "stats": report["stats"],
+            "docs": enriched_docs,
+            "url_tasks": enriched_url_tasks,
+            "media_tasks": enriched_media_tasks,
+        }
+        atomic_write_json(latest_path, payload)
 
         logger.warning(
-            "[Pipeline] env=%s run_id=%s no_changes=True (skipping final_* outputs)",
-            env_mode.upper(), run_id
+            "[Pipeline] env=%s run_id=%s docs=%d enriched_out=%s report=%s",
+            env_mode.upper(), run_id, len(enriched_docs), enrich_res.get("out", ""), str(final_report_path)
         )
 
-        # Return paths pointing to latest only
         return PipelineResult(
             env_mode=env_mode.upper(),
             run_id=run_id,
-            stats=latest_payload["stats"],
-            final_path="",
-            report_path="",
+            stats=report["stats"],
+            final_path=str(enrich_res.get("out", "")),
+            report_path=str(final_report_path),
             latest_path=str(latest_path),
         )
-
-    # Build output payload
-    payload = {
-        "meta": {
-            "env_mode": env_mode.upper(),
-            "run_id": run_id,
-            "created_at": datetime.now().isoformat(timespec="seconds"),
-        },
-        "stats": {
-            "downloader": dl.stats,
-            "enricher": enrich_stats,
-            "improver": improve_stats,
-        },
-        "docs": dl.docs,
-        "url_tasks": dl.url_tasks,
-        "media_tasks": dl.media_tasks,
-    }
-
-    out_dir = _output_dir(env_mode, root=output_root)
-    final_docs_path = out_dir / f"final_output_{run_id}.json"
-    final_report_path = out_dir / f"final_report_{run_id}.json"
-
-    latest_path = Path(output_root) / env_mode.upper() / "latest.json"
-
-    # Save full output
-    _atomic_write_json(final_docs_path, dl.docs)
-
-    # 2) Save report (meta + stats + counts)
-    report = {
-        "meta": {
-            "env_mode": env_mode.upper(),
-            "run_id": run_id,
-            "created_at": datetime.now().isoformat(timespec="seconds"),
-        },
-        "stats": {
-            "downloader": dl.stats,
-            "enricher": enrich_stats,
-            "improver": improve_stats,
-        },
-        "counts": {
-            "docs": len(dl.docs),
-            "url_tasks": len(dl.url_tasks),
-            "media_tasks": len(dl.media_tasks),
-        },
-        "paths": {
-            "final_docs": str(final_docs_path),
-            "final_report": str(final_report_path),
-            "latest": str(latest_path),
-        },
-    }
-    _atomic_write_json(final_report_path, report)
-
-    # 3) Keep latest.json as the full payload for reuse
-    payload = {
-        "meta": report["meta"],
-        "stats": report["stats"],
-        "docs": dl.docs,
-        "url_tasks": dl.url_tasks,
-        "media_tasks": dl.media_tasks,
-    }
-    _atomic_write_json(latest_path, payload)
-
-    logger.warning(
-        "[Pipeline] env=%s run_id=%s docs=%d saved_docs=%s",
-        env_mode.upper(), run_id, len(dl.docs), str(final_docs_path)
-    )
-
-    return PipelineResult(
-        env_mode=env_mode.upper(),
-        run_id=run_id,
-        stats=report["stats"],
-        final_path=str(final_docs_path),
-        report_path=str(final_report_path),
-        latest_path=str(latest_path),
-    )
+    finally:
+        release_job_lock(lock)
 
 
 # ---------------- CLI ----------------
