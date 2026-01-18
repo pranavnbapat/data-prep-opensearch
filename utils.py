@@ -629,7 +629,7 @@ def fetch_url_text_with_extractor(
     session: Optional[requests.Session] = None,
 ) -> Optional[str]:
     """
-    Calls your text-extractor:
+    Calls text-extractor:
       GET {EXTRACTOR_BASE}/api/extract?url=<encoded>
     Returns raw extracted text (str) or None on failure.
     """
@@ -827,4 +827,49 @@ def is_url_based_ko(orig_doc: dict) -> tuple[bool, list[str]]:
         if isinstance(aid, str) and aid.strip() and not _looks_hosted(aid):
             urls.append(aid.strip())
 
-    return (len(urls) > 0, urls)
+    return len(urls) > 0, urls
+
+def transcribe_media_url(url: str, session: requests.Session) -> str:
+    """
+    Calls transcription endpoint. Assumes it accepts JSON: {"url": "..."}.
+    Adjust request/response parsing to match service.
+    """
+    endpoint = os.getenv("TRANSCRIBE_ENDPOINT_URL", "https://media-transcriber.nexavion.com/transcribe").strip()
+    if not endpoint:
+        raise RuntimeError("TRANSCRIBE_ENDPOINT_URL env var is not set")
+
+    whisper_model = os.getenv("WHISPER_MODEL", "large-v1").strip()
+
+    r = session.post(
+        endpoint,
+        json={"url": url, "whisper_model": whisper_model},
+        timeout=int(os.getenv("TRANSCRIBE_HTTP_TIMEOUT", "3600")),
+    )
+    r.raise_for_status()
+
+    # Be defensive: response might not be JSON even on 200
+    try:
+        body = r.json()
+    except ValueError:
+        return ""
+
+    # ---- service-specific response shape ----
+    if isinstance(body, dict):
+        whisper = body.get("whisper")
+        if isinstance(whisper, dict):
+            text = whisper.get("text")
+            if isinstance(text, str) and text.strip():
+                return text.strip()
+
+        # Fallbacks (in case service changes / other endpoints)
+        text = body.get("text")
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+
+        data = body.get("data")
+        if isinstance(data, dict):
+            text2 = data.get("text")
+            if isinstance(text2, str) and text2.strip():
+                return text2.strip()
+
+    return ""

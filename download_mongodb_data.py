@@ -864,7 +864,7 @@ def extract_first_resource_url(doc: Dict[str, Any]) -> Optional[str]:
     if not isinstance(dm, dict):
         dm = {}
 
-    # Try common patterns (adjust as per your real schema if you know the exact field)
+    # Try common patterns
     candidates = [
         first.get("url"),
         first.get("download_url"),
@@ -903,8 +903,8 @@ def is_youtube_url(u: str) -> bool:
 
 def transcribe_media_url(url: str, session: requests.Session) -> str:
     """
-    Calls your transcription endpoint. Assumes it accepts JSON: {"url": "..."}.
-    Adjust request/response parsing to match your service.
+    Calls transcription endpoint. Assumes it accepts JSON: {"url": "..."}.
+    Adjust request/response parsing to match service.
     """
     endpoint = os.getenv("TRANSCRIBE_ENDPOINT_URL", "https://media-transcriber.nexavion.com/transcribe").strip()
     if not endpoint:
@@ -1135,7 +1135,7 @@ def patch_url_only_docs_with_extracted_text(
                             translate_to=translate_to,
                             http_client=sess,  # shares cookies/proxies if you set them on the session
                         )
-                        # Convert to plain text (your STT format uses start/end; mirror that)
+                        # Convert to plain text
                         text_from_caps = "\n".join(s["text"] for s in segs if s.get("text"))
                         # Return a tagged payload so the main loop can set source fields
                         return (llid, url, text_from_caps, "youtube_captions")
@@ -1143,7 +1143,7 @@ def patch_url_only_docs_with_extracted_text(
                         # Fall back to HTML extractor for YT pages if captions blocked/missing
                         logging.info("[Patch] Captions unavailable for %s (%s): %s", llid, url, cap_err)
 
-            # --- 2) Generic HTML/article extraction path (your existing service) ---
+            # --- 2) Generic HTML/article extraction path ---
             text = fetch_url_text_with_extractor(
                 url,
                 timeout=int(os.getenv("EXTRACTOR_TIMEOUT", "150")),
