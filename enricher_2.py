@@ -6,14 +6,11 @@ import json
 import logging
 import os
 import random
-import threading
 import time
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-
-import requests
 
 try:
     from dotenv import load_dotenv
@@ -25,98 +22,11 @@ from deapi_transcribe import transcribe_video, DeapiError
 from job_lock import acquire_job_lock, release_job_lock
 from io_helpers import (resolve_latest_pointer, find_latest_matching, atomic_write_json, update_latest_pointer,
                         run_stamp, output_dir)
-from utils import (fetch_url_text_with_extractor, has_enrich_via, should_skip, target_url_for_enrichment,
-                   is_placeholder_content, is_deapi_platform_url)
+from enricher_utils import (pagesense_one, safe_host, custom_transcribe_one, load_stage_payload)
+from utils import (has_enrich_via, should_skip, target_url_for_enrichment, is_placeholder_content, is_deapi_platform_url)
 
 
 logger = logging.getLogger(__name__)
-_tls = threading.local()
-
-# ---------------- HTTP session helpers ----------------
-def get_public_session(timeout: int = 30) -> requests.Session:
-    """
-    Thread-local session for calling external services (PageSense, sniffing, etc).
-    Does NOT include backend basic auth.
-    """
-    key = f"public|{timeout}"
-    sess = getattr(_tls, "session", None)
-    sess_key = getattr(_tls, "session_key", None)
-
-    if sess is None or sess_key != key:
-        try:
-            if sess is not None:
-                sess.close()
-        except Exception:
-            pass
-
-        s = requests.Session()
-        s.headers.update({"accept": "application/json"})
-
-        # Default timeout wrapper (like downloader)
-        original = s.request
-
-        def _with_timeout(method, url, **kw):
-            kw.setdefault("timeout", timeout)
-            return original(method, url, **kw)
-
-        s.request = _with_timeout  # type: ignore[attr-defined]
-
-        _tls.session = s
-        _tls.session_key = key
-        sess = s
-
-    return sess
-
-def download_to_tempfile(url: str) -> Optional[Path]:
-    """
-    Downloads a URL to a local temp file (streaming).
-    Returns the file path, or None on failure.
-    """
-    import tempfile
-    from urllib.parse import urlparse
-
-    try:
-        # Best-effort filename extension
-        path = urlparse(url).path
-        suffix = ""
-        if "." in path:
-            suffix = "." + path.split(".")[-1][:10]  # keep it sane
-
-        fd, tmp_name = tempfile.mkstemp(prefix="deapi_media_", suffix=suffix)
-        os.close(fd)
-
-        sess = get_public_session(timeout=int(os.getenv("MEDIA_DL_HTTP_TIMEOUT", "60")))
-        with sess.get(url, stream=True) as r:
-            r.raise_for_status()
-            max_bytes = int(os.getenv("MEDIA_DL_MAX_BYTES", str(2 * 1024 * 1024 * 1024))) # 2 GB
-            written = 0
-
-            with open(tmp_name, "wb") as f:
-                for chunk in r.iter_content(chunk_size=1024 * 256):
-                    if not chunk:
-                        continue
-                    f.write(chunk)
-                    written += len(chunk)
-                    if written > max_bytes:
-                        raise RuntimeError(f"Media download exceeded limit: {written} bytes")
-
-        return Path(tmp_name)
-
-    except Exception as e:
-        logger.error("[MediaDownloadFail] host=%s err=%s", _safe_host(url), e)
-        try:
-            if "tmp_name" in locals() and tmp_name and os.path.exists(tmp_name):
-                os.remove(tmp_name)
-        except Exception:
-            pass
-        return None
-# ---------------- HTTP session helpers ----------------
-
-
-# ---------------- Small utilities ----------------
-def _load_stage_payload(path: Path) -> Dict[str, Any]:
-    with path.open("r", encoding="utf-8") as fh:
-        return json.load(fh)
 
 def load_latest_downloader_output(env_mode: str, output_root: str) -> Tuple[Path, List[Dict[str, Any]]]:
     # Prefer pointer file first
@@ -126,7 +36,7 @@ def load_latest_downloader_output(env_mode: str, output_root: str) -> Tuple[Path
     if p is None:
         raise RuntimeError(f"No downloader output found under {output_root}/{env_mode.upper()}/")
 
-    payload = _load_stage_payload(p)
+    payload = load_stage_payload(p)
 
     # Support both shapes: full payload dict OR raw docs list
     if isinstance(payload, dict):
@@ -149,7 +59,7 @@ def load_latest_enricher_output(env_mode: str, output_root: str) -> Tuple[Option
     if p is None:
         return None, []
 
-    payload = _load_stage_payload(p)
+    payload = load_stage_payload(p)
     if isinstance(payload, dict):
         docs = payload.get("docs") or []
     elif isinstance(payload, list):
@@ -172,16 +82,6 @@ def _index_docs_by_llid(docs: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]
 
 def _now_perf() -> float:
     return time.perf_counter()
-
-def _safe_host(url: Any) -> str:
-    try:
-        from urllib.parse import urlparse
-        if isinstance(url, (bytes, bytearray)):
-            url = url.decode("utf-8", "ignore")
-        u = urlparse(str(url))
-        return f"{u.scheme}://{u.netloc}"
-    except Exception:
-        return "unknown://"
 
 def _inc(counter: Dict[str, int], key: str, n: int = 1) -> None:
     counter[key] = counter.get(key, 0) + n
@@ -255,21 +155,21 @@ def transcribe_with_deapi(*, video_url: Optional[str] = None, video_path: Option
         if not text:
             logger.warning(
                 "[deAPI] Empty transcript. status=%s request_id=%s url_host=%s",
-                result.status, result.request_id, _safe_host(video_url)
+                result.status, result.request_id, safe_host(video_url)
             )
             return None
         return text
 
     except DeapiError as e:
-        logger.error("[deAPI] Transcription failed url_host=%s err=%s", _safe_host(video_url), e)
+        logger.error("[deAPI] Transcription failed url_host=%s err=%s", safe_host(video_url), e)
         return None
     except Exception as e:
-        logger.exception("[deAPI] Unexpected error url_host=%s err=%s", _safe_host(video_url), e)
+        logger.exception("[deAPI] Unexpected error url_host=%s err=%s", safe_host(video_url), e)
         return None
 # ---------------- deAPI transcription ----------------
 
 
-def _carry_forward_enrichment(doc: Dict[str, Any], prev: Optional[Dict[str, Any]]) -> bool:
+def carry_forward_enrichment(doc: Dict[str, Any], prev: Optional[Dict[str, Any]]) -> bool:
     """
     If prev has valid enrichment and current doc doesn't, copy it over.
     Returns True if we copied anything.
@@ -299,6 +199,12 @@ def _carry_forward_enrichment(doc: Dict[str, Any], prev: Optional[Dict[str, Any]
         doc["ko_content_source"] = prev["ko_content_source"]
     if isinstance(prev.get("ko_content_url"), str):
         doc["ko_content_url"] = prev["ko_content_url"]
+
+    logger.info(
+        "[EnrichCarryForward] llid=%s source=%s",
+        doc.get("_orig_id") or doc.get("_id"),
+        prev.get("ko_content_source")
+    )
 
     return True
 
@@ -335,15 +241,17 @@ def enrich_docs_via_routes(
 
     for llid, doc in idx.items():
         if not has_enrich_via(doc):
+            logger.debug("[EnrichSkip] llid=%s reason=no_route", llid)
             skipped_no_route += 1
             continue
 
         prev = prev_enriched_index.get(llid)
 
         # Carry forward previous enrichment so we don't overwrite good content with placeholders
-        _carry_forward_enrichment(doc, prev)
+        carry_forward_enrichment(doc, prev)
 
         if should_skip(doc, prev):
+            logger.debug("[EnrichSkip] llid=%s reason=prev_done", llid)
             skipped_prev_done += 1
             continue
 
@@ -360,8 +268,14 @@ def enrich_docs_via_routes(
 
         target = target_url_for_enrichment(doc)
         if not target:
+            logger.warning("[EnrichSkip] llid=%s route=%s reason=missing_target", llid, route)
             skipped_missing_target += 1
             continue
+
+        logger.info(
+            "[EnrichQueue] ID=%s route=%s target_host=%s",
+            llid, route, target
+        )
 
         candidates.append((llid, route, target))
 
@@ -389,34 +303,6 @@ def enrich_docs_via_routes(
 
     failure_reasons: Dict[str, int] = {}
 
-    # ---- pagesense runner ----
-    def _pagesense_one(llid: str, url: str) -> Tuple[str, str, Optional[str], str]:
-        time.sleep(random.uniform(0.05, 0.25))
-        try:
-            sess = get_public_session(timeout=int(os.getenv("EXTRACTOR_HTTP_TIMEOUT", "35")))
-            text = fetch_url_text_with_extractor(
-                url,
-                timeout=int(os.getenv("EXTRACTOR_TIMEOUT", "150")),
-                retries=int(os.getenv("EXTRACTOR_RETRIES", "3")),
-                backoff=float(os.getenv("EXTRACTOR_BACKOFF", "1.6")),
-                min_chars=int(os.getenv("EXTRACTOR_MIN_CHARS", "100")),
-                session=sess,
-            )
-            return llid, url, (text.strip() if isinstance(text, str) else None), "pagesense"
-        except Exception as e:
-            logger.error("[PageSenseFail] llid=%s host=%s err=%s", llid, _safe_host(url), e)
-            return llid, url, None, "pagesense:failed"
-
-    def transcribe_with_custom_api(*, file_path: Path) -> Optional[str]:
-        """
-        Placeholder for your custom transcription service.
-
-        Later you can:
-          - POST the file to your service
-          - Or upload to storage and send a URL
-        """
-        return None
-
     # ---- transcribe runner ----
     def _api_transcribe_one(llid: str, url: str) -> Tuple[str, str, Optional[str], str]:
         """
@@ -434,37 +320,6 @@ def enrich_docs_via_routes(
             return llid, url, text.strip(), "api_transcribe"
         return llid, url, None, "api_transcribe:failed"
 
-    def _custom_transcribe_one(llid: str, url: str) -> Tuple[str, str, Optional[str], str]:
-        """
-        custom_transcribe: download hosted file (S3/whatever) and send to your custom transcription API.
-        For now this calls a placeholder 'transcribe_with_custom_api(...)' that you'll implement later.
-        """
-        time.sleep(random.uniform(0.05, 0.25))
-
-        tmp: Optional[Path] = None
-        try:
-            tmp = download_to_tempfile(url)
-            if not tmp:
-                return llid, url, None, "custom_transcribe:download_failed"
-
-            if not tmp.exists() or tmp.stat().st_size == 0:
-                logger.error("[MediaDL] Empty download llid=%s path=%s", llid, tmp)
-                return llid, url, None, "custom_transcribe:download_empty"
-
-            # TODO: implement this later (send file to custom API)
-            text = transcribe_with_custom_api(file_path=tmp)
-
-            if text and isinstance(text, str) and text.strip():
-                return llid, url, text.strip(), "custom_transcribe"
-            return llid, url, None, "custom_transcribe:failed"
-
-        finally:
-            if tmp:
-                try:
-                    tmp.unlink(missing_ok=True)
-                except Exception:
-                    pass
-
     # Apply patch helper
     def _apply_success(doc: Dict[str, Any], *, text: str, source: str, url: str) -> None:
         if isinstance(max_chars, int) and max_chars > 0:
@@ -478,7 +333,12 @@ def enrich_docs_via_routes(
     if pagesense_jobs:
         max_w = int(os.getenv("EXTRACTOR_MAX_WORKERS", str(extractor_workers)))
         with ThreadPoolExecutor(max_workers=max_w) as ex:
-            futs = [ex.submit(_pagesense_one, llid, url) for llid, url in pagesense_jobs]
+            http_timeout = int(os.getenv("EXTRACTOR_HTTP_TIMEOUT", "35"))
+            futs = [
+                ex.submit(pagesense_one, llid=llid, url=url, http_timeout=http_timeout)
+                for llid, url in pagesense_jobs
+            ]
+
             for fut in as_completed(futs):
                 llid, url, text, tag = fut.result()
                 doc = idx.get(llid)
@@ -512,7 +372,11 @@ def enrich_docs_via_routes(
     if custom_transcribe_jobs:
         max_w = int(os.getenv("TRANSCRIBE_MAX_WORKERS", str(transcribe_workers)))
         with ThreadPoolExecutor(max_workers=max_w) as ex:
-            futs = [ex.submit(_custom_transcribe_one, llid, url) for llid, route, url in custom_transcribe_jobs]
+            futs = [
+                ex.submit(custom_transcribe_one, llid=llid, url=url)
+                for llid, route, url in custom_transcribe_jobs
+            ]
+
             for fut in as_completed(futs):
                 llid, url, text, tag = fut.result()
                 doc = idx.get(llid)
@@ -527,7 +391,6 @@ def enrich_docs_via_routes(
 
     patched_total = patched_pagesense + patched_transcribe
     failed_total = failed_pagesense + failed_transcribe
-    # skipped_total = len(docs) - patched_total
 
     logger.warning(
         "[EnricherDone] candidates=%d patched=%d failed=%d skipped_prev=%d",
@@ -543,7 +406,6 @@ def enrich_docs_via_routes(
         "failed": failed_total,
         "failed_pagesense": failed_pagesense,
         "failed_transcribe": failed_transcribe,
-        # "skipped": skipped_total,
         "skipped_no_route": skipped_no_route,
         "skipped_prev_done": skipped_prev_done,
         "skipped_disabled": skipped_disabled,
