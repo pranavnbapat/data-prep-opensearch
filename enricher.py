@@ -6,72 +6,29 @@ import json
 import logging
 import os
 import random
-import threading
 import time
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import requests
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
 
 from deapi_transcribe import transcribe_video, DeapiError
 from job_lock import acquire_job_lock, release_job_lock
 from io_helpers import (resolve_latest_pointer, find_latest_matching, atomic_write_json, update_latest_pointer,
                         run_stamp, output_dir)
-from utils import (
-    fetch_url_text_with_extractor,
-    flatten_ko_content
-)
+from enricher_utils import (pagesense_one, safe_host, custom_transcribe_one, load_stage_payload)
+from utils import (has_enrich_via, should_skip, target_url_for_enrichment, is_placeholder_content, is_deapi_platform_url)
 
 
 logger = logging.getLogger(__name__)
-_tls = threading.local()
 
-# ---------------- HTTP session helpers ----------------
-def get_public_session(timeout: int = 30) -> requests.Session:
-    """
-    Thread-local session for calling external services (PageSense, sniffing, etc).
-    Does NOT include backend basic auth.
-    """
-    key = f"public|{timeout}"
-    sess = getattr(_tls, "session", None)
-    sess_key = getattr(_tls, "session_key", None)
-
-    if sess is None or sess_key != key:
-        try:
-            if sess is not None:
-                sess.close()
-        except Exception:
-            pass
-
-        s = requests.Session()
-        s.headers.update({"accept": "application/json"})
-
-        # Default timeout wrapper (like downloader)
-        original = s.request
-
-        def _with_timeout(method, url, **kw):
-            kw.setdefault("timeout", timeout)
-            return original(method, url, **kw)
-
-        s.request = _with_timeout  # type: ignore[attr-defined]
-
-        _tls.session = s
-        _tls.session_key = key
-        sess = s
-
-    return sess
-# ---------------- HTTP session helpers ----------------
-
-
-# ---------------- Small utilities ----------------
-def _load_stage_payload(path: Path) -> Dict[str, Any]:
-    with path.open("r", encoding="utf-8") as fh:
-        return json.load(fh)
-
-def load_latest_downloader_output(env_mode: str, output_root: str) -> Tuple[Path, List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+def load_latest_downloader_output(env_mode: str, output_root: str) -> Tuple[Path, List[Dict[str, Any]]]:
     # Prefer pointer file first
     p = resolve_latest_pointer(env_mode, output_root, "latest_downloaded.json")
     if p is None:
@@ -79,29 +36,41 @@ def load_latest_downloader_output(env_mode: str, output_root: str) -> Tuple[Path
     if p is None:
         raise RuntimeError(f"No downloader output found under {output_root}/{env_mode.upper()}/")
 
-    payload = _load_stage_payload(p)
+    payload = load_stage_payload(p)
 
     # Support both shapes: full payload dict OR raw docs list
     if isinstance(payload, dict):
         docs = payload.get("docs") or []
-        url_tasks = payload.get("url_tasks") or []
-        media_tasks = payload.get("media_tasks") or []
     elif isinstance(payload, list):
         docs = payload
-        url_tasks = []
-        media_tasks = []
     else:
         raise RuntimeError(f"Unexpected payload shape in {p}: {type(payload)}")
 
     if not isinstance(docs, list):
         raise RuntimeError(f"Invalid docs in {p}")
 
-    return p, docs, url_tasks, media_tasks
+    return p, docs
 
-def _is_placeholder_content(val: Any) -> bool:
-    if not isinstance(val, str):
-        return True
-    return val.strip().lower() in ("", "no content present")
+def load_latest_enricher_output(env_mode: str, output_root: str) -> Tuple[Optional[Path], List[Dict[str, Any]]]:
+    # Prefer pointer file first
+    p = resolve_latest_pointer(env_mode, output_root, "latest_enriched.json")
+    if p is None:
+        p = find_latest_matching(env_mode, output_root, "final_enriched_*.json")
+    if p is None:
+        return None, []
+
+    payload = load_stage_payload(p)
+    if isinstance(payload, dict):
+        docs = payload.get("docs") or []
+    elif isinstance(payload, list):
+        docs = payload
+    else:
+        return p, []
+
+    if not isinstance(docs, list):
+        return p, []
+
+    return p, docs
 
 def _index_docs_by_llid(docs: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     idx: Dict[str, Dict[str, Any]] = {}
@@ -113,15 +82,6 @@ def _index_docs_by_llid(docs: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]
 
 def _now_perf() -> float:
     return time.perf_counter()
-
-def _safe_host(url: str) -> str:
-    # Keep logs readable; avoids dumping full URLs with long querystrings.
-    try:
-        from urllib.parse import urlparse
-        u = urlparse(url)
-        return f"{u.scheme}://{u.netloc}"
-    except Exception:
-        return "unknown://"
 
 def _inc(counter: Dict[str, int], key: str, n: int = 1) -> None:
     counter[key] = counter.get(key, 0) + n
@@ -145,21 +105,10 @@ def _norm_ext(e: Any) -> str:
         e = e[1:]
     return e
 
-def _is_youtube_url(u: str) -> bool:
-    if not isinstance(u, str):
-        return False
-    v = u.lower()
-    return (
-        "youtube.com/watch" in v or
-        "youtube.com/live" in v or
-        "youtube.com/shorts" in v or
-        "youtu.be/" in v
-    )
 # ---------------- Small utilities ----------------
 
 
 # ---------------- deAPI transcription ----------------
-
 def transcribe_with_deapi(*, video_url: Optional[str] = None, video_path: Optional[Path] = None) -> Optional[str]:
     """
     Uses deAPI to transcribe a video URL and returns plain text or None.
@@ -178,607 +127,294 @@ def transcribe_with_deapi(*, video_url: Optional[str] = None, video_path: Option
     max_wait_s = int(os.getenv("DEAPI_MAX_WAIT_SEC", str(12 * 60)))  # 12 min default
 
     try:
+        if video_url is not None and isinstance(video_url, (bytes, bytearray)):
+            video_url = video_url.decode("utf-8", "ignore")
+
+        video_arg: Optional[str] = None
+        if isinstance(video_url, str) and video_url.strip():
+            video_arg = video_url.strip()
+        elif video_path is not None:
+            video_arg = str(video_path)
+
+        if not video_arg:
+            logger.error("[deAPI] Missing video source (both url and path empty)")
+            return None
+
         result = transcribe_video(
             api_key=api_key,
-            video=video_url,                   # URL in -> /vid2txt
-            video_path=str(video_path),
+            video=video_arg,
             model=model,
             include_timestamps=include_ts,
-            return_result_in_response=True,    # best chance to get text inline
+            return_result_in_response=True,
             timeout_s=timeout_s,
             poll_interval_s=poll_interval_s,
             max_wait_s=max_wait_s,
         )
+
         text = (result.transcript_text or "").strip()
         if not text:
             logger.warning(
                 "[deAPI] Empty transcript. status=%s request_id=%s url_host=%s",
-                result.status, result.request_id, _safe_host(video_url)
+                result.status, result.request_id, safe_host(video_url)
             )
             return None
         return text
 
     except DeapiError as e:
-        logger.error("[deAPI] Transcription failed url_host=%s err=%s", _safe_host(video_url), e)
+        logger.error("[deAPI] Transcription failed url_host=%s err=%s", safe_host(video_url), e)
         return None
     except Exception as e:
-        logger.exception("[deAPI] Unexpected error url_host=%s err=%s", _safe_host(video_url), e)
+        logger.exception("[deAPI] Unexpected error url_host=%s err=%s", safe_host(video_url), e)
         return None
 # ---------------- deAPI transcription ----------------
 
 
-# ---------------- Routing decision ----------------
-@dataclass(frozen=True)
-class RouteDecision:
-    action: str          # "extract" | "transcribe" | "skip"
-    tag: str             # used in ko_content_source and logging
-    reason: str = ""     # extra human-friendly reason for debug
-
-
-_MEDIA_EXTS = {"mp4", "mov", "m4a", "mp3", "wav", "aac", "ogg", "webm"}
-_PDF_EXTS = {"pdf"}
-_IMAGE_EXTS = {"jpg", "jpeg", "png", "svg", "webp", "tif", "tiff"}
-
-
-def _guess_ext_from_headers(content_type: str, content_disp: str, url: str) -> str:
+def carry_forward_enrichment(doc: Dict[str, Any], prev: Optional[Dict[str, Any]]) -> bool:
     """
-    Best-effort extension inference from HTTP headers + URL path.
-    This is intentionally conservative; it only helps disambiguate octet-stream URL-only items.
+    If prev has valid enrichment and current doc doesn't, copy it over.
+    Returns True if we copied anything.
     """
-    ct = (content_type or "").split(";")[0].strip().lower()
-    cd = (content_disp or "").lower()
+    if not prev:
+        return False
 
-    # Try filename= from Content-Disposition
-    try:
-        import re
-        m = re.search(r'filename\*?=(?:utf-8\'\')?"?([^";]+)"?', cd)
-        if m:
-            fn = m.group(1).strip().strip('"')
-            if "." in fn:
-                return _norm_ext(fn.rsplit(".", 1)[-1])
-    except Exception:
-        pass
+    prev_text = prev.get("ko_content_flat")
+    prev_enriched = int(prev.get("enriched") or 0) == 1
 
-    # Try common content-types
-    if ct == "application/pdf":
-        return "pdf"
-    if ct.startswith("video/"):
-        # video/mp4 -> mp4, etc.
-        return ct.split("/", 1)[-1].strip() or ""
-    if ct.startswith("audio/"):
-        return ct.split("/", 1)[-1].strip() or ""
-    if ct.startswith("image/"):
-        return ct.split("/", 1)[-1].strip() or ""
+    # Only carry forward if prev looks enriched and current isn't
+    if not prev_enriched or not isinstance(prev_text, str) or is_placeholder_content(prev_text):
+        return False
 
-    # Lastly, try URL path suffix
-    try:
-        from urllib.parse import urlparse
-        path = urlparse(url).path or ""
-        if "." in path:
-            return _norm_ext(path.rsplit(".", 1)[-1])
-    except Exception:
-        pass
+    cur_text = doc.get("ko_content_flat")
+    cur_enriched = int(doc.get("enriched") or 0) == 1
 
-    return ""
+    if cur_enriched and isinstance(cur_text, str) and not is_placeholder_content(cur_text):
+        return False  # already has content
 
+    # Copy the enrichment payload
+    doc["ko_content_flat"] = prev_text
+    doc["enriched"] = 1
 
-def _sniff_url_headers(url: str, session: requests.Session) -> Tuple[str, str]:
-    """
-    HEAD sniff to improve routing when mimetype is missing/unknown (e.g., application/octet-stream).
-    Returns (content_type, content_disposition). Empty strings on failure.
-
-    NOTE: This is for routing only, not for downloading content.
-    """
-    try:
-        # Some hosts reject HEAD; allow fallback to GET with Range if enabled.
-        r = session.head(url, allow_redirects=True, timeout=int(os.getenv("HEAD_SNIFF_TIMEOUT", "15")))
-        ct = r.headers.get("Content-Type", "") or ""
-        cd = r.headers.get("Content-Disposition", "") or ""
-        if ct or cd:
-            return ct, cd
-    except Exception:
-        pass
-
-    if _env_bool("HEAD_SNIFF_ALLOW_GET_FALLBACK", False):
-        try:
-            # Tiny GET: ask for first byte only (many servers honour it).
-            headers = {"Range": "bytes=0-0"}
-            r = session.get(url, headers=headers, stream=True, allow_redirects=True, timeout=int(os.getenv("HEAD_SNIFF_TIMEOUT", "15")))
-            ct = r.headers.get("Content-Type", "") or ""
-            cd = r.headers.get("Content-Disposition", "") or ""
-            return ct, cd
-        except Exception:
-            pass
-
-    return "", ""
-
-def _download_media_to_temp(url: str, llid: str, session: requests.Session) -> Optional[Path]:
-    """
-    Download hosted media to a temp file for deAPI upload.
-    """
-    tmp_dir = Path(os.getenv("ENRICH_MEDIA_TMP_DIR", "output/_tmp_media"))
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    out_path = tmp_dir / f"{llid}.bin"
-
-    try:
-        with session.get(url, stream=True, allow_redirects=True, timeout=int(os.getenv("MEDIA_DL_TIMEOUT", "120"))) as r:
-            r.raise_for_status()
-            with out_path.open("wb") as fh:
-                for chunk in r.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        fh.write(chunk)
-        return out_path
-    except Exception as e:
-        logger.error("[MediaDownloadFail] llid=%s url_host=%s err=%s", llid, _safe_host(url), e)
-        return None
-
-def decide_route(
-    *,
-    kind: str,
-    url: str,
-    is_url_only: bool,
-    ko_is_hosted: bool,
-    mimetype: str,
-    ext: str,
-    enable_pdf: bool,
-    enable_images: bool,
-    enable_head_sniff: bool,
-    head_session: Optional[requests.Session],
-) -> RouteDecision:
-    """
-    Decide what to do with this task. This is where your KO distribution logic lives.
-
-    Important: we *never* send PDFs/images to deAPI vid2txt. For now we skip them (or you can add extractors later).
-    """
-    mt = _norm_mimetype(mimetype)
-    ex = _norm_ext(ext)
-
-    # 1) YouTube: always treat as transcription target (URL-only or otherwise)
-    if mt == "external/youtube" or _is_youtube_url(url):
-        return RouteDecision(action="transcribe", tag="deapi_vid2txt", reason="youtube")
-
-    # 2) Clear media mimetypes
-    if mt.startswith("video/") or mt.startswith("audio/"):
-        return RouteDecision(action="transcribe", tag="deapi_vid2txt", reason=f"mimetype={mt}")
-
-    # 3) Clear PDF
-    if mt == "application/pdf":
-        if enable_pdf:
-            # Placeholder: wire your PDF extractor here later.
-            return RouteDecision(action="skip", tag="skip:pdf:not_implemented", reason="pdf extractor not implemented")
-        return RouteDecision(action="skip", tag="skip:pdf:disabled", reason="pdf disabled")
-
-    # 4) Clear images
-    if mt.startswith("image/"):
-        if enable_images:
-            # Placeholder: wire OCR (deAPI img2txt) here later.
-            return RouteDecision(action="skip", tag="skip:image:not_implemented", reason="image OCR not implemented")
-        return RouteDecision(action="skip", tag="skip:image:disabled", reason="image disabled")
-
-    # 5) Octet-stream / missing / unreliable mimetype: route via extension or sniff
-    if mt in ("application/octet-stream", ""):
-        # Extension-based decision first (cheap and reliable when present)
-        if ex in _MEDIA_EXTS:
-            return RouteDecision(action="transcribe", tag="deapi_vid2txt", reason=f"ext={ex}")
-        if ex in _PDF_EXTS:
-            if enable_pdf:
-                return RouteDecision(action="skip", tag="skip:pdf:not_implemented", reason="pdf extractor not implemented")
-            return RouteDecision(action="skip", tag="skip:pdf:disabled", reason="pdf disabled")
-        if ex in _IMAGE_EXTS:
-            if enable_images:
-                return RouteDecision(action="skip", tag="skip:image:not_implemented", reason="image OCR not implemented")
-            return RouteDecision(action="skip", tag="skip:image:disabled", reason="image disabled")
-
-        # For URL tasks only, we can optionally HEAD-sniff to disambiguate
-        if kind == "url" and enable_head_sniff and head_session is not None:
-            ct, cd = _sniff_url_headers(url, head_session)
-            sniff_ext = _guess_ext_from_headers(ct, cd, url)
-            sniff_ext = _norm_ext(sniff_ext)
-
-            if sniff_ext in _MEDIA_EXTS:
-                return RouteDecision(action="transcribe", tag="deapi_vid2txt", reason=f"sniff_ext={sniff_ext}")
-            if sniff_ext in _PDF_EXTS:
-                if enable_pdf:
-                    return RouteDecision(action="skip", tag="skip:pdf:not_implemented", reason="pdf extractor not implemented")
-                return RouteDecision(action="skip", tag="skip:pdf:disabled", reason="pdf disabled")
-            if sniff_ext in _IMAGE_EXTS:
-                if enable_images:
-                    return RouteDecision(action="skip", tag="skip:image:not_implemented", reason="image OCR not implemented")
-                return RouteDecision(action="skip", tag="skip:image:disabled", reason="image disabled")
-
-        # If still unknown:
-        # - If it's a URL task, try URL extractor (might be a normal webpage mislabelled as octet-stream).
-        # - If it's a media task with unknown type, avoid calling deAPI blindly: skip for now.
-        if kind == "url":
-            return RouteDecision(action="extract", tag="external_url_extractor", reason="octet-stream url -> try extractor")
-        return RouteDecision(action="skip", tag="skip:unknown_media", reason="octet-stream media with unknown ext")
-
-    # 6) Everything else: treat as webpage URL extraction for url tasks, otherwise skip
-    if kind == "url":
-        return RouteDecision(action="extract", tag="external_url_extractor", reason=f"default url mt={mt or 'none'}")
-    return RouteDecision(action="skip", tag="skip:unhandled", reason=f"default media mt={mt or 'none'}")
-# ---------------- Routing decision ----------------
-
-
-# ---------------- Core enrichment entrypoint ----------------
-def enrich_external_content(
-    docs: List[Dict[str, Any]],
-    url_tasks: List[Dict[str, Any]],
-    media_tasks: List[Dict[str, Any]],
-    *,
-    ko_content_mode: str = None,
-    previous_index: Optional[Dict[str, Dict[str, Any]]] = None,
-    extractor_workers: int = 4,
-    transcribe_workers: int = 3,
-    max_chars: Optional[int] = None,
-) -> Dict[str, Any]:
-    """
-    Patches docs in-place using a routing logic driven by mimetype/extension/URL pattern.
-
-    Notes:
-    - deAPI is used for video/audio transcription only.
-    - PDFs/images are currently skipped (by design) unless you later add extractors.
-    """
-    if not docs:
-        return {"patched": 0, "reused": 0, "failed": 0, "skipped": 0}
-
-    ko_content_mode = (ko_content_mode or os.getenv("KO_CONTENT_MODE", "flat_only")).strip() or "flat_only"
-    prev_index = previous_index or {}
-
-    # Feature flags
-    enable_url_extract = _env_bool("ENRICH_ENABLE_URL_EXTRACT", True)
-    enable_transcribe = _env_bool("ENRICH_ENABLE_TRANSCRIBE", True)
-    enable_deapi_transcribe = _env_bool("ENRICH_ENABLE_DEAPI_TRANSCRIBE", True)
-
-    # These are routing toggles (future work):
-    enable_pdf = _env_bool("ENRICH_ENABLE_PDF_EXTRACT", False)
-    enable_images = _env_bool("ENRICH_ENABLE_IMAGE_OCR", False)
-
-    # Sniffing is specifically for octet-stream URL-only ambiguity
-    enable_head_sniff = _env_bool("ENRICH_ENABLE_HEAD_SNIFF", True)
+    # Preserve provenance if present
+    if isinstance(prev.get("ko_content_source"), str):
+        doc["ko_content_source"] = prev["ko_content_source"]
+    if isinstance(prev.get("ko_content_url"), str):
+        doc["ko_content_url"] = prev["ko_content_url"]
 
     logger.info(
-        "[EnricherFlags] url_extract=%s transcribe=%s deapi_transcribe=%s pdf=%s images=%s head_sniff=%s",
-        enable_url_extract, enable_transcribe, enable_deapi_transcribe, enable_pdf, enable_images, enable_head_sniff
+        "[EnrichCarryForward] llid=%s source=%s",
+        doc.get("_orig_id") or doc.get("_id"),
+        prev.get("ko_content_source")
     )
+
+    return True
+
+def enrich_docs_via_routes(
+    docs: List[Dict[str, Any]],
+    *,
+    prev_enriched_index: Dict[str, Dict[str, Any]],
+    extractor_workers: int,
+    transcribe_workers: int,
+    max_chars: Optional[int],
+) -> Dict[str, Any]:
+    """
+    Mutates docs in-place.
+
+    Only enriches docs that have enrich_via in {"pagesense", "api_transcribe", "custom_transcribe"}.
+    Skips if already enriched in previous enricher snapshot AND @id unchanged.
+    Writes enriched text into ko_content_flat.
+    """
+    if not docs:
+        return {"patched": 0, "skipped": 0, "failed": 0}
+
+    enable_pagesense = _env_bool("ENRICH_ENABLE_URL_EXTRACT", True)
+    enable_api_transcribe = _env_bool("ENRICH_ENABLE_API_TRANSCRIBE", True)
+    enable_custom_transcribe = _env_bool("ENRICH_ENABLE_CUSTOM_TRANSCRIBE", True)
 
     idx = _index_docs_by_llid(docs)
 
-    t0 = _now_perf()
-    logger.warning(
-        "[EnricherStart] docs=%d url_tasks=%d media_tasks=%d ko_content_mode=%s extractor_workers=%d transcribe_workers=%d",
-        len(docs), len(url_tasks or []), len(media_tasks or []), ko_content_mode, extractor_workers, transcribe_workers
-    )
+    # ---- build candidates ----
+    candidates: List[Tuple[str, str, str]] = []  # (llid, route, target_url)
+    skipped_no_route = 0
+    skipped_prev_done = 0
+    skipped_disabled = 0
+    skipped_missing_target = 0
 
-    # --- build a unified worklist ---
-    # Each item: (llid, url, kind, is_url_only, ko_is_hosted, mimetype, ext)
-    work: List[Tuple[str, str, str, bool, bool, Optional[str], Optional[str]]] = []
-
-    seen = set()
-
-    for row in url_tasks or []:
-        llid = row.get("logical_layer_id")
-        url = row.get("first_url") or row.get("url")
-        if not llid or not url:
-            continue
-        if llid in seen:
-            continue
-        seen.add(llid)
-        doc = idx.get(str(llid), {})
-        is_url_only = bool(doc.get("is_url_only"))
-        ko_is_hosted = bool(doc.get("ko_is_hosted"))
-        mt = doc.get("ko_object_mimetype")
-        ext = doc.get("ko_object_extension")
-        work.append((str(llid), str(url), "url", is_url_only, ko_is_hosted, mt, ext))
-
-    for row in media_tasks or []:
-        llid = row.get("logical_layer_id")
-        url = row.get("media_url")
-        mt = row.get("mimetype")
-        if not llid or not url:
-            continue
-        if llid in seen:
-            continue
-        seen.add(llid)
-        doc = idx.get(str(llid), {})
-        is_url_only = bool(doc.get("is_url_only"))  # usually False / missing for hosted media, but safe
-        ko_is_hosted = bool(doc.get("ko_is_hosted"))
-        ext = doc.get("ko_object_extension")
-        work.append((str(llid), str(url), "media", is_url_only, ko_is_hosted, mt, ext))
-
-    if not work:
-        return {"patched": 0, "reused": 0, "failed": 0, "skipped": 0}
-
-    kind_counts: Dict[str, int] = {}
-    host_counts: Dict[str, int] = {}
-    for _llid, url, kind, _mt, _ext in work:
-        _inc(kind_counts, kind)
-        _inc(host_counts, _safe_host(url))
-
-    logger.info(
-        "[EnricherWorklist] total=%d kinds=%s unique_hosts=%d top_host=%s",
-        len(work),
-        kind_counts,
-        len(host_counts),
-        (sorted(host_counts.items(), key=lambda kv: kv[1], reverse=True)[:1] or [("n/a", 0)])[0],
-    )
-
-    # Concurrency limits (be nice to external services)
-    extractor_max = int(os.getenv("EXTRACTOR_MAX_CONCURRENCY", str(extractor_workers)))
-    transcribe_max = int(os.getenv("TRANSCRIBE_MAX_CONCURRENCY", str(transcribe_workers)))
-    extractor_sema = threading.BoundedSemaphore(extractor_max)
-    transcribe_sema = threading.BoundedSemaphore(transcribe_max)
-
-    patched = 0
-    reused = 0
-    skipped = 0
-    failed = 0
-
-    failures: List[Dict[str, Any]] = []
-    reused_items: List[Dict[str, Any]] = []
-
-    reused_reasons: Dict[str, int] = {}
-    failure_reasons: Dict[str, int] = {}
-    source_failures: Dict[str, int] = {}
-    skipped_reasons: Dict[str, int] = {}
-
-    # --- reuse from previous snapshot when possible ---
-    work2: List[Tuple[str, str, str, Optional[str], Optional[str]]] = []
-    for llid, url, kind, mimetype, ext in work:
-        doc = idx.get(llid)
-        if not doc:
-            skipped += 1
-            _inc(skipped_reasons, "skipped:missing_doc")
+    for llid, doc in idx.items():
+        if not has_enrich_via(doc):
+            logger.debug("[EnrichSkip] llid=%s reason=no_route", llid)
+            skipped_no_route += 1
             continue
 
-        cur_flat = doc.get("ko_content_flat")
-        if not _is_placeholder_content(cur_flat):
-            skipped += 1
-            _inc(skipped_reasons, "skipped:already_has_content")
+        prev = prev_enriched_index.get(llid)
+
+        # Carry forward previous enrichment so we don't overwrite good content with placeholders
+        carry_forward_enrichment(doc, prev)
+
+        if should_skip(doc, prev):
+            logger.debug("[EnrichSkip] llid=%s reason=prev_done", llid)
+            skipped_prev_done += 1
             continue
 
-        prev_doc = prev_index.get(llid)
-        if prev_doc:
-            prev_flat = prev_doc.get("ko_content_flat")
-            prev_url = prev_doc.get("ko_content_url") or prev_doc.get("first_url")
-            if (
-                    isinstance(prev_flat, str)
-                    and prev_flat.strip()
-                    and (not _is_placeholder_content(prev_flat))
-                    and (not prev_url or prev_url == url)
-            ):
+        route = doc.get("enrich_via")
+        if route == "pagesense" and not enable_pagesense:
+            skipped_disabled += 1
+            continue
+        if route == "api_transcribe" and not enable_api_transcribe:
+            skipped_disabled += 1
+            continue
+        if route == "custom_transcribe" and not enable_custom_transcribe:
+            skipped_disabled += 1
+            continue
 
-                doc["ko_content_flat"] = prev_flat
-                if prev_doc.get("ko_content_source"):
-                    doc["ko_content_source"] = prev_doc["ko_content_source"]
-                doc["ko_content_url"] = url
-                reused += 1
-                reused_items.append({"llid": llid, "url": url, "source": doc.get("ko_content_source")})
-                _inc(reused_reasons, "reuse:prev_flat_same_url")
-                continue
+        target = target_url_for_enrichment(doc)
+        if not target:
+            logger.warning("[EnrichSkip] llid=%s route=%s reason=missing_target", llid, route)
+            skipped_missing_target += 1
+            continue
 
-        work2.append((llid, url, kind, mimetype, ext))
-
-    if reused:
-        max_show = int(os.getenv("REUSE_LOG_MAX", "10"))
-        logger.info("[EnricherReuse] reused=%d reasons=%s", reused, reused_reasons)
         logger.info(
-            "[ReusedKOs] showing=%d/%d items=%s",
-            min(max_show, len(reused_items)),
-            len(reused_items),
-            reused_items[:max_show],
+            "[EnrichQueue] ID=%s route=%s target_host=%s",
+            llid, route, target
         )
 
-    if not work2:
+        candidates.append((llid, route, target))
+
+    if not candidates:
         return {
             "patched": 0,
-            "reused": reused,
+            "skipped": len(docs),
             "failed": 0,
-            "skipped": skipped,
-            "failures": failures,
-            "skipped_reasons": skipped_reasons,
+            "skipped_no_route": skipped_no_route,
+            "skipped_prev_done": skipped_prev_done,
+            "skipped_disabled": skipped_disabled,
+            "skipped_missing_target": skipped_missing_target,
+            "candidates": 0,
         }
 
-    # --- router worker ---
-    def _route_and_fetch(item: Tuple[str, str, str, Optional[str], Optional[str]]) -> Tuple[str, str, Optional[str], str]:
-        llid, url, kind, mimetype, ext = item
+    # Separate pools (so transcribe doesn't starve pagesense)
+    pagesense_jobs = [(llid, target) for (llid, route, target) in candidates if route == "pagesense"]
+    api_transcribe_jobs = [(llid, "api_transcribe", target) for (llid, route, target) in candidates if route == "api_transcribe"]
+    custom_transcribe_jobs = [(llid, "custom_transcribe", target) for (llid, route, target) in candidates if route == "custom_transcribe"]
 
-        t_item = _now_perf()
-        logger.debug(
-            "[EnrichItemStart] llid=%s kind=%s url_host=%s mimetype_in=%r ext_in=%r",
-            llid, kind, _safe_host(url), mimetype, ext
-        )
+    patched_pagesense = 0
+    patched_transcribe = 0
+    failed_pagesense = 0
+    failed_transcribe = 0
 
-        def _slow_warn(tag: str, dt: float, thr_env: str, default_thr: float) -> None:
-            thr = float(os.getenv(thr_env, str(default_thr)))
-            if dt > thr:
-                logger.warning("[SlowEnrichCall] tag=%s llid=%s dt=%.2fs url_host=%s", tag, llid, dt, _safe_host(url))
+    failure_reasons: Dict[str, int] = {}
 
-        # stagger to avoid thundering herd
-        time.sleep(random.uniform(0.15, 0.5))
+    # ---- transcribe runner ----
+    def _api_transcribe_one(llid: str, url: str) -> Tuple[str, str, Optional[str], str]:
+        """
+        api_transcribe: send URL to deAPI (no downloading here).
+        Expected: YouTube/platform URLs only.
+        """
+        time.sleep(random.uniform(0.05, 0.25))
 
-        # For HEAD sniff we use the public session with shorter timeout
-        head_sess = None
-        if enable_head_sniff:
-            head_sess = get_public_session(timeout=int(os.getenv("HEAD_SNIFF_HTTP_TIMEOUT", "20")))
+        # Fail fast if someone mis-routed a non-supported URL into api_transcribe
+        if not is_deapi_platform_url(url):
+            return llid, url, None, "api_transcribe:unsupported_url"
 
-        decision = decide_route(
-            kind=kind,
-            url=url,
-            is_url_only=is_url_only,
-            ko_is_hosted=ko_is_hosted,
-            mimetype=mimetype or "",
-            ext=ext or "",
-            enable_pdf=enable_pdf,
-            enable_images=enable_images,
-            enable_head_sniff=enable_head_sniff,
-            head_session=head_sess,
-        )
+        text = transcribe_with_deapi(video_url=url)
+        if text and isinstance(text, str) and text.strip():
+            return llid, url, text.strip(), "api_transcribe"
+        return llid, url, None, "api_transcribe:failed"
 
-        logger.debug(
-            "[RouteDecision] llid=%s kind=%s tag=%s action=%s reason=%s",
-            llid, kind, decision.tag, decision.action, decision.reason
-        )
+    # Apply patch helper
+    def _apply_success(doc: Dict[str, Any], *, text: str, source: str, url: str) -> None:
+        if isinstance(max_chars, int) and max_chars > 0:
+            text = text[:max_chars]
+        doc["ko_content_flat"] = text
+        doc["ko_content_source"] = source  # "pagesense" or "api_transcribe" or "custom_transcribe"
+        doc["ko_content_url"] = url
+        doc["enriched"] = 1
 
-        # --- SKIP routes ---
-        if decision.action == "skip":
-            # We mark source as :skipped so the caller counts it as skipped, not failed.
-            return llid, url, None, f"{decision.tag}:skipped"
+    # run pagesense
+    if pagesense_jobs:
+        max_w = int(os.getenv("EXTRACTOR_MAX_WORKERS", str(extractor_workers)))
+        with ThreadPoolExecutor(max_workers=max_w) as ex:
+            http_timeout = int(os.getenv("EXTRACTOR_HTTP_TIMEOUT", "35"))
+            futs = [
+                ex.submit(pagesense_one, llid=llid, url=url, http_timeout=http_timeout)
+                for llid, url in pagesense_jobs
+            ]
 
-        # --- EXTRACT routes ---
-        if decision.action == "extract":
-            if not enable_url_extract:
-                logger.info("[EnrichSkip] route=%s llid=%s disabled_by_flag", decision.tag, llid)
-                return llid, url, None, f"{decision.tag}:disabled"
-
-            t_wait = _now_perf()
-            extractor_sema.acquire()
-            wait_dt = _now_perf() - t_wait
-            if wait_dt > float(os.getenv("ENRICH_SEMA_WAIT_WARN_SEC", "1.0")):
-                logger.warning("[EnrichWait] route=%s llid=%s wait=%.2fs", decision.tag, llid, wait_dt)
-
-            try:
-                sess = get_public_session(timeout=int(os.getenv("EXTRACTOR_HTTP_TIMEOUT", "35")))
-                t_call = _now_perf()
-                text = fetch_url_text_with_extractor(
-                    url,
-                    timeout=int(os.getenv("EXTRACTOR_TIMEOUT", "150")),
-                    retries=int(os.getenv("EXTRACTOR_RETRIES", "3")),
-                    backoff=float(os.getenv("EXTRACTOR_BACKOFF", "1.6")),
-                    min_chars=int(os.getenv("EXTRACTOR_MIN_CHARS", "100")),
-                    session=sess,
-                )
-                call_dt = _now_perf() - t_call
-                _slow_warn(decision.tag, call_dt, "SLOW_EXTRACTOR_SEC", 8.0)
-                logger.info(
-                    "[EnrichCallDone] route=%s llid=%s ok=%s chars=%s dt=%.2fs",
-                    decision.tag, llid, bool(text), (len(text) if isinstance(text, str) else None), call_dt
-                )
-                return llid, url, text, decision.tag
-            except Exception as e:
-                call_dt = _now_perf() - t_item
-                logger.error("[EnrichCallFail] route=%s llid=%s dt=%.2fs err=%s", decision.tag, llid, call_dt, e)
-                return llid, url, None, decision.tag
-            finally:
-                extractor_sema.release()
-
-        # --- TRANSCRIBE routes ---
-        if decision.action == "transcribe":
-            if not enable_transcribe or not enable_deapi_transcribe:
-                logger.info("[EnrichSkip] route=%s llid=%s disabled_by_flag", decision.tag, llid)
-                return llid, url, None, f"{decision.tag}:disabled"
-
-            t_wait = _now_perf()
-            transcribe_sema.acquire()
-            wait_dt = _now_perf() - t_wait
-            if wait_dt > float(os.getenv("ENRICH_SEMA_WAIT_WARN_SEC", "1.0")):
-                logger.warning("[EnrichWait] route=%s llid=%s wait=%.2fs", decision.tag, llid, wait_dt)
-
-            try:
-                t_call = _now_perf()
-                sess = get_public_session(timeout=int(os.getenv("ENRICH_DL_HTTP_TIMEOUT", "60")))
-                local_path = _download_media_to_temp(url, llid, sess)
-                if not local_path:
-                    return llid, url, None, f"{decision.tag}:download_failed"
-
-                text = transcribe_with_deapi(video_path=local_path)
-
-                call_dt = _now_perf() - t_call
-                _slow_warn(decision.tag, call_dt, "SLOW_TRANSCRIBE_SEC", 20.0)
-                logger.info(
-                    "[EnrichCallDone] route=%s llid=%s ok=%s chars=%s dt=%.2fs",
-                    decision.tag, llid, bool(text), (len(text) if isinstance(text, str) else None), call_dt
-                )
-                return llid, url, text, decision.tag
-            except Exception as e:
-                call_dt = _now_perf() - t_item
-                logger.error("[EnrichCallFail] route=%s llid=%s dt=%.2fs err=%s", decision.tag, llid, call_dt, e)
-                return llid, url, None, decision.tag
-            finally:
-                transcribe_sema.release()
-
-        # Defensive fallback: should never happen
-        logger.warning("[EnrichNoRoute] llid=%s kind=%s url_host=%s mt=%r ext=%r", llid, kind, _safe_host(url), mimetype, ext)
-        return llid, url, None, "no_route"
-
-    # Worker pool size: can be the max of both because semaphores throttle real concurrency.
-    max_workers = int(os.getenv("ENRICH_MAX_WORKERS", str(max(extractor_workers, transcribe_workers, 4))))
-
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = [ex.submit(_route_and_fetch, item) for item in work2]
-        for fut in as_completed(futures):
-            try:
-                llid, url, text, source = fut.result()
-            except Exception as e:
-                failed += 1
-                _inc(failure_reasons, "worker_exception")
-                failures.append({"reason": "worker_exception", "error": str(e)})
-                continue
-
-            doc = idx.get(llid)
-            if not doc:
-                skipped += 1
-                _inc(skipped_reasons, "skipped:missing_doc_postfetch")
-                continue
-
-            if not text:
-                if isinstance(source, str) and source.endswith(":disabled"):
-                    skipped += 1
-                    _inc(skipped_reasons, "skipped:disabled_by_flag")
+            for fut in as_completed(futs):
+                llid, url, text, tag = fut.result()
+                doc = idx.get(llid)
+                if not doc:
                     continue
-
-                if isinstance(source, str) and source.endswith(":skipped"):
-                    skipped += 1
-                    _inc(skipped_reasons, source)
+                if not text or is_placeholder_content(text):
+                    failed_pagesense += 1
+                    _inc(failure_reasons, tag if text else "pagesense:empty")
                     continue
+                _apply_success(doc, text=text, source="pagesense", url=url)
+                patched_pagesense += 1
 
-                failed += 1
-                _inc(failure_reasons, "no_text")
-                _inc(source_failures, f"source:{source}")
-                failures.append({"llid": llid, "url": url, "source": source, "reason": "no_text"})
-                continue
+    # run api transcribe
+    if api_transcribe_jobs:
+        max_w = int(os.getenv("TRANSCRIBE_MAX_WORKERS", str(transcribe_workers)))
+        with ThreadPoolExecutor(max_workers=max_w) as ex:
+            futs = [ex.submit(_api_transcribe_one, llid, url) for llid, route, url in api_transcribe_jobs]
+            for fut in as_completed(futs):
+                llid, url, text, tag = fut.result()
+                doc = idx.get(llid)
+                if not doc:
+                    continue
+                if not text:
+                    failed_transcribe += 1
+                    _inc(failure_reasons, tag)
+                    continue
+                _apply_success(doc, text=text, source="api_transcribe", url=url)
+                patched_transcribe += 1
 
-            if isinstance(max_chars, int) and max_chars > 0:
-                text = text[:max_chars]
+    # run custom transcribe
+    if custom_transcribe_jobs:
+        max_w = int(os.getenv("TRANSCRIBE_MAX_WORKERS", str(transcribe_workers)))
+        with ThreadPoolExecutor(max_workers=max_w) as ex:
+            futs = [
+                ex.submit(custom_transcribe_one, llid=llid, url=url)
+                for llid, route, url in custom_transcribe_jobs
+            ]
 
-            doc["ko_content_flat"] = text
-            doc["ko_content_source"] = source
-            doc["ko_content_url"] = url
+            for fut in as_completed(futs):
+                llid, url, text, tag = fut.result()
+                doc = idx.get(llid)
+                if not doc:
+                    continue
+                if not text:
+                    failed_transcribe += 1
+                    _inc(failure_reasons, tag)
+                    continue
+                _apply_success(doc, text=text, source="custom_transcribe", url=url)
+                patched_transcribe += 1
 
-            flattened = flatten_ko_content(doc, mode=ko_content_mode)
-            doc.clear()
-            doc.update(flattened)
-
-            patched += 1
-
-    elapsed = _now_perf() - t0
-
-    max_fail_show = int(os.getenv("FAIL_LOG_MAX", "10"))
-    if failed:
-        logger.info("[EnricherFailures] failed=%d reasons=%s by_source=%s", failed, failure_reasons, source_failures)
-        logger.info(
-            "[FailedKOs] showing=%d/%d items=%s",
-            min(max_fail_show, len(failures)),
-            len(failures),
-            failures[:max_fail_show],
-        )
+    patched_total = patched_pagesense + patched_transcribe
+    failed_total = failed_pagesense + failed_transcribe
 
     logger.warning(
-        "[EnricherDone] patched=%d reused=%d failed=%d skipped=%d elapsed=%.2fs",
-        patched, reused, failed, skipped, elapsed
+        "[EnricherDone] candidates=%d patched=%d failed=%d skipped_prev=%d",
+        len(candidates), patched_total, failed_total, skipped_prev_done,
     )
 
     return {
-        "patched": patched,
-        "reused": reused,
-        "failed": failed,
-        "skipped": skipped,
-        "elapsed_sec": round(elapsed, 2),
-        "failures": failures,
+        "total_docs": len(docs),
+        "candidates": len(candidates),
+        "patched": patched_total,
+        "patched_pagesense": patched_pagesense,
+        "patched_transcribe": patched_transcribe,
+        "failed": failed_total,
+        "failed_pagesense": failed_pagesense,
+        "failed_transcribe": failed_transcribe,
+        "skipped_no_route": skipped_no_route,
+        "skipped_prev_done": skipped_prev_done,
+        "skipped_disabled": skipped_disabled,
+        "skipped_missing_target": skipped_missing_target,
         "failure_reasons": failure_reasons,
-        "skipped_reasons": skipped_reasons,
     }
 
+
+# ---------------- Routing decision ----------------
 def run_enricher_stage(
     *,
     env_mode: str,
@@ -791,14 +427,16 @@ def run_enricher_stage(
     lock = None
     if use_lock:
         lock = acquire_job_lock(env_mode=env_mode, output_root=output_root, entrypoint="enricher")
-    try:
-        in_path, docs, url_tasks, media_tasks = load_latest_downloader_output(env_mode, output_root)
 
-        stats = enrich_external_content(
+    try:
+        in_path, docs = load_latest_downloader_output(env_mode, output_root)
+
+        prev_path, prev_docs = load_latest_enricher_output(env_mode, output_root)
+        prev_index = _index_docs_by_llid(prev_docs)
+
+        stats = enrich_docs_via_routes(
             docs,
-            url_tasks,
-            media_tasks,
-            previous_index=None,
+            prev_enriched_index=prev_index,
             extractor_workers=extractor_workers,
             transcribe_workers=transcribe_workers,
             max_chars=max_chars,
@@ -813,12 +451,11 @@ def run_enricher_stage(
                 "env_mode": env_mode.upper(),
                 "run_id": run_id,
                 "created_from": str(in_path),
+                "created_from_prev_enriched": (str(prev_path) if prev_path else None),
                 "stage": "enricher",
             },
             "stats": stats,
             "docs": docs,
-            "url_tasks": url_tasks,
-            "media_tasks": media_tasks,
         }
 
         atomic_write_json(out_path, payload)
@@ -826,11 +463,10 @@ def run_enricher_stage(
 
         logger.warning("[EnricherStage] in=%s out=%s", str(in_path), str(out_path))
         return {"in": str(in_path), "out": str(out_path), "stats": stats}
+
     finally:
         if lock is not None:
             release_job_lock(lock)
-
-# ---------------- Core enrichment entrypoint ----------------
 
 
 if __name__ == "__main__":
