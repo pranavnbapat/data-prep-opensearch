@@ -238,7 +238,7 @@ def transcribe_video(
         # deAPI's per-endpoint schema may define the exact field name; "file" is the common convention.
         # If deAPI uses a different field, change files={'file': ...} accordingly.
         with open(path, "rb") as f:
-            files = {"file": (os.path.basename(path), f, "video/mp4")}
+            files = {"video": (os.path.basename(path), f, "video/mp4")}
             data = {
                 "include_ts": str(bool(include_timestamps)).lower(),
                 "model": model,

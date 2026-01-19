@@ -966,11 +966,11 @@ def set_enrich_via(d: Dict[str, Any]) -> None:
     at_id = d.get("@id")
 
     if ko_is_hosted and is_media_mimetype(mimetype):
-        d["enrich_via"] = "transcribe"
+        d["enrich_via"] = "custom_transcribe"
         return
 
     if (not ko_is_hosted) and is_video_platform_url(at_id):
-        d["enrich_via"] = "transcribe"
+        d["enrich_via"] = "api_transcribe"
         return
 
     if not ko_is_hosted:
@@ -979,4 +979,77 @@ def set_enrich_via(d: Dict[str, Any]) -> None:
 
     # Hosted but non-media: no external enrichment route needed (keep it absent)
     d.pop("enrich_via", None)
+
+def has_enrich_via(doc: Dict[str, Any]) -> bool:
+    return doc.get("enrich_via") in {"pagesense", "api_transcribe", "custom_transcribe"}
+
+def is_placeholder_content(val: Any) -> bool:
+    if not isinstance(val, str):
+        return True
+    return val.strip().lower() in ("", "no content present")
+
+def already_enriched(prev_doc: Dict[str, Any]) -> bool:
+    return prev_doc.get("enriched") == 1 and not is_placeholder_content(prev_doc.get("ko_content_flat"))
+
+def should_skip(current: Dict[str, Any], prev_doc: Optional[Dict[str, Any]]) -> bool:
+    if not prev_doc:
+        return False
+    # skip only if target didn't change
+    if (prev_doc.get("@id") or "") != (current.get("@id") or ""):
+        return False
+    # and previous enrichment exists
+    return already_enriched(prev_doc)
+
+def target_url_for_enrichment(doc: Dict[str, Any]) -> Optional[str]:
+    """
+    Decide what URL we enrich from.
+
+    - pagesense: always doc["@id"]
+    - transcribe:
+        - if hosted media: use ko_file_id (S3 hosted URL)
+        - else: use @id (youtube/vimeo/etc.)
+    """
+    via = doc.get("enrich_via")
+    at_id = doc.get("@id") if isinstance(doc.get("@id"), str) else None
+    ko_file_id = doc.get("ko_file_id") if isinstance(doc.get("ko_file_id"), str) else None
+
+    if via == "pagesense":
+        return at_id.strip() if at_id and at_id.strip() else None
+
+    ko_is_hosted = bool(doc.get("ko_is_hosted"))
+    mimetype = (doc.get("ko_object_mimetype") or "").strip().lower()
+
+    if via == "api_transcribe":
+        # hosted media (video/audio/image) -> use hosted file url
+        if ko_is_hosted and any(mimetype.startswith(x) for x in ("video/", "audio/", "image/")):
+            return ko_file_id.strip() if ko_file_id and ko_file_id.strip() else None
+
+        # non-hosted media platforms -> use @id
+        return at_id.strip() if at_id and at_id.strip() else None
+
+    if via == "custom_transcribe":
+        # hosted media (video/audio/image) -> use hosted file url
+        if ko_is_hosted and any(mimetype.startswith(x) for x in ("video/", "audio/", "image/")):
+            return ko_file_id.strip() if ko_file_id and ko_file_id.strip() else None
+
+        # non-hosted media platforms -> use @id
+        return at_id.strip() if at_id and at_id.strip() else None
+
+    return None
+
+def is_deapi_platform_url(u: str) -> bool:
+    """
+    deAPI /vid2txt only accepts a few platforms (per error message).
+    Keep this strict to avoid 422 spam.
+    """
+    if not isinstance(u, str):
+        return False
+    v = u.lower()
+    return any(host in v for host in (
+        "youtube.com/", "youtu.be/",
+        "twitter.com/", "x.com/",
+        "twitch.tv/",
+        "kick.com/",
+    ))
+
 
