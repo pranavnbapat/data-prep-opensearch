@@ -20,7 +20,7 @@ class LockHandle:
 
 
 def _pid_is_alive(pid: int) -> bool:
-    """POSIX-friendly: checks if a pid exists (doesn't guarantee it's *your* process)."""
+    """POSIX-friendly: checks if a pid exists."""
     if pid <= 0:
         return False
     try:

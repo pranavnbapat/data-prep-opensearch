@@ -9,7 +9,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py download_mongodb_data.py utils.py ./
+COPY app.py db_bootstrap.py download_mongodb_data.py utils.py ./
 
 RUN mkdir -p /app/output \
  && useradd -m -u 10001 appuser \

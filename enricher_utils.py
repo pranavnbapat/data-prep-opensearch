@@ -9,8 +9,11 @@ import time
 
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import requests
+
+from requests.auth import HTTPBasicAuth
 
 
 _tls = threading.local()
@@ -149,6 +152,13 @@ def transcribe_with_custom_api(*, media_url: str) -> Optional[str]:
     Calls the RunPod /transcribe endpoint with a direct media URL (S3 hosted audio/video).
     Returns transcript text or None.
     """
+    user = (os.getenv("CUSTOM_TRANSCRIBE_USER") or "").strip()
+    pwd = (os.getenv("CUSTOM_TRANSCRIBE_PASSWORD") or "").strip()
+
+    auth = None
+    if user and pwd:
+        auth = HTTPBasicAuth(user, pwd)
+
     retries = int(os.getenv("CUSTOM_TRANSCRIBE_RETRIES", "2"))
     backoff = float(os.getenv("CUSTOM_TRANSCRIBE_BACKOFF", "1.5"))
     endpoint = (os.getenv("CUSTOM_TRANSCRIBE_ENDPOINT") or "").strip()
@@ -167,11 +177,12 @@ def transcribe_with_custom_api(*, media_url: str) -> Optional[str]:
                 endpoint.rstrip("/") + "/transcribe",
                 json={"url": media_url, "whisper_model": whisper_model},
                 headers={"accept": "application/json", "content-type": "application/json"},
+                auth=auth,
             )
 
             if r.status_code >= 400:
                 logger.error(
-                    "[CustomTranscribeFail] host=%s status=%s body=%s",
+                    "[CustomTranscribeFail] media_host=%s status=%s body=%s",
                     media_url,
                     r.status_code,
                     (r.text or "")[:500],  # cap to avoid huge logs
@@ -200,3 +211,55 @@ def custom_transcribe_one(llid: str, url: str) -> Tuple[str, str, Optional[str],
     if text:
         return llid, url, text, "custom_transcribe"
     return llid, url, None, "custom_transcribe:failed"
+
+def _normalise_netloc(netloc: str) -> str:
+    n = (netloc or "").strip().lower()
+    # Drop common prefix for checks
+    if n.startswith("www."):
+        n = n[4:]
+    return n
+
+def classify_url_for_enrichment(url: Any) -> Tuple[bool, str]:
+    """
+    Returns (ok, reason).
+    ok=True  -> safe to send to pagesense/transcribe
+    ok=False -> skip with 'reason'
+    """
+    if isinstance(url, (bytes, bytearray)):
+        url = url.decode("utf-8", "ignore")
+
+    if not isinstance(url, str):
+        return False, "not_a_string"
+
+    u = url.strip()
+    if not u:
+        return False, "empty"
+
+    try:
+        p = urlparse(u)
+    except Exception:
+        return False, "parse_error"
+
+    scheme = (p.scheme or "").lower()
+    if scheme not in {"http", "https"}:
+        return False, f"unsupported_scheme:{scheme or 'none'}"
+
+    netloc = _normalise_netloc(p.netloc)
+    if not netloc:
+        return False, "missing_host"
+
+    # Reject obviously broken hosts like "www.google" (no TLD)
+    # Heuristic: must contain at least one dot and end segment length >= 2
+    if "." not in netloc:
+        return False, "host_missing_tld"
+    tld = netloc.rsplit(".", 1)[-1]
+    if len(tld) < 2:
+        return False, "host_bad_tld"
+
+    # Homepage / bare domain: no real path (or "/") AND no query params
+    path = p.path or ""
+    has_query = bool(p.query and p.query.strip())
+    if (path == "" or path == "/") and not has_query:
+        return False, "homepage_or_bare_domain"
+
+    return True, "ok"

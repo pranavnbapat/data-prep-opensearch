@@ -832,7 +832,6 @@ def is_url_based_ko(orig_doc: dict) -> tuple[bool, list[str]]:
 def transcribe_media_url(url: str, session: requests.Session) -> str:
     """
     Calls transcription endpoint. Assumes it accepts JSON: {"url": "..."}.
-    Adjust request/response parsing to match service.
     """
     endpoint = os.getenv("TRANSCRIBE_ENDPOINT_URL", "https://media-transcriber.nexavion.com/transcribe").strip()
     if not endpoint:
@@ -906,7 +905,6 @@ def is_video_platform_url(u: Any) -> bool:
     if host.startswith("www."):
         host = host[4:]
 
-    # You can extend this list safely over time
     video_hosts = {
         "youtube.com",
         "youtu.be",

@@ -4,21 +4,16 @@ import hashlib
 import json
 import logging
 import os
-import threading
 import time
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
-from typing import TypedDict, Optional, Dict, Any, List, Tuple
-from urllib3.util.retry import Retry
+from typing import Optional, Dict, Any, List, Tuple
 
 import requests
 
-from requests.adapters import HTTPAdapter
-from requests.auth import HTTPBasicAuth
-
 from io_helpers import run_stamp, output_dir, atomic_write_json, update_latest_pointer, resolve_latest_pointer
 from job_lock import acquire_job_lock, release_job_lock
+from downloader_utils import BackendCfg, DownloadResult, get_session, api_base, load_backend_cfg, KO_CONTENT_MODE
 from utils import (CustomJSONEncoder, normalize_date_to_yyyy_mm_dd, strip_html_light, clean_list, get_ko_id,
                    extract_location_names, flatten_ko_content, set_enrich_via)
 
@@ -27,124 +22,6 @@ try:
     load_dotenv()
 except Exception:
     pass
-
-
-ENV_CHOICES = {"DEV", "PRD"}
-KO_CONTENT_MODE = os.getenv("KO_CONTENT_MODE", "flat_only").strip() or "flat_only"
-
-logger = logging.getLogger(__name__)
-
-class BackendCfg(TypedDict):
-    host: str
-    user: str
-    pwd: str
-
-@dataclass(frozen=True)
-class DownloadResult:
-    docs: List[Dict[str, Any]]
-    url_tasks: List[Dict[str, Any]]
-    media_tasks: List[Dict[str, Any]]
-    stats: Dict[str, Any]
-
-
-# ---------------- Thread-local session ----------------
-_tls = threading.local()
-
-def _session_cache_key(backend_cfg: BackendCfg, timeout: int) -> str:
-    # Key includes host + username + timeout; password changes should trigger new container redeploy anyway.
-    return f"{backend_cfg['host']}|{backend_cfg['user']}|{timeout}"
-
-def get_session(backend_cfg: BackendCfg, timeout: int = 15) -> requests.Session:
-    """
-    Return a thread-local pooled session. Recreates session when backend/timeout changes.
-    Safe to call from threadpool workers.
-    """
-    key = _session_cache_key(backend_cfg, timeout)
-    sess = getattr(_tls, "session", None)
-    sess_key = getattr(_tls, "session_key", None)
-    if sess is None or sess_key != key:
-        # Close old session if present
-        try:
-            if sess is not None:
-                sess.close()
-        except Exception:
-            pass
-        sess = _build_session(backend_cfg, timeout=timeout)
-        _tls.session = sess
-        _tls.session_key = key
-    return sess
-
-def _build_session(backend_cfg: BackendCfg, timeout: int = 15) -> requests.Session:
-    """
-    Create a pooled, retrying Requests Session with HTTP Basic Auth.
-    Adds default timeout to all requests.
-    """
-    s = requests.Session()
-    s.auth = HTTPBasicAuth(backend_cfg["user"], backend_cfg["pwd"])
-    s.headers.update({
-        "accept": "application/json",
-        "Content-Type": "application/json",
-    })
-
-    retry = Retry(
-        total=5,
-        backoff_factor=0.5,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=("GET", "POST"),
-        raise_on_status=False,
-    )
-    adapter = HTTPAdapter(
-        max_retries=retry,
-        pool_connections=50,
-        pool_maxsize=50,
-    )
-    s.mount("http://", adapter)
-    s.mount("https://", adapter)
-
-    # Enforce a default timeout transparently
-    original = s.request
-    def _with_timeout(method, url, **kw):
-        kw.setdefault("timeout", timeout)
-        return original(method, url, **kw)
-    s.request = _with_timeout  # type: ignore[attr-defined]
-
-    return s
-
-
-# ---------------- Backend config ----------------
-def load_backend_cfg(env_mode: str) -> BackendCfg:
-    """
-    Loads backend config from environment variables.
-    No globals; safe per-job.
-    """
-    mode = (env_mode or "").strip().upper()
-    if mode not in ENV_CHOICES:
-        logging.warning("Invalid ENV_MODE=%r; falling back to DEV", env_mode)
-        mode = "DEV"
-
-    if mode == "DEV":
-        host = os.getenv("BACKEND_CORE_HOST_DEV", "")
-        user = os.getenv("BACKEND_CORE_DEV_API_USERNAME", "")
-        pwd  = os.getenv("BACKEND_CORE_DEV_API_PASSWORD", "")
-    else:
-        host = os.getenv("BACKEND_CORE_HOST_PRD", "")
-        user = os.getenv("BACKEND_CORE_PRD_API_USERNAME", "")
-        pwd  = os.getenv("BACKEND_CORE_PRD_API_PASSWORD", "")
-
-    if not host or not user or not pwd:
-        raise RuntimeError(
-            f"Missing required env vars for {mode}. "
-            f"Expected BACKEND_CORE_HOST_{mode}, BACKEND_CORE_{mode}_API_USERNAME, BACKEND_CORE_{mode}_API_PASSWORD"
-        )
-
-    return {"host": host.rstrip("/"), "user": user, "pwd": pwd}
-
-
-def api_base(backend_cfg: BackendCfg) -> str:
-    base = backend_cfg["host"]
-    if not base:
-        raise RuntimeError("Backend host is empty.")
-    return base
 
 
 # ---------------- Small helpers ----------------
@@ -228,7 +105,9 @@ def _stable_list(v: Any) -> List[str]:
                 s = x.strip()
                 if s:
                     out.append(s)
-        return sorted(out, key=str.casefold)
+        # return sorted(out, key=lambda s: s.casefold())
+        # OR
+        return sorted(dedup_case_insensitive(out), key=lambda s: s.casefold())
     return []
 
 def _stable_str(v: Any) -> str:
@@ -638,22 +517,29 @@ def prepare_one_doc(
       - "dropped"
     """
 
-    def _drop(reason: str, cleaned_doc: Optional[Dict[str, Any]] = None) -> Tuple[
+    def _drop(reason: str, cleaned_doc: Optional[Dict[str, Any]] = None, *, details: Optional[Dict[str, Any]] = None) -> \
+    Tuple[
         None, None, None, str, Dict[str, Any], bool, None, None, None
     ]:
+        info = {
+            "reason": f"drop:{reason}",
+            "logical_layer_id": str(doc.get("_id", "")).strip() or None,
+            "at_id": (cleaned_doc or {}).get("@id") or get_ko_id(doc) or None,
+            "title": (cleaned_doc or {}).get("title") or doc.get("title") or None,
+            "project_id": (cleaned_doc or {}).get("project_id") or doc.get("project_id") or None,
+        }
+        if isinstance(details, dict) and details:
+            info.update(details)
+
         return (
             None, None, None,
             f"drop:{reason}",
-            {
-                "reason": f"drop:{reason}",
-                "logical_layer_id": str(doc.get("_id", "")).strip() or None,
-                "at_id": (cleaned_doc or {}).get("@id") or get_ko_id(doc) or None,
-                "title": (cleaned_doc or {}).get("title") or doc.get("title") or None,
-                "project_id": (cleaned_doc or {}).get("project_id") or doc.get("project_id") or None,
-            },
+            info,
             True,
             None, None, None
         )
+
+    cleaned: Optional[Dict[str, Any]] = None
 
     try:
         # hard stop: published only
@@ -700,8 +586,16 @@ def prepare_one_doc(
 
         # pre-enrichment required fields
         required_pre = ["project_id", "title", "@id", "topics", "themes", "date_of_completion"]
-        if any(_is_blank(cleaned.get(f)) for f in required_pre):
-            return _drop("missing_required_pre", cleaned)
+        missing_pre = [f for f in required_pre if _is_blank(cleaned.get(f))]
+        if missing_pre:
+            return _drop(
+                "missing_required_pre",
+                cleaned,
+                details={
+                    "missing_pre_fields": missing_pre,
+                    "drop_message": f"missing pre-enrichment fields: {missing_pre}",
+                },
+            )
 
         # enrich with project
         cleaned = enrich_with_project(cleaned, projects_index)
@@ -833,7 +727,7 @@ def prepare_one_doc(
 
     except Exception as e:
         logging.exception("prepare_one_doc failed for _id=%r: %s", doc.get("_id"), e)
-        return _drop("exception", cleaned if "cleaned" in locals() else None)
+        return _drop("exception", cleaned)
 
 
 # ---------------- Page processing ----------------
@@ -1051,12 +945,13 @@ def download_and_prepare(
                 # One KO per line for readability in logs
                 for i, item in enumerate(dropped_items[:show_n], start=1):
                     logging.info(
-                        "[DroppedKOs] env=%s page=%s showing=%s/%s reason=%r logical_layer_id=%r title=%r",
+                        "[DroppedKOs] env=%s page=%s showing=%s/%s reason=%r missing_pre_fields=%r logical_layer_id=%r title=%r",
                         env_mode,
                         page,
                         i,
                         total,
                         item.get("reason"),
+                        item.get("missing_pre_fields"),
                         item.get("logical_layer_id"),
                         item.get("title"),
                     )

@@ -131,47 +131,49 @@ def run_pipeline(
         else:
             logger.warning("[Pipeline] Downloader disabled; downstream stages will resolve latest inputs themselves.")
 
-        # Step 2: enrich (only if enabled)
-        enrich_res = None
-        enrich_stats: Dict[str, Any] = {"patched": 0, "notes": "disabled"}
-        enriched_docs: List[Dict[str, Any]] = (dl.docs if dl else [])
-        enriched_url_tasks: List[Dict[str, Any]] = (dl.url_tasks if dl else [])
-        enriched_media_tasks: List[Dict[str, Any]] = (dl.media_tasks if dl else [])
+        # Step 2: enrich (cascading: only runs if downloader ran and enable_enricher=True)
+        enrich_res: Dict[str, Any] = {}
+        enrich_stats: Dict[str, Any] = {"patched": 0, "notes": "skipped_or_disabled"}
+
+        # Default to downloader outputs (only valid if downloader ran)
+        enriched_docs: List[Dict[str, Any]] = dl.docs if dl else []
+        enriched_url_tasks: List[Dict[str, Any]] = dl.url_tasks if dl else []
+        enriched_media_tasks: List[Dict[str, Any]] = dl.media_tasks if dl else []
 
         if enable_enricher:
-            enrich_res = run_enricher_stage(
-                env_mode=env_mode,
-                output_root=output_root,
-                extractor_workers=extractor_workers,
-                transcribe_workers=transcribe_workers,
-                max_chars=max_chars,
-                use_lock=False,
-            )
-            enrich_stats = enrich_res["stats"]
+            if not dl:
+                # Should never happen due to cascading flags, but keep it defensive.
+                logger.warning("[Pipeline] Enricher enabled but downloader did not run; skipping enricher.")
+            else:
+                enrich_res = run_enricher_stage(
+                    env_mode=env_mode,
+                    output_root=output_root,
+                    extractor_workers=extractor_workers,
+                    transcribe_workers=transcribe_workers,
+                    max_chars=max_chars,
+                    use_lock=False,
+                )
+                enrich_stats = enrich_res.get("stats") or {"patched": 0, "notes": "missing_stats"}
 
-            fallback_docs = (dl.docs if dl else [])
-            fallback_url_tasks = (dl.url_tasks if dl else [])
-            fallback_media_tasks = (dl.media_tasks if dl else [])
-
-            try:
-                enriched_payload = json.loads(Path(enrich_res["out"]).read_text(encoding="utf-8"))
-                enriched_docs = enriched_payload.get("docs", fallback_docs)
-                enriched_url_tasks = enriched_payload.get("url_tasks", fallback_url_tasks)
-                enriched_media_tasks = enriched_payload.get("media_tasks", fallback_media_tasks)
-                if not isinstance(enriched_docs, list):
-                    raise ValueError("enriched docs is not a list")
-            except Exception as e:
-                logger.warning("[Pipeline] Failed to load enriched output (%s): %s", enrich_res.get("out"), e)
-                enriched_docs = fallback_docs
-                enriched_url_tasks = fallback_url_tasks
-                enriched_media_tasks = fallback_media_tasks
+                # Enricher output contains only docs; tasks remain from downloader
+                try:
+                    enriched_payload = json.loads(Path(enrich_res["out"]).read_text(encoding="utf-8"))
+                    enriched_docs = enriched_payload.get("docs", enriched_docs)
+                    if not isinstance(enriched_docs, list):
+                        raise ValueError("enriched docs is not a list")
+                except Exception as e:
+                    logger.warning("[Pipeline] Failed to load enriched output (%s): %s", enrich_res.get("out"), e)
+                    # Keep downloader docs/tasks as-is
         else:
-            logger.warning("[Pipeline] Enricher disabled; using downloader output (or empty).")
+            logger.warning("[Pipeline] Enricher disabled (or cascaded off); skipping.")
 
         enrich_res = enrich_res or {}
 
-        # Step 3: improver (stub)
-        improve_stats = improve_docs_stub(enriched_docs) if enable_improver else {"improved": 0, "notes": "disabled"}
+        # Step 3: improver (cascading: only runs if enricher ran and enable_improver=True)
+        if enable_improver:
+            improve_stats = improve_docs_stub(enriched_docs)
+        else:
+            improve_stats = {"improved": 0, "notes": "skipped_or_disabled"}
 
         downloader_stats = dl.stats if dl else {"changed": 0, "emitted": 0, "dropped": 0, "notes": "disabled"}
 
@@ -264,7 +266,7 @@ def run_pipeline(
             env_mode=env_mode.upper(),
             run_id=run_id,
             stats=report["stats"],
-            final_path=str(enrich_res.get("out", "")),
+            final_path=(str(enrich_res["out"]) if (enable_enricher and enrich_res.get("out")) else ""),
             report_path=str(final_report_path),
             latest_path=str(latest_path),
         )

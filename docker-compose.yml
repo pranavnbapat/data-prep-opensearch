@@ -11,6 +11,9 @@ services:
       - ./output:/app/output
     restart: always
     user: "${UID}:${GID}"
+    depends_on:
+      data-prep-opensearch-mysql:
+        condition: service_healthy
     healthcheck:
       test: [ "CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0) if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3).status==200 else sys.exit(1)\"" ]
       interval: 30s
@@ -24,9 +27,50 @@ services:
       dockerfile: Dockerfile.scheduler
     container_name: data-prep-opensearch-scheduler
     depends_on:
-      - data-prep-opensearch
+      data-prep-opensearch:
+        condition: service_started
+      data-prep-opensearch-mysql:
+        condition: service_healthy
     env_file:
       - .env
     restart: always
     user: "${UID}:${GID}"
+
+  data-prep-opensearch-mysql:
+    image: mysql:8.0
+    container_name: data-prep-opensearch-mysql
+    restart: always
+    env_file:
+      - .env
+    ports:
+      - "3106:3306"
+    volumes:
+      - ./mysql_data:/var/lib/mysql
+      # - ./mysql_init:/docker-entrypoint-initdb.d:ro
+    command:
+      - --default-authentication-plugin=mysql_native_password
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    healthcheck:
+      test: [ "CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root -p$$MYSQL_ROOT_PASSWORD --silent" ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  data-prep-opensearch-phpmyadmin:
+    image: phpmyadmin:latest
+    container_name: data-prep-opensearch-phpmyadmin
+    restart: always
+    depends_on:
+      data-prep-opensearch-mysql:
+        condition: service_healthy
+    ports:
+      - "9095:80"
+    environment:
+      PMA_HOST: data-prep-opensearch-mysql
+      PMA_PORT: 3306
+      PMA_ARBITRARY: 0
+
+
 

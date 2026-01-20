@@ -22,7 +22,8 @@ from deapi_transcribe import transcribe_video, DeapiError
 from job_lock import acquire_job_lock, release_job_lock
 from io_helpers import (resolve_latest_pointer, find_latest_matching, atomic_write_json, update_latest_pointer,
                         run_stamp, output_dir)
-from enricher_utils import (pagesense_one, safe_host, custom_transcribe_one, load_stage_payload)
+from enricher_utils import (pagesense_one, safe_host, custom_transcribe_one, load_stage_payload,
+                            classify_url_for_enrichment)
 from utils import (has_enrich_via, should_skip, target_url_for_enrichment, is_placeholder_content, is_deapi_platform_url)
 
 
@@ -237,7 +238,9 @@ def enrich_docs_via_routes(
     skipped_no_route = 0
     skipped_prev_done = 0
     skipped_disabled = 0
+    skipped_bad_target = 0
     skipped_missing_target = 0
+    carry_forward_copied = 0
 
     for llid, doc in idx.items():
         if not has_enrich_via(doc):
@@ -248,7 +251,8 @@ def enrich_docs_via_routes(
         prev = prev_enriched_index.get(llid)
 
         # Carry forward previous enrichment so we don't overwrite good content with placeholders
-        carry_forward_enrichment(doc, prev)
+        if carry_forward_enrichment(doc, prev):
+            carry_forward_copied += 1
 
         if should_skip(doc, prev):
             logger.debug("[EnrichSkip] llid=%s reason=prev_done", llid)
@@ -272,6 +276,15 @@ def enrich_docs_via_routes(
             skipped_missing_target += 1
             continue
 
+        ok, reason = classify_url_for_enrichment(target)
+        if not ok:
+            logger.warning(
+                "[EnrichSkip] llid=%s route=%s reason=%s target=%r",
+                llid, route, reason, target
+            )
+            skipped_bad_target += 1
+            continue
+
         logger.info(
             "[EnrichQueue] ID=%s route=%s target_host=%s",
             llid, route, target
@@ -288,6 +301,7 @@ def enrich_docs_via_routes(
             "skipped_prev_done": skipped_prev_done,
             "skipped_disabled": skipped_disabled,
             "skipped_missing_target": skipped_missing_target,
+            "carry_forward_copied": carry_forward_copied,
             "candidates": 0,
         }
 
@@ -410,6 +424,7 @@ def enrich_docs_via_routes(
         "skipped_prev_done": skipped_prev_done,
         "skipped_disabled": skipped_disabled,
         "skipped_missing_target": skipped_missing_target,
+        "carry_forward_copied": carry_forward_copied,
         "failure_reasons": failure_reasons,
     }
 
@@ -441,6 +456,14 @@ def run_enricher_stage(
             transcribe_workers=transcribe_workers,
             max_chars=max_chars,
         )
+
+        # If nothing changed and we have a previous snapshot, don't create a new file
+        patched = int(stats.get("patched") or 0)
+        carried = int(stats.get("carry_forward_copied") or 0)
+
+        if patched == 0 and carried == 0 and prev_path is not None:
+            logger.warning("[EnricherStage] no_changes; keeping_prev=%s", str(prev_path))
+            return {"in": str(in_path), "out": str(prev_path), "stats": stats, "no_changes": True}
 
         run_id = run_stamp()
         out_dir = output_dir(env_mode, root=output_root)

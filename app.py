@@ -19,7 +19,10 @@ from fastapi import FastAPI, BackgroundTasks, HTTPException
 from pydantic import BaseModel, field_validator
 from uuid import uuid4
 
+from db_bootstrap import ensure_tables_exist
 from download_mongodb_data import get_ko_metadata, select_environment
+
+
 load_dotenv()
 
 @asynccontextmanager
@@ -41,6 +44,12 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Data Prep", lifespan=lifespan)
 
 MAX_PAGE_SIZE = 100
+
+@app.on_event("startup")
+def _startup_bootstrap_db() -> None:
+    # Runs on every container start; DDL is idempotent.
+    ensure_tables_exist()
+
 
 _tz = os.getenv("TZ")
 if _tz:

@@ -273,7 +273,6 @@ def main() -> None:
         elif len(mimes) == 1:
             mime_counter[mimes[0]] += 1
         else:
-            # If multiple, count each, but also keep a combined label so you can spot multi-asset records
             for m in mimes:
                 mime_counter[m] += 1
             mime_counter["(multiple_per_record)"] += 1
@@ -293,7 +292,6 @@ def main() -> None:
     n = len(records)
 
     # "Unique-ish" keys: appear in <100% of records.
-    # You can tighten this further later, e.g., only keys that appear in <= 5 records.
     uniqueish = [(k, c) for k, c in key_freq.items() if c < n]
     uniqueish.sort(key=lambda x: (x[1], x[0]))
 
