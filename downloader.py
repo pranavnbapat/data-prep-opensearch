@@ -228,49 +228,6 @@ def extract_first_resource_file_info(doc: Dict[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in out.items() if not _is_blank(v)}
 
 
-# def extract_first_resource_url(doc: Dict[str, Any]) -> Optional[str]:
-#     """
-#     Best-effort URL from first resource.
-#     """
-#     kor = doc.get("knowledge_object_resources")
-#     if not isinstance(kor, list) or not kor:
-#         return None
-#
-#     first = kor[0]
-#     if not isinstance(first, dict):
-#         return None
-#
-#     dm = first.get("display_metadata") or {}
-#     if not isinstance(dm, dict):
-#         dm = {}
-#
-#     candidates = [
-#         first.get("url"),
-#         first.get("download_url"),
-#         first.get("href"),
-#         first.get("link"),
-#         dm.get("hosted_url"),
-#         dm.get("external_url"),
-#         dm.get("resource_url"),
-#         first.get("@id"),
-#     ]
-#     for u in candidates:
-#         if isinstance(u, str) and u.strip():
-#             return u.strip()
-#     return None
-
-# def is_youtube_url(u: str) -> bool:
-#     if not isinstance(u, str):
-#         return False
-#     v = u.lower()
-#     return (
-#         "youtube.com/watch" in v or
-#         "youtube.com/live" in v or
-#         "youtube.com/shorts" in v or
-#         "youtu.be/" in v
-#     )
-
-
 # ---------------- API calls ----------------
 
 def fetch_ko_metadata_api(

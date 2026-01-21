@@ -8,7 +8,6 @@ import os
 import random
 import time
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -22,9 +21,9 @@ from deapi_transcribe import transcribe_video, DeapiError
 from job_lock import acquire_job_lock, release_job_lock
 from io_helpers import (resolve_latest_pointer, find_latest_matching, atomic_write_json, update_latest_pointer,
                         run_stamp, output_dir)
-from enricher_utils import (pagesense_one, safe_host, custom_transcribe_one, load_stage_payload,
-                            classify_url_for_enrichment)
-from utils import (has_enrich_via, should_skip, target_url_for_enrichment, is_placeholder_content, is_deapi_platform_url)
+from enricher_utils import (pagesense_one, custom_transcribe_one, load_stage_payload, classify_url_for_enrichment,
+                            target_url_for_enrichment, has_enrich_via, should_skip, is_placeholder_content,
+                            is_deapi_platform_url)
 
 
 logger = logging.getLogger(__name__)
@@ -156,16 +155,16 @@ def transcribe_with_deapi(*, video_url: Optional[str] = None, video_path: Option
         if not text:
             logger.warning(
                 "[deAPI] Empty transcript. status=%s request_id=%s url_host=%s",
-                result.status, result.request_id, safe_host(video_url)
+                result.status, result.request_id, video_url
             )
             return None
         return text
 
     except DeapiError as e:
-        logger.error("[deAPI] Transcription failed url_host=%s err=%s", safe_host(video_url), e)
+        logger.error("[deAPI] Transcription failed url_host=%s err=%s", video_url, e)
         return None
     except Exception as e:
-        logger.exception("[deAPI] Unexpected error url_host=%s err=%s", safe_host(video_url), e)
+        logger.exception("[deAPI] Unexpected error url_host=%s err=%s", video_url, e)
         return None
 # ---------------- deAPI transcription ----------------
 
@@ -224,6 +223,109 @@ def enrich_docs_via_routes(
     Skips if already enriched in previous enricher snapshot AND @id unchanged.
     Writes enriched text into ko_content_flat.
     """
+
+    def _retry_n(*, fn, attempts: int, base_sleep_s: float, jitter_s: float, label: str):
+        """
+        Retry wrapper for per-record calls.
+        Adds logs so long-running calls don't look stuck.
+        """
+        last = None
+        for i in range(attempts):
+            attempt_no = i + 1
+            t0 = time.perf_counter()
+            logger.info("[EnrichTry] %s attempt=%d/%d", label, attempt_no, attempts)
+
+            last = fn()
+
+            dt = time.perf_counter() - t0
+            if last is not None:
+                logger.info("[EnrichTryOK] %s attempt=%d/%d dt=%.2fs", label, attempt_no, attempts, dt)
+                return last
+
+            logger.warning("[EnrichTryFail] %s attempt=%d/%d dt=%.2fs", label, attempt_no, attempts, dt)
+
+            if i < attempts - 1:
+                delay = (base_sleep_s ** i) + random.uniform(0.0, jitter_s)
+                logger.info("[EnrichBackoff] %s sleep=%.2fs", label, delay)
+                time.sleep(delay)
+
+        return None
+
+    def _pagesense_try(llid: str, url: str) -> Tuple[Optional[str], str]:
+        """
+        Returns (text_or_none, tag)
+        """
+        def _call():
+            # pagesense_one returns (llid, url, text, tag)
+            res = pagesense_one(llid=llid, url=url, http_timeout=0)
+            # Support both 4-tuple and 5-tuple returns
+            if isinstance(res, tuple) and len(res) >= 4:
+                _llid, _url, text, tag = res[0], res[1], res[2], res[3]
+            else:
+                text, tag = None, "pagesense:failed"
+
+            if text and not is_placeholder_content(text):
+                return (text, tag)
+            return None
+
+        out = _retry_n(
+            fn=_call,
+            attempts=int(os.getenv("ENRICH_PAGESENSE_TRIES", "3")),
+            base_sleep_s=float(os.getenv("ENRICH_PAGESENSE_BACKOFF", "1.6")),
+            jitter_s=float(os.getenv("ENRICH_PAGESENSE_JITTER", "0.8")),
+            label=f"pagesense llid={llid} host={url}",
+        )
+
+        if out is None:
+            return None, "pagesense:empty"
+        return out[0], "pagesense"
+
+    def _custom_transcribe_try(llid: str, url: str) -> Tuple[Optional[str], str]:
+        """
+        Returns (text_or_none, tag)
+        """
+
+        def _call():
+            # custom_transcribe_one returns (llid, url, text, tag)
+            _llid, _url, text, tag = custom_transcribe_one(llid=llid, url=url)
+            return text.strip() if isinstance(text, str) and text.strip() else None
+
+        text = _retry_n(
+            fn=_call,
+            attempts=int(os.getenv("ENRICH_TRANSCRIBE_TRIES", "3")),
+            base_sleep_s=float(os.getenv("ENRICH_TRANSCRIBE_BACKOFF", "1.7")),
+            jitter_s=float(os.getenv("ENRICH_TRANSCRIBE_JITTER", "0.8")),
+            label=f"custom_transcribe llid={llid} host={url}",
+        )
+
+        if not text:
+            return None, "custom_transcribe:failed"
+        return text, "custom_transcribe"
+
+    def _api_transcribe_try(llid: str, url: str) -> Tuple[Optional[str], str]:
+        """
+        Returns (text_or_none, tag)
+        """
+        if not is_deapi_platform_url(url):
+            return None, "api_transcribe:unsupported_url"
+
+        def _call():
+            text = transcribe_with_deapi(video_url=url)
+            return text.strip() if isinstance(text, str) and text.strip() else None
+
+        text = _retry_n(
+            fn=_call,
+            attempts=int(os.getenv("ENRICH_TRANSCRIBE_TRIES", "3")),
+            base_sleep_s=float(os.getenv("ENRICH_TRANSCRIBE_BACKOFF", "1.7")),
+            jitter_s=float(os.getenv("ENRICH_TRANSCRIBE_JITTER", "0.8")),
+            label=f"api_transcribe llid={llid} host={url}",
+        )
+
+        if not text:
+            return None, "api_transcribe:failed"
+        return text, "api_transcribe"
+
+
     if not docs:
         return {"patched": 0, "skipped": 0, "failed": 0}
 
@@ -244,7 +346,7 @@ def enrich_docs_via_routes(
 
     for llid, doc in idx.items():
         if not has_enrich_via(doc):
-            logger.debug("[EnrichSkip] llid=%s reason=no_route", llid)
+            logger.debug("[EnrichSkip] id=%s reason=no_route", llid)
             skipped_no_route += 1
             continue
 
@@ -255,7 +357,7 @@ def enrich_docs_via_routes(
             carry_forward_copied += 1
 
         if should_skip(doc, prev):
-            logger.debug("[EnrichSkip] llid=%s reason=prev_done", llid)
+            logger.debug("[EnrichSkip] id=%s reason=prev_done", llid)
             skipped_prev_done += 1
             continue
 
@@ -272,14 +374,14 @@ def enrich_docs_via_routes(
 
         target = target_url_for_enrichment(doc)
         if not target:
-            logger.warning("[EnrichSkip] llid=%s route=%s reason=missing_target", llid, route)
+            logger.warning("[EnrichSkip] id=%s route=%s reason=missing_target", llid, route)
             skipped_missing_target += 1
             continue
 
         ok, reason = classify_url_for_enrichment(target)
         if not ok:
             logger.warning(
-                "[EnrichSkip] llid=%s route=%s reason=%s target=%r",
+                "[EnrichSkip] id=%s route=%s reason=%s target=%r",
                 llid, route, reason, target
             )
             skipped_bad_target += 1
@@ -305,34 +407,12 @@ def enrich_docs_via_routes(
             "candidates": 0,
         }
 
-    # Separate pools (so transcribe doesn't starve pagesense)
-    pagesense_jobs = [(llid, target) for (llid, route, target) in candidates if route == "pagesense"]
-    api_transcribe_jobs = [(llid, "api_transcribe", target) for (llid, route, target) in candidates if route == "api_transcribe"]
-    custom_transcribe_jobs = [(llid, "custom_transcribe", target) for (llid, route, target) in candidates if route == "custom_transcribe"]
-
     patched_pagesense = 0
     patched_transcribe = 0
     failed_pagesense = 0
     failed_transcribe = 0
 
     failure_reasons: Dict[str, int] = {}
-
-    # ---- transcribe runner ----
-    def _api_transcribe_one(llid: str, url: str) -> Tuple[str, str, Optional[str], str]:
-        """
-        api_transcribe: send URL to deAPI (no downloading here).
-        Expected: YouTube/platform URLs only.
-        """
-        time.sleep(random.uniform(0.05, 0.25))
-
-        # Fail fast if someone mis-routed a non-supported URL into api_transcribe
-        if not is_deapi_platform_url(url):
-            return llid, url, None, "api_transcribe:unsupported_url"
-
-        text = transcribe_with_deapi(video_url=url)
-        if text and isinstance(text, str) and text.strip():
-            return llid, url, text.strip(), "api_transcribe"
-        return llid, url, None, "api_transcribe:failed"
 
     # Apply patch helper
     def _apply_success(doc: Dict[str, Any], *, text: str, source: str, url: str) -> None:
@@ -343,65 +423,83 @@ def enrich_docs_via_routes(
         doc["ko_content_url"] = url
         doc["enriched"] = 1
 
-    # run pagesense
-    if pagesense_jobs:
-        max_w = int(os.getenv("EXTRACTOR_MAX_WORKERS", str(extractor_workers)))
-        with ThreadPoolExecutor(max_workers=max_w) as ex:
-            http_timeout = int(os.getenv("EXTRACTOR_HTTP_TIMEOUT", "35"))
-            futs = [
-                ex.submit(pagesense_one, llid=llid, url=url, http_timeout=http_timeout)
-                for llid, url in pagesense_jobs
-            ]
+    # ---- sequential runner: one KO at a time, with per-record retries ----
+    per_record_delay = float(os.getenv("ENRICH_PER_RECORD_DELAY_SEC", "0.25"))
 
-            for fut in as_completed(futs):
-                llid, url, text, tag = fut.result()
-                doc = idx.get(llid)
-                if not doc:
-                    continue
-                if not text or is_placeholder_content(text):
-                    failed_pagesense += 1
-                    _inc(failure_reasons, tag if text else "pagesense:empty")
-                    continue
-                _apply_success(doc, text=text, source="pagesense", url=url)
-                patched_pagesense += 1
+    total = len(candidates)
 
-    # run api transcribe
-    if api_transcribe_jobs:
-        max_w = int(os.getenv("TRANSCRIBE_MAX_WORKERS", str(transcribe_workers)))
-        with ThreadPoolExecutor(max_workers=max_w) as ex:
-            futs = [ex.submit(_api_transcribe_one, llid, url) for llid, route, url in api_transcribe_jobs]
-            for fut in as_completed(futs):
-                llid, url, text, tag = fut.result()
-                doc = idx.get(llid)
-                if not doc:
-                    continue
-                if not text:
-                    failed_transcribe += 1
-                    _inc(failure_reasons, tag)
-                    continue
-                _apply_success(doc, text=text, source="api_transcribe", url=url)
-                patched_transcribe += 1
+    for n, (llid, route, target) in enumerate(candidates, start=1):
+        doc = idx.get(llid)
+        if not doc:
+            continue
 
-    # run custom transcribe
-    if custom_transcribe_jobs:
-        max_w = int(os.getenv("TRANSCRIBE_MAX_WORKERS", str(transcribe_workers)))
-        with ThreadPoolExecutor(max_workers=max_w) as ex:
-            futs = [
-                ex.submit(custom_transcribe_one, llid=llid, url=url)
-                for llid, route, url in custom_transcribe_jobs
-            ]
+        # Per-record header
+        t0 = time.perf_counter()
+        logger.info(
+            "[EnrichRun] %d/%d id=%s route=%s target=%s",
+            n, total, llid, route, target
+        )
 
-            for fut in as_completed(futs):
-                llid, url, text, tag = fut.result()
-                doc = idx.get(llid)
-                if not doc:
-                    continue
-                if not text:
-                    failed_transcribe += 1
-                    _inc(failure_reasons, tag)
-                    continue
-                _apply_success(doc, text=text, source="custom_transcribe", url=url)
-                patched_transcribe += 1
+        # Small jitter/delay to avoid hammering even in serial mode
+        if per_record_delay > 0:
+            time.sleep(per_record_delay + random.uniform(0.0, 0.15))
+
+        if route == "pagesense":
+            text, tag = _pagesense_try(llid, target)
+            if not text:
+                failed_pagesense += 1
+                _inc(failure_reasons, tag)
+                logger.warning(
+                    "[EnrichFail] %d/%d id=%s route=%s reason=%s dt=%.2fs",
+                    n, total, llid, route, tag, time.perf_counter() - t0
+                )
+                continue
+
+            _apply_success(doc, text=text, source="pagesense", url=target)
+            patched_pagesense += 1
+            logger.info(
+                "[EnrichOK] %d/%d id=%s route=%s chars=%d dt=%.2fs",
+                n, total, llid, route, len(text), time.perf_counter() - t0
+            )
+            continue
+
+        if route == "api_transcribe":
+            text, tag = _api_transcribe_try(llid, target)
+            if not text:
+                failed_transcribe += 1
+                _inc(failure_reasons, tag)
+                logger.warning(
+                    "[EnrichFail] %d/%d id=%s route=%s reason=%s dt=%.2fs",
+                    n, total, llid, route, tag, time.perf_counter() - t0
+                )
+                continue
+
+            _apply_success(doc, text=text, source="api_transcribe", url=target)
+            patched_transcribe += 1
+            logger.info(
+                "[EnrichOK] %d/%d id=%s route=%s chars=%d dt=%.2fs",
+                n, total, llid, route, len(text), time.perf_counter() - t0
+            )
+            continue
+
+        if route == "custom_transcribe":
+            text, tag = _custom_transcribe_try(llid, target)
+            if not text:
+                failed_transcribe += 1
+                _inc(failure_reasons, tag)
+                logger.warning(
+                    "[EnrichFail] %d/%d id=%s route=%s reason=%s dt=%.2fs",
+                    n, total, llid, route, tag, time.perf_counter() - t0
+                )
+                continue
+
+            _apply_success(doc, text=text, source="custom_transcribe", url=target)
+            patched_transcribe += 1
+            logger.info(
+                "[EnrichOK] %d/%d id=%s route=%s chars=%d dt=%.2fs",
+                n, total, llid, route, len(text), time.perf_counter() - t0
+            )
+            continue
 
     patched_total = patched_pagesense + patched_transcribe
     failed_total = failed_pagesense + failed_transcribe
