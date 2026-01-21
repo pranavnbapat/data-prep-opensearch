@@ -14,8 +14,9 @@ import requests
 from io_helpers import run_stamp, output_dir, atomic_write_json, update_latest_pointer, resolve_latest_pointer
 from job_lock import acquire_job_lock, release_job_lock
 from downloader_utils import BackendCfg, DownloadResult, get_session, api_base, load_backend_cfg, KO_CONTENT_MODE
+from enricher_utils import set_enrich_via
 from utils import (CustomJSONEncoder, normalize_date_to_yyyy_mm_dd, strip_html_light, clean_list, get_ko_id,
-                   extract_location_names, flatten_ko_content, set_enrich_via)
+                   extract_location_names, flatten_ko_content)
 
 try:
     from dotenv import load_dotenv
@@ -640,7 +641,7 @@ def prepare_one_doc(
                 _ensure_stage_flags(merged)
 
                 if os.getenv("LOG_LEVEL", "").upper() == "DEBUG":
-                    logging.debug("[ReuseUnchanged] llid=%s ko_updated_at=%s", logical_layer_id, cleaned.get("ko_updated_at"))
+                    logging.debug("[ReuseUnchanged] id=%s ko_updated_at=%s", logical_layer_id, cleaned.get("ko_updated_at"))
 
                 dl_fp, enr_fp, imp_fp = _compute_fps(merged)
                 merged["_dl_fp"] = dl_fp

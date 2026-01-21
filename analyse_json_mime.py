@@ -1,29 +1,11 @@
 # analyse_json_mime.py
 
-"""
-Analyse a JSON file to:
-1) Count MIME types (group-by)
-2) Find keys that appear only in some objects ("unique-ish" fields)
-3) For those keys, report which MIME types tend to co-occur with them
-
-Usage:
-  python3 analyse_json_mime.py --input /path/to/file.json
-  python3 analyse_json_mime.py --input file.json --topkey records
-  python3 analyse_json_mime.py --input file.json --out_prefix report
-
-Notes:
-- Supports:
-  * JSON list
-  * JSON dict containing a list (auto-detected or via --topkey)
-  * NDJSON (one JSON object per line)
-"""
-
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
+
 from collections import Counter, defaultdict
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -104,7 +86,6 @@ def extract_mimes_from_obj(o: Dict[str, Any]) -> List[str]:
     found: List[str] = []
 
     # Common direct fields
-    # FarmBook-ish / KO-ish direct fields
     for key in (
             "ko_hosted_mime_type",
             "ko_object_mimetype",

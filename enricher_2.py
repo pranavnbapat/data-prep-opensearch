@@ -201,7 +201,7 @@ def carry_forward_enrichment(doc: Dict[str, Any], prev: Optional[Dict[str, Any]]
         doc["ko_content_url"] = prev["ko_content_url"]
 
     logger.info(
-        "[EnrichCarryForward] llid=%s source=%s",
+        "[EnrichCarryForward] id=%s source=%s",
         doc.get("_orig_id") or doc.get("_id"),
         prev.get("ko_content_source")
     )

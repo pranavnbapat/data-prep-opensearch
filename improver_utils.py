@@ -110,7 +110,9 @@ def classify_failure(reason: Optional[str]) -> str:
 def carry_forward_previous_improvements(doc: Dict[str, Any], prev: Optional[Dict[str, Any]]) -> bool:
     """
     If prev has improved output, copy its generated fields into the current doc.
-    This makes reruns stable even when the input is always the enriched snapshot.
+
+    Returns True only if this actually changed the current doc (meaningful carry-forward),
+    and False if it's a no-op (already identical / baseline reconstruction).
     """
     if not prev:
         return False
@@ -118,14 +120,40 @@ def carry_forward_previous_improvements(doc: Dict[str, Any], prev: Optional[Dict
     if int(prev.get("improved") or 0) != 1:
         return False
 
-    copied = False
-    for k in ("ko_content_flat_summarised", "title_llm", "subtitle_llm", "description_llm", "keywords_llm"):
-        if prev.get(k) is not None:
-            doc[k] = prev[k]
-            copied = True
+    keys = ("ko_content_flat_summarised", "title_llm", "subtitle_llm", "description_llm", "keywords_llm")
 
-    # carry forward status too (optional, but makes output self-describing)
-    if copied:
+    # --- No-op short-circuit: if doc already matches prev, don't count it ---
+    # We treat "already identical" as NOT a meaningful change.
+    already_identical = (
+        int(doc.get("improved") or 0) == 1
+        and all(doc.get(k) == prev.get(k) for k in keys)
+    )
+    if already_identical:
+        return False
+
+    changed = False
+
+    # Copy values, but only mark as changed when we actually modify something.
+    for k in keys:
+        if prev.get(k) is None:
+            continue
+
+        # Only overwrite if different; avoids counting baseline reconstruction
+        if doc.get(k) != prev.get(k):
+            doc[k] = prev[k]
+            changed = True
+
+    # carry forward status too (optional, but keeps output self-describing)
+    if changed:
         doc["improved"] = 1
 
-    return copied
+        # If after copying we are identical to prev, this is baseline reconstruction:
+        # treat as not meaningful (so it won't trigger a new snapshot).
+        if (
+            int(doc.get("improved") or 0) == int(prev.get("improved") or 0)
+            and all(doc.get(k) == prev.get(k) for k in keys)
+        ):
+            return False
+
+    return changed
+

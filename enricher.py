@@ -190,6 +190,15 @@ def carry_forward_enrichment(doc: Dict[str, Any], prev: Optional[Dict[str, Any]]
     if cur_enriched and isinstance(cur_text, str) and not is_placeholder_content(cur_text):
         return False  # already has content
 
+    # If current already equals what we'd carry forward, do nothing.
+    if (
+            doc.get("ko_content_flat") == prev_text
+            and int(doc.get("enriched") or 0) == 1
+            and doc.get("ko_content_source") == prev.get("ko_content_source")
+            and doc.get("ko_content_url") == prev.get("ko_content_url")
+    ):
+        return False
+
     # Copy the enrichment payload
     doc["ko_content_flat"] = prev_text
     doc["enriched"] = 1
@@ -200,13 +209,23 @@ def carry_forward_enrichment(doc: Dict[str, Any], prev: Optional[Dict[str, Any]]
     if isinstance(prev.get("ko_content_url"), str):
         doc["ko_content_url"] = prev["ko_content_url"]
 
-    logger.info(
-        "[EnrichCarryForward] llid=%s source=%s",
-        doc.get("_orig_id") or doc.get("_id"),
-        prev.get("ko_content_source")
-    )
+    # If after copying we are identical to prev's enrichment state,
+    # treat this as "reconstructing baseline" (NOT a meaningful change).
+    if (
+            doc.get("ko_content_flat") == prev.get("ko_content_flat")
+            and int(doc.get("enriched") or 0) == int(prev.get("enriched") or 0)
+            and doc.get("ko_content_source") == prev.get("ko_content_source")
+            and doc.get("ko_content_url") == prev.get("ko_content_url")
+    ):
+        return False  # don't count it
 
+    logger.info(
+        "[EnrichCarryForward] id=%s source=%s",
+        doc.get("_orig_id") or doc.get("_id"),
+        prev.get("ko_content_source"),
+    )
     return True
+
 
 def enrich_docs_via_routes(
     docs: List[Dict[str, Any]],

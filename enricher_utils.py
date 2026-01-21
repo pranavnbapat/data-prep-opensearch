@@ -142,7 +142,7 @@ def pagesense_one(*, llid: str, url: str, http_timeout: int) -> Tuple[str, str, 
         )
         return llid, url, (text.strip() if isinstance(text, str) else None), "pagesense"
     except Exception as e:
-        logger.error("[PageSenseFail] llid=%s host=%s err=%s", llid, safe_host(url), e)
+        logger.error("[PageSenseFail] id=%s host=%s err=%s", llid, safe_host(url), e)
         return llid, url, None, "pagesense:failed"
 
 
@@ -285,7 +285,7 @@ def target_url_for_enrichment(doc: Dict[str, Any]) -> Optional[str]:
 
     if via == "api_transcribe":
         # hosted media (video/audio/image) -> use hosted file url
-        if ko_is_hosted and any(mimetype.startswith(x) for x in ("video/", "audio/")):
+        if (not ko_is_hosted) and any(mimetype.startswith(x) for x in ("video/", "audio/")):
             return ko_file_id.strip() if ko_file_id and ko_file_id.strip() else None
 
         # non-hosted media platforms -> use @id

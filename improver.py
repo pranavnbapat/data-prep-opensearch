@@ -83,6 +83,7 @@ def run_improver_stage(
         improved = 0
         failed = 0
         failure_reasons: Dict[str, int] = {}
+        carry_forward_copied = 0
 
         t0 = time.perf_counter()
 
@@ -96,7 +97,8 @@ def run_improver_stage(
             prev = prev_index.get(llid)
 
             # Always carry forward previous improvements if they exist
-            carry_forward_previous_improvements(d, prev)
+            if carry_forward_previous_improvements(d, prev):
+                carry_forward_copied += 1
 
             # Now decide whether to skip
             if should_skip_improve(d, prev):
@@ -134,9 +136,15 @@ def run_improver_stage(
             "improved": improved,
             "failed": failed,
             "skipped_prev_done": skipped_prev_done,
+            "carry_forward_copied": carry_forward_copied,
             "failure_reasons": failure_reasons,
             "elapsed_sec": round(elapsed, 2),
         }
+
+        # If nothing changed and we have a previous snapshot, don't create a new file
+        if improved == 0 and carry_forward_copied == 0 and prev_path is not None:
+            logger.warning("[ImproverStage] no_changes; keeping_prev=%s", str(prev_path))
+            return {"in": str(in_path), "out": str(prev_path), "stats": stats, "no_changes": True}
 
         run_id = run_stamp()
         out_dir = output_dir(env_mode, root=output_root)
