@@ -12,7 +12,7 @@ from typing import Optional, Dict, Any, List, Tuple
 import requests
 
 from io_helpers import run_stamp, output_dir, atomic_write_json, update_latest_pointer, resolve_latest_pointer
-from job_lock import acquire_job_lock, release_job_lock
+from job_lock import acquire_job_lock, release_job_lock, JobLockHeldError
 from downloader_utils import BackendCfg, DownloadResult, get_session, api_base, load_backend_cfg, KO_CONTENT_MODE
 from enricher_utils import set_enrich_via
 from utils import (CustomJSONEncoder, normalize_date_to_yyyy_mm_dd, strip_html_light, clean_list, get_ko_id,
@@ -227,6 +227,47 @@ def extract_first_resource_file_info(doc: Dict[str, Any]) -> Dict[str, Any]:
 
     # drop blanks
     return {k: v for k, v in out.items() if not _is_blank(v)}
+
+
+def _write_drops_report(
+    *,
+    env_mode: str,
+    output_root: str,
+    run_id: str,
+    page: int,
+    dropped_items: List[Dict[str, Any]],
+) -> Optional[str]:
+    """
+    Append dropped KO details to a per-run JSONL file.
+
+    JSONL is ideal for logs: 1 JSON object per line, easy to grep, stream, and parse.
+    Returns the file path as a string (or None if nothing written).
+    """
+    if not dropped_items:
+        return None
+
+    out_dir = output_dir(env_mode, root=output_root)
+    drops_path = out_dir / f"dropped_kos_{run_id}.jsonl"
+
+    # Keep lines small-ish but detailed.
+    # We also add page/env/run_id for traceability.
+    lines = []
+    for item in dropped_items:
+        if not isinstance(item, dict):
+            continue
+        rec = dict(item)
+        rec["env_mode"] = env_mode.upper()
+        rec["run_id"] = run_id
+        rec["page"] = page
+        lines.append(json.dumps(rec, ensure_ascii=False, cls=CustomJSONEncoder))
+
+    # Append mode so each page adds to the same file.
+    drops_path.parent.mkdir(parents=True, exist_ok=True)
+    with drops_path.open("a", encoding="utf-8") as f:
+        for ln in lines:
+            f.write(ln + "\n")
+
+    return str(drops_path)
 
 
 # ---------------- API calls ----------------
@@ -484,6 +525,7 @@ def prepare_one_doc(
             "logical_layer_id": str(doc.get("_id", "")).strip() or None,
             "at_id": (cleaned_doc or {}).get("@id") or get_ko_id(doc) or None,
             "title": (cleaned_doc or {}).get("title") or doc.get("title") or None,
+            "title_raw": doc.get("title") or None,
             "project_id": (cleaned_doc or {}).get("project_id") or doc.get("project_id") or None,
         }
         if isinstance(details, dict) and details:
@@ -833,6 +875,8 @@ def download_and_prepare(
     try:
         backend_cfg = load_backend_cfg(env_mode)
 
+        run_id = run_stamp()
+
         page = 1
         pages_seen = set()
 
@@ -923,6 +967,16 @@ def download_and_prepare(
                         show_n,
                         total,
                     )
+
+                drops_path = _write_drops_report(
+                    env_mode=env_mode,
+                    output_root=output_root,
+                    run_id=run_id,
+                    page=page,
+                    dropped_items=dropped_items,
+                )
+                if drops_path:
+                    logging.info("[DropsReport] wrote=%s count=%s", drops_path, len(dropped_items))
 
             docs_all.extend(docs_p)
             url_tasks_all.extend(url_p)
@@ -1049,13 +1103,18 @@ if __name__ == "__main__":
         except Exception:
             prev_index = {}
 
-    res = download_and_prepare(
-        env_mode=env_mode,
-        page_size=ps,
-        sort_criteria=sc,
-        max_workers=mw,
-        prev_index=prev_index,
-    )
+    try:
+        res = download_and_prepare(
+            env_mode=env_mode,
+            page_size=ps,
+            sort_criteria=sc,
+            max_workers=mw,
+            prev_index=prev_index,
+        )
+    except JobLockHeldError as e:
+        # Expected case: show friendly message, no traceback.
+        print(str(e))
+        raise SystemExit(2)
 
     # quick local smoke output (don’t do this in production)
     print(json.dumps(res.stats, indent=2, cls=CustomJSONEncoder))

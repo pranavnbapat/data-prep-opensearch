@@ -275,7 +275,6 @@ def enrich_docs_via_routes(
         Returns (text_or_none, tag)
         """
         def _call():
-            # pagesense_one returns (llid, url, text, tag)
             res = pagesense_one(llid=llid, url=url, http_timeout=0)
             # Support both 4-tuple and 5-tuple returns
             if isinstance(res, tuple) and len(res) >= 4:
@@ -292,7 +291,7 @@ def enrich_docs_via_routes(
             attempts=int(os.getenv("ENRICH_PAGESENSE_TRIES", "3")),
             base_sleep_s=float(os.getenv("ENRICH_PAGESENSE_BACKOFF", "1.6")),
             jitter_s=float(os.getenv("ENRICH_PAGESENSE_JITTER", "0.8")),
-            label=f"pagesense llid={llid} host={url}",
+            label=f"pagesense id={llid} host={url}",
         )
 
         if out is None:
@@ -314,7 +313,7 @@ def enrich_docs_via_routes(
             attempts=int(os.getenv("ENRICH_TRANSCRIBE_TRIES", "3")),
             base_sleep_s=float(os.getenv("ENRICH_TRANSCRIBE_BACKOFF", "1.7")),
             jitter_s=float(os.getenv("ENRICH_TRANSCRIBE_JITTER", "0.8")),
-            label=f"custom_transcribe llid={llid} host={url}",
+            label=f"custom_transcribe id={llid} host={url}",
         )
 
         if not text:
@@ -337,7 +336,7 @@ def enrich_docs_via_routes(
             attempts=int(os.getenv("ENRICH_TRANSCRIBE_TRIES", "3")),
             base_sleep_s=float(os.getenv("ENRICH_TRANSCRIBE_BACKOFF", "1.7")),
             jitter_s=float(os.getenv("ENRICH_TRANSCRIBE_JITTER", "0.8")),
-            label=f"api_transcribe llid={llid} host={url}",
+            label=f"api_transcribe id={llid} host={url}",
         )
 
         if not text:

@@ -87,7 +87,7 @@ def run_improver_stage(
 
         t0 = time.perf_counter()
 
-        for d in docs:
+        for i, d in enumerate(docs, start=1):
             llid = d.get("_orig_id") or d.get("_id")
             if not isinstance(llid, str) or not llid:
                 failed += 1
@@ -105,15 +105,21 @@ def run_improver_stage(
                 skipped_prev_done += 1
                 continue
 
-            attempted += 1
-            ok, reason = improve_one_doc_via_llm(d)
-
-            doc_id = d.get("@id") or d.get("_orig_id") or d.get("_id") or "unknown"
             title = d.get("title") or ""
             title_snip = (title[:50] + "…") if isinstance(title, str) and len(title) > 50 else (
                 title if isinstance(title, str) else "")
 
-            logger.warning('[ImproverDoc] id="%s" title="%s"', doc_id, title_snip)
+            # attempted is "LLM attempts", i/total is "position in input list"
+            logger.warning('[ImproverDoc] %d/%d title="%s"',
+                           i, len(docs), title_snip)
+
+            attempted += 1
+
+            if attempted % 25 == 0:
+                logger.warning("[ImproverProgress] attempted=%d improved=%d failed=%d skipped_prev=%d",
+                               attempted, improved, failed, skipped_prev_done)
+
+            ok, reason = improve_one_doc_via_llm(d)
 
             if ok:
                 d["improved"] = 1

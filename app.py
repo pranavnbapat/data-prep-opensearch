@@ -21,6 +21,7 @@ from uuid import uuid4
 
 from db_bootstrap import ensure_tables_exist
 from download_mongodb_data import get_ko_metadata, select_environment
+from pipeline import run_pipeline
 
 
 load_dotenv()
@@ -81,14 +82,32 @@ class RunParams(BaseModel):
         # Cap to 100
         return min(v, MAX_PAGE_SIZE)
 
-def _effective_page_size(val: Optional[int]) -> int:
-    # Default from env (or 100), then cap to 100, min 1 (defensive)
-    env_default = int(os.getenv("DL_PAGE_SIZE", str(MAX_PAGE_SIZE)))
-    ps = env_default if val is None else val
-    if ps < 1:
-        ps = 1
-    if ps > MAX_PAGE_SIZE:
-        ps = MAX_PAGE_SIZE
+class PipelineRunParams(BaseModel):
+    page_size: Optional[int] = None
+    env_mode: Optional[EnvMode] = None
+
+    model_config = {"extra": "ignore"}
+
+def _effective_page_size(raw_page_size: int | None, *, default: int = 100, max_size: int = 100) -> int:
+    """
+    Normalise page size coming from API / env.
+
+    Rules:
+      - 0 / None / invalid -> default (100)
+      - > max_size -> default (100)
+      - 1..max_size -> keep value
+    """
+    try:
+        ps = int(raw_page_size) if raw_page_size is not None else 0
+    except (TypeError, ValueError):
+        ps = 0
+
+    if ps == 0:
+        return default
+    if ps < 0:
+        return default
+    if ps > max_size:
+        return default
     return ps
 
 
@@ -111,6 +130,14 @@ class Job(BaseModel):
     emitted: Optional[int] = None
     dropped: Optional[int] = None
     output_file: Optional[str] = None
+
+    # --- pipeline outputs (optional) ---
+    final_path: Optional[str] = None
+    report_path: Optional[str] = None
+    latest_path: Optional[str] = None
+    pipeline_stats: Optional[dict] = None
+    error_trace: Optional[str] = None
+
     error: Optional[str] = None
     bucket_year: str
     bucket_month: str
@@ -223,14 +250,15 @@ class PerJobLogHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord):
         msg = self.format(record)
-        line = f"{datetime.utcnow().isoformat()}Z {record.levelname} {msg}"
-        self.buf.append(line)
-        if self.persist_fp:
-            try:
-                self.persist_fp.write(line + "\n")
-                self.persist_fp.flush()
-            except Exception:
-                pass
+        for part in msg.splitlines() or [""]:
+            line = f"{datetime.utcnow().isoformat()}Z {record.levelname} {part}"
+            self.buf.append(line)
+            if self.persist_fp:
+                try:
+                    self.persist_fp.write(line + "\n")
+                    self.persist_fp.flush()
+                except Exception:
+                    pass
 
     def close(self):
         try:
@@ -291,6 +319,106 @@ def _run_job(job_id: str, page_size: int, env_mode: EnvMode):
         root_logger.removeHandler(handler)
         handler.close()
 
+def _clean_error_message(e: Exception) -> str:
+    """
+    Produce a short, readable message for the API/UI.
+    Keeps the actionable hint for JobLockHeldError but drops stack traces.
+    """
+    txt = str(e).strip()
+
+    # Heuristic: keep everything up to "Traceback" if present (your JobLockHeldError includes a nice block)
+    if "Traceback (most recent call last):" in txt:
+        txt = txt.split("Traceback (most recent call last):", 1)[0].rstrip()
+
+    # Also trim any massive whitespace at the end
+    return txt
+
+def _run_pipeline_job(job_id: str, page_size: int, env_mode: EnvMode):
+    with JOB_LOCK:
+        job = JOBS[job_id]
+        job.status = JobStatus.running
+        job.started_at = datetime.utcnow()
+
+    # attach per-job log capture (same pattern as _run_job)
+    log_dir = _log_file_path(JOBS[job_id]).parent
+    handler = PerJobLogHandler(job_id, persist_dir=str(log_dir))
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    root_logger = logging.getLogger()
+    root_logger.addHandler(handler)
+
+    try:
+        # Keep consistent with your existing /run job
+        select_environment(env_mode.value)
+
+        # Pull pipeline knobs from env (same as pipeline CLI does)
+        ps = page_size
+
+        dl_workers = int(os.getenv("DL_MAX_WORKERS", "10"))
+        sort_criteria = int(os.getenv("DL_SORT_CRITERIA", "1"))
+
+        extractor_workers = int(os.getenv("EXTRACTOR_MAX_WORKERS", "4"))
+        transcribe_workers = int(os.getenv("TRANSCRIBE_MAX_WORKERS", "3"))
+
+        max_chars_env = int(os.getenv("PIPELINE_MAX_CHARS", "0"))
+        max_chars = max_chars_env if max_chars_env > 0 else None
+
+        output_root = os.getenv("OUTPUT_ROOT", "output")
+
+        logging.info("Starting pipeline (env=%s, page_size=%s)", env_mode.value, ps)
+
+        res = run_pipeline(
+            env_mode=env_mode.value,
+            page_size=ps,
+            sort_criteria=sort_criteria,
+            dl_workers=dl_workers,
+            extractor_workers=extractor_workers,
+            transcribe_workers=transcribe_workers,
+            max_chars=max_chars,
+            output_root=output_root,
+        )
+
+        # Persist results into job metadata
+        with JOB_LOCK:
+            job.status = JobStatus.success
+            job.finished_at = datetime.utcnow()
+
+            # Useful summary fields
+            job.final_path = res.final_path
+            job.report_path = res.report_path
+            job.latest_path = res.latest_path
+            job.pipeline_stats = res.stats
+
+            # Optional: mirror downloader-style convenience counters if present
+            dl_stats = (res.stats or {}).get("downloader") or {}
+            job.emitted = dl_stats.get("emitted")
+            job.dropped = dl_stats.get("dropped")
+
+        _write_job_to_disk(job)
+
+        logging.info("Pipeline finished (final=%r report=%r latest=%r)",
+                     res.final_path, res.report_path, res.latest_path)
+
+    except Exception as e:
+        clean = f"{e.__class__.__name__}: {_clean_error_message(e)}"
+        tb = traceback.format_exc()
+
+        with JOB_LOCK:
+            job.status = JobStatus.error
+            job.error = clean  # clean, readable
+            job.error_trace = tb  # full traceback stored separately
+            job.finished_at = datetime.utcnow()
+
+        _write_job_to_disk(job)
+
+        # Logs: keep both, but make the first line human-friendly
+        logging.error("Pipeline failed: %s", clean)
+        logging.debug("Pipeline traceback:\n%s", tb)
+
+    finally:
+        root_logger.removeHandler(handler)
+        handler.close()
+
 @app.post("/run")
 def trigger_run(params: RunParams, bg: BackgroundTasks):
     # prevent concurrent runs
@@ -325,6 +453,41 @@ def trigger_run(params: RunParams, bg: BackgroundTasks):
     bg.add_task(_run_job, job_id, job.page_size, job.env_mode)
     return {"status": "scheduled", "job_id": job_id}
 
+@app.post("/run-pipeline")
+def trigger_pipeline_run(params: PipelineRunParams, bg: BackgroundTasks):
+    # prevent concurrent runs (reuse the same global lock)
+    with JOB_LOCK:
+        if any(j.status == JobStatus.running for j in JOBS.values()):
+            raise HTTPException(status_code=409, detail="Another job is already running")
+
+    env_mode_val = (params.env_mode.value if params.env_mode
+                    else (os.getenv("ENV_MODE") or "DEV")).upper()
+    try:
+        resolved_env_mode = EnvMode(env_mode_val)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid ENV_MODE {env_mode_val!r}. Use DEV or PRD")
+
+    byear, bmonth = _bucket_parts_now()
+
+    job_id = uuid4().hex
+    job = Job(
+        id=job_id,
+        status=JobStatus.queued,
+        created_at=datetime.utcnow(),
+        env_mode=resolved_env_mode,
+        page_size=_effective_page_size(params.page_size),
+        bucket_year=byear,
+        bucket_month=bmonth,
+    )
+
+    with JOB_LOCK:
+        JOBS[job_id] = job
+
+    _write_job_to_disk(job)
+
+    bg.add_task(_run_pipeline_job, job_id, job.page_size, job.env_mode)
+    return {"status": "scheduled", "job_id": job_id}
+
 @app.get("/jobs")
 def list_jobs():
     with JOB_LOCK:
@@ -336,7 +499,10 @@ def get_job(job_id: str):
         job = JOBS.get(job_id)
         if not job:
             raise HTTPException(status_code=404, detail="job not found")
-        return job.model_dump()
+
+        data = job.model_dump(mode="json")
+        data.pop("error_trace", None)
+        return data
 
 @app.get("/jobs/{job_id}/logs")
 def get_job_logs(job_id: str, tail: int = 200):

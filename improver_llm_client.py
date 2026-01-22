@@ -15,10 +15,11 @@ from improver_config import BASE_VLLM_HOST, PER_REQUEST_TIMEOUT
 logger = logging.getLogger(__name__)
 _session = requests.Session()
 _retries = Retry(
-    total=4,
+    total=2,
     backoff_factor=0.7,
-    status_forcelist=(408, 409, 425, 429, 499, 500, 502, 503, 504, 524),
-    allowed_methods=frozenset(["POST"]),
+    # 404 is usually "real", but with RunPod proxy it can be transient. We'll treat it as retryable.
+    status_forcelist=(404, 408, 409, 425, 429, 499, 500, 502, 503, 504, 524),
+    allowed_methods=frozenset(["GET", "POST"]),
     raise_on_status=False,
 )
 _session.mount("https://", HTTPAdapter(max_retries=_retries))
@@ -40,7 +41,13 @@ def warm_up_model(model: str, base_url: Optional[str] = None) -> None:
             "max_tokens": 4,
             "temperature": 0.0,
         }
-        _session.post(url, json=payload, timeout=(10, 30))
+        resp = _session.post(url, json=payload, timeout=(10, 30))
+        if resp.status_code >= 400:
+            logger.warning(
+                "[ImproverWarmup] status=%s url=%s body=%s",
+                resp.status_code, url, (resp.text or "")[:200]
+            )
+
     except Exception:
         pass
 
@@ -89,10 +96,25 @@ def call_vllm_chat(
     r = _session.post(url, json=payload, timeout=PER_REQUEST_TIMEOUT)
 
     if r.status_code >= 400:
+        cf_ray = r.headers.get("cf-ray", "")
         logger.error(
-            "[ImproverHTTP] status=%s url=%s body=%s",
-            r.status_code, url, (r.text or "")[:500]
+            "[ImproverHTTP] status=%s url=%s cf_ray=%s body=%s",
+            r.status_code, url, cf_ray, (r.text or "")[:500]
         )
+
+        if r.status_code == 404:
+            logger.error(
+                "[ImproverHTTP] 404 usually means the server behind BASE_VLLM_HOST is not vLLM's OpenAI API "
+                "(wrong port/service, vLLM not running, or proxy not pointing to vLLM). Try POST %s/v1/models to verify.",
+                (host or "").rstrip("/")
+            )
+            # Quick health probe: if models works, the 404 was likely transient routing.
+            try:
+                probe = _session.get(f"{host}/v1/models", timeout=(5, 10))
+                logger.error("[ImproverHTTP] 404 probe_models_status=%s", probe.status_code)
+            except Exception as e:
+                logger.error("[ImproverHTTP] 404 probe_models_failed=%s", e)
+
         r.raise_for_status()
 
     data = r.json()
