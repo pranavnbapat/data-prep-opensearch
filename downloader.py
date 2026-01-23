@@ -1,6 +1,5 @@
 # downloader.py
 
-import hashlib
 import json
 import logging
 import os
@@ -13,7 +12,8 @@ import requests
 
 from io_helpers import run_stamp, output_dir, atomic_write_json, update_latest_pointer, resolve_latest_pointer
 from job_lock import acquire_job_lock, release_job_lock, JobLockHeldError
-from downloader_utils import BackendCfg, DownloadResult, get_session, api_base, load_backend_cfg, KO_CONTENT_MODE
+from downloader_utils import (BackendCfg, DownloadResult, get_session, api_base, load_backend_cfg, KO_CONTENT_MODE,
+                              valid_year, is_blank, sha256_obj, stable_str)
 from enricher_utils import set_enrich_via
 from utils import (CustomJSONEncoder, normalize_date_to_yyyy_mm_dd, strip_html_light, clean_list, get_ko_id,
                    extract_location_names, flatten_ko_content)
@@ -25,6 +25,31 @@ except Exception:
     pass
 
 
+SOURCE_FP_FIELDS = [
+    "@id",
+    "title",
+    "subtitle",
+    "description",
+    "keywords",
+    "creators",
+    "languages",
+    "date_of_completion",
+    "intended_purposes",
+    "locations_flat",
+    "category",
+    "topics",
+    "themes",
+    "license",
+    "project_id",
+    "subcategories",
+    "project_name",
+    "project_acronym",
+    "project_url",
+    "project_type",
+    "_orig_id",
+]
+
+
 # ---------------- Small helpers ----------------
 def _stable_value(v: Any) -> Any:
     """
@@ -32,7 +57,7 @@ def _stable_value(v: Any) -> Any:
 
     - str: stripped
     - list: recursively stable + sorted (order-insensitive)
-    - dict: recursively stable with sorted keys (via json.dumps in _sha256_obj)
+    - dict: recursively stable with sorted keys (via json.dumps in sha256_obj)
     - numbers/bool/None: kept
     - anything else: stringified
     """
@@ -51,9 +76,21 @@ def _stable_value(v: Any) -> Any:
         # sort deterministically (string representation is the safest cross-type key)
         return sorted(stable_items, key=lambda x: str(x).casefold())
     if isinstance(v, dict):
-        # keep structure; keys sorted later by _sha256_obj via json.dumps(sort_keys=True)
+        # keep structure; keys sorted later by sha256_obj via json.dumps(sort_keys=True)
         return {str(k): _stable_value(val) for k, val in v.items()}
     return str(v)
+
+def compute_source_fp(doc: Dict[str, Any]) -> str:
+    """
+    Fingerprint only the fields we care about for 'did the KO change?'.
+    Excludes ko_content_flat so content/extraction drift doesn't masquerade as metadata changes.
+    """
+    obj = {f: _stable_value(doc.get(f)) for f in SOURCE_FP_FIELDS}
+    return sha256_obj(obj)
+
+def compute_content_fp(doc: Dict[str, Any]) -> str:
+    """Fingerprint only the flattened content."""
+    return sha256_obj(stable_str(doc.get("ko_content_flat")))
 
 def compute_field_hashes(doc: Dict[str, Any]) -> Dict[str, str]:
     """
@@ -61,35 +98,33 @@ def compute_field_hashes(doc: Dict[str, Any]) -> Dict[str, str]:
     """
     fields = [
         "@id",
-        "_orig_id",
         "title",
         "subtitle",
         "description",
         "keywords",
-        "topics",
-        "themes",
+        "creators",
+        "languages",
+        "date_of_completion",
         "intended_purposes",
         "locations_flat",
-        "languages",
         "category",
-        "subcategories",
+        "topics",
+        "themes",
         "license",
         "project_id",
+        "subcategories",
         "project_name",
         "project_acronym",
-        "date_of_completion",
+        "project_url",
+        "project_type",
+        "_orig_id",
         "ko_content_flat",
-
-        # optional but often useful “resource identity” / media routing
-        "ko_is_hosted",
-        "ko_object_mimetype",
-        "ko_file_id",
     ]
 
     out: Dict[str, str] = {}
     for f in fields:
         v = _stable_value(doc.get(f))
-        out[f] = _sha256_obj(v)
+        out[f] = sha256_obj(v)
     return out
 
 def _stable_list(v: Any) -> List[str]:
@@ -110,75 +145,6 @@ def _stable_list(v: Any) -> List[str]:
         # OR
         return sorted(dedup_case_insensitive(out), key=lambda s: s.casefold())
     return []
-
-def _stable_str(v: Any) -> str:
-    return (v or "").strip() if isinstance(v, str) else ("" if v is None else str(v))
-
-def _sha256_obj(obj: Any) -> str:
-    """Hash a python object deterministically using JSON canonicalisation."""
-    # IMPORTANT: ensure_ascii=False keeps unicode stable; sort_keys stabilises key order
-    s = json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()
-
-def _is_blank(val: Any) -> bool:
-    if val is None:
-        return True
-    if isinstance(val, str):
-        return not val.strip()
-    if isinstance(val, list):
-        return len(val) == 0 or all((not isinstance(x, str)) or (not x.strip()) for x in val)
-    if isinstance(val, dict):
-        return len(val) == 0
-    return False
-
-def _norm_ts(v: Any) -> Optional[str]:
-    """Normalise timestamps to comparable strings; keep None if missing."""
-    if v is None:
-        return None
-    if isinstance(v, str):
-        s = v.strip()
-        return s or None
-    return str(v)
-
-def _is_unchanged_against_prev(
-    *,
-    llid: str,
-    cleaned: Dict[str, Any],
-    prev_index: Optional[Dict[str, Dict[str, Any]]],
-    compare_project_ts: bool = True,
-) -> bool:
-    """
-    True when ko_updated_at (and optionally proj_updated_at) matches previous snapshot.
-    """
-    if not prev_index:
-        return False
-    prev = prev_index.get(llid)
-    if not prev:
-        return False
-
-    cur_ko = _norm_ts(cleaned.get("ko_updated_at"))
-    prev_ko = _norm_ts(prev.get("ko_updated_at"))
-
-    if not cur_ko or not prev_ko:
-        return False
-    if cur_ko != prev_ko:
-        return False
-
-    if compare_project_ts:
-        cur_p = _norm_ts(cleaned.get("proj_updated_at"))
-        prev_p = _norm_ts(prev.get("proj_updated_at"))
-        # If either missing, don't let project timestamp block reuse
-        if cur_p and prev_p and cur_p != prev_p:
-            return False
-
-    return True
-
-def _valid_year(yyyy: str, min_year: int = 1000, max_year: int = 2100) -> bool:
-    try:
-        y = int(yyyy)
-        return min_year <= y <= max_year
-    except Exception:
-        return False
 
 def dedup_case_insensitive(items: Optional[List[str]]) -> List[str]:
     if not items:
@@ -226,48 +192,122 @@ def extract_first_resource_file_info(doc: Dict[str, Any]) -> Dict[str, Any]:
     out["ko_resource_language"] = first.get("language")
 
     # drop blanks
-    return {k: v for k, v in out.items() if not _is_blank(v)}
+    return {k: v for k, v in out.items() if not is_blank(v)}
 
 
-def _write_drops_report(
+# def _write_drops_report(
+#     *,
+#     env_mode: str,
+#     output_root: str,
+#     run_id: str,
+#     page: int,
+#     dropped_items: List[Dict[str, Any]],
+# ) -> Optional[str]:
+#     """
+#     Append dropped KO details to a per-run JSONL file.
+# 
+#     JSONL is ideal for logs: 1 JSON object per line, easy to grep, stream, and parse.
+#     Returns the file path as a string (or None if nothing written).
+#     """
+#     if not dropped_items:
+#         return None
+# 
+#     out_dir = output_dir(env_mode, root=output_root)
+#     drops_path = out_dir / f"dropped_kos_{run_id}.jsonl"
+# 
+#     # Keep lines small-ish but detailed.
+#     # We also add page/env/run_id for traceability.
+#     lines = []
+#     for item in dropped_items:
+#         if not isinstance(item, dict):
+#             continue
+#         rec = dict(item)
+#         rec["env_mode"] = env_mode.upper()
+#         rec["run_id"] = run_id
+#         rec["page"] = page
+#         lines.append(json.dumps(rec, ensure_ascii=False, cls=CustomJSONEncoder))
+# 
+#     # Append mode so each page adds to the same file.
+#     drops_path.parent.mkdir(parents=True, exist_ok=True)
+#     with drops_path.open("a", encoding="utf-8") as f:
+#         for ln in lines:
+#             f.write(ln + "\n")
+# 
+#     return str(drops_path)
+
+
+def upsert_dropped_kos(
     *,
     env_mode: str,
     output_root: str,
     run_id: str,
     page: int,
-    dropped_items: List[Dict[str, Any]],
+    dropped_records: List[Dict[str, Any]],
 ) -> Optional[str]:
     """
-    Append dropped KO details to a per-run JSONL file.
-
-    JSONL is ideal for logs: 1 JSON object per line, easy to grep, stream, and parse.
-    Returns the file path as a string (or None if nothing written).
+    Maintain ONE JSON file of dropped KOs (dedup by logical_layer_id).
+    If a KO already exists, update/overwrite it.
     """
-    if not dropped_items:
+    if not dropped_records:
         return None
 
     out_dir = output_dir(env_mode, root=output_root)
-    drops_path = out_dir / f"dropped_kos_{run_id}.jsonl"
+    path = out_dir / "dropped_kos.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Keep lines small-ish but detailed.
-    # We also add page/env/run_id for traceability.
-    lines = []
-    for item in dropped_items:
-        if not isinstance(item, dict):
+    # Load existing
+    existing: Dict[str, Any] = {}
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            existing = {}
+
+    dropped_by_id = existing.get("dropped_by_id")
+    if not isinstance(dropped_by_id, dict):
+        dropped_by_id = {}
+
+    # Update meta (keep it lightweight and current)
+    existing["meta"] = {
+        "env_mode": env_mode.upper(),
+        "last_run_id": run_id,
+        "last_updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "stage": "downloader",
+    }
+
+    # Upsert each record
+    for rec in dropped_records:
+        if not isinstance(rec, dict):
             continue
-        rec = dict(item)
-        rec["env_mode"] = env_mode.upper()
-        rec["run_id"] = run_id
-        rec["page"] = page
-        lines.append(json.dumps(rec, ensure_ascii=False, cls=CustomJSONEncoder))
 
-    # Append mode so each page adds to the same file.
-    drops_path.parent.mkdir(parents=True, exist_ok=True)
-    with drops_path.open("a", encoding="utf-8") as f:
-        for ln in lines:
-            f.write(ln + "\n")
+        logical_layer_id = rec.get("logical_layer_id") or rec.get("_orig_id") or rec.get("_id")
+        if not isinstance(logical_layer_id, str) or not logical_layer_id.strip():
+            continue
+        logical_layer_id = logical_layer_id.strip()
 
-    return str(drops_path)
+        doc_block = rec.get("doc") if isinstance(rec.get("doc"), dict) else {}
+        if not doc_block:
+            continue
+
+        # Inject run/page metadata into the doc itself
+        inject = {
+            "_drop_run_id": run_id,
+            "_drop_page": page,
+            "_drop_updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "_drop_env_mode": env_mode.upper(),
+        }
+
+        # Rebuild in order so injected fields appear first, then the existing doc fields
+        new_doc = dict(inject)
+        new_doc.update(doc_block)
+
+        dropped_by_id[logical_layer_id] = new_doc
+
+    existing["dropped_by_id"] = dropped_by_id
+
+    # Atomic write (you already have atomic_write_json)
+    atomic_write_json(path, existing)
+    return str(path)
 
 
 # ---------------- API calls ----------------
@@ -444,7 +484,7 @@ def clean_ko_metadata(doc: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         parsed = None
 
-    if parsed and _valid_year(parsed[:4], min_year=1000, max_year=2100):
+    if parsed and valid_year(parsed[:4], min_year=1000, max_year=2100):
         cleaned["date_of_completion"] = parsed
     else:
         cleaned.pop("date_of_completion", None)
@@ -520,21 +560,30 @@ def prepare_one_doc(
     Tuple[
         None, None, None, str, Dict[str, Any], bool, None, None, None
     ]:
-        info = {
-            "reason": f"drop:{reason}",
-            "logical_layer_id": str(doc.get("_id", "")).strip() or None,
-            "at_id": (cleaned_doc or {}).get("@id") or get_ko_id(doc) or None,
-            "title": (cleaned_doc or {}).get("title") or doc.get("title") or None,
-            "title_raw": doc.get("title") or None,
-            "project_id": (cleaned_doc or {}).get("project_id") or doc.get("project_id") or None,
+        logical_layer_id = str(doc.get("_id", "")).strip() or None
+
+        full_doc = dict(cleaned_doc) if isinstance(cleaned_doc, dict) else dict(doc)
+        if logical_layer_id and isinstance(full_doc, dict):
+            full_doc["_orig_id"] = logical_layer_id
+
+        # Add drop metadata *into* the doc (in this order)
+        drop_meta = {
+            "_drop_reason": f"drop:{reason}",
         }
-        if isinstance(details, dict) and details:
-            info.update(details)
+
+        # Put drop_meta "just above _id" by rebuilding dict in order
+        ordered_doc = dict(drop_meta)
+        ordered_doc.update(full_doc)
+
+        payload = {
+            "logical_layer_id": logical_layer_id,
+            "doc": ordered_doc,
+        }
 
         return (
             None, None, None,
             f"drop:{reason}",
-            info,
+            payload,
             True,
             None, None, None
         )
@@ -581,12 +630,12 @@ def prepare_one_doc(
         cleaned["creators"] = dedup_case_insensitive(cleaned.get("creators"))
 
         # enforce date_of_completion
-        if _is_blank(cleaned.get("date_of_completion")):
+        if is_blank(cleaned.get("date_of_completion")):
             return _drop("missing_date_of_completion", cleaned)
 
         # pre-enrichment required fields
         required_pre = ["project_id", "title", "@id", "topics", "themes", "date_of_completion"]
-        missing_pre = [f for f in required_pre if _is_blank(cleaned.get(f))]
+        missing_pre = [f for f in required_pre if is_blank(cleaned.get(f))]
         if missing_pre:
             return _drop(
                 "missing_required_pre",
@@ -602,7 +651,7 @@ def prepare_one_doc(
 
         # post-enrichment required fields
         required_post = ["project_name", "project_acronym"]
-        if any(_is_blank(cleaned.get(f)) for f in required_post):
+        if any(is_blank(cleaned.get(f)) for f in required_post):
             return _drop("missing_project_fields", cleaned)
 
         # logical layer id
@@ -619,86 +668,89 @@ def prepare_one_doc(
         def _compute_fps(cleaned_doc: Dict[str, Any]) -> Tuple[str, str, str]:
             # ---- Improver inputs ----
             improver_obj = {
-                "title": _stable_str(cleaned_doc.get("title")),
-                "subtitle": _stable_str(cleaned_doc.get("subtitle")),
-                "description": _stable_str(cleaned_doc.get("description")),
+                "title": stable_str(cleaned_doc.get("title")),
+                "subtitle": stable_str(cleaned_doc.get("subtitle")),
+                "description": stable_str(cleaned_doc.get("description")),
                 "keywords": _stable_list(cleaned_doc.get("keywords")),
-                "ko_content_flat": _stable_str(cleaned_doc.get("ko_content_flat")),
+                "ko_content_flat": stable_str(cleaned_doc.get("ko_content_flat")),
             }
-            improver_fp = _sha256_obj(improver_obj)
+            improver_fp = sha256_obj(improver_obj)
 
             # ---- Enricher inputs (only identity of external targets) ----
             enricher_obj = {
                 "policy": {
-                    "router_version": _stable_str(os.getenv("ENRICHER_ROUTER_VERSION", "1")),
-                    "enable_url_extract": _stable_str(os.getenv("ENRICH_ENABLE_URL_EXTRACT", "1")),
-                    "enable_transcribe": _stable_str(os.getenv("ENRICH_ENABLE_TRANSCRIBE", "0")),
-                    "enable_deapi_transcribe": _stable_str(os.getenv("ENRICH_ENABLE_DEAPI_TRANSCRIBE", "0")),
-                    "deapi_model": _stable_str(os.getenv("DEAPI_TRANSCRIBE_MODEL", "WhisperLargeV3")),
+                    "router_version": stable_str(os.getenv("ENRICHER_ROUTER_VERSION", "1")),
+                    "enable_url_extract": stable_str(os.getenv("ENRICH_ENABLE_URL_EXTRACT", "1")),
+                    "enable_transcribe": stable_str(os.getenv("ENRICH_ENABLE_TRANSCRIBE", "0")),
+                    "enable_deapi_transcribe": stable_str(os.getenv("ENRICH_ENABLE_DEAPI_TRANSCRIBE", "0")),
+                    "deapi_model": stable_str(os.getenv("DEAPI_TRANSCRIBE_MODEL", "WhisperLargeV3")),
                 }
             }
-            enricher_fp = _sha256_obj(enricher_obj)
+            enricher_fp = sha256_obj(enricher_obj)
 
             # ---- Downloader/source fingerprint (bigger picture) ----
             dl_obj = {
-                "@id": _stable_str(cleaned_doc.get("@id")),
-                "project_id": _stable_str(cleaned_doc.get("project_id")),
-                "project_acronym": _stable_str(cleaned_doc.get("project_acronym")),
-                "project_name": _stable_str(cleaned_doc.get("project_name")),
-                "date_of_completion": _stable_str(cleaned_doc.get("date_of_completion")),
+                "@id": stable_str(cleaned_doc.get("@id")),
+                "project_id": stable_str(cleaned_doc.get("project_id")),
+                "project_acronym": stable_str(cleaned_doc.get("project_acronym")),
+                "project_name": stable_str(cleaned_doc.get("project_name")),
+                "date_of_completion": stable_str(cleaned_doc.get("date_of_completion")),
                 "topics": _stable_list(cleaned_doc.get("topics")),
                 "themes": _stable_list(cleaned_doc.get("themes")),
-                "license": _stable_str(cleaned_doc.get("license")),
-                "ko_file_id": _stable_str(cleaned_doc.get("ko_file_id")),
-                "ko_object_mimetype": _stable_str(cleaned_doc.get("ko_object_mimetype")),
+                "license": stable_str(cleaned_doc.get("license")),
+                "ko_file_id": stable_str(cleaned_doc.get("ko_file_id")),
+                "ko_object_mimetype": stable_str(cleaned_doc.get("ko_object_mimetype")),
                 "ko_object_size": cleaned_doc.get("ko_object_size"),
-                "ko_updated_at": _stable_str(cleaned_doc.get("ko_updated_at")),
-                "proj_updated_at": _stable_str(cleaned_doc.get("proj_updated_at")),
-                "ko_content_flat": _stable_str(cleaned_doc.get("ko_content_flat")),
+                "ko_updated_at": stable_str(cleaned_doc.get("ko_updated_at")),
+                "proj_updated_at": stable_str(cleaned_doc.get("proj_updated_at")),
+                "ko_content_flat": stable_str(cleaned_doc.get("ko_content_flat")),
             }
-            dl_fp = _sha256_obj(dl_obj)
+            dl_fp = sha256_obj(dl_obj)
 
             return dl_fp, enricher_fp, improver_fp
 
-        # --- incremental reuse: if unchanged, reuse previous snapshot doc and skip content API ---
-        compare_proj = os.getenv("DL_COMPARE_PROJECT_TS", "1").strip().lower() in {"1", "true", "yes", "y", "on"}
-        is_unchanged = _is_unchanged_against_prev(
-            llid=logical_layer_id,
-            cleaned=cleaned,
-            prev_index=prev_index,
-            compare_project_ts=compare_proj,
-        )
+        # ---------------- Source fingerprint gate (primary truth) ----------------
+        # Compute a fingerprint of exactly the "fields we care about".
+        cur_source_fp = compute_source_fp(cleaned)
 
-        if is_unchanged and prev_index and skip_content_if_unchanged:
-            prev_doc = prev_index.get(logical_layer_id)
-            if isinstance(prev_doc, dict):
-                # Keep the latest cleaned metadata for fields that might be re-normalised,
-                # but preserve heavy/derived fields from previous (content/enrich/llm).
-                merged = dict(prev_doc)  # start from previous snapshot (has ko_content_flat etc.)
-                merged.update(cleaned)   # ensure current core metadata is up-to-date
-                merged["_orig_id"] = logical_layer_id
+        prev_doc = prev_index.get(logical_layer_id) if prev_index else None
+        prev_source_fp = prev_doc.get("_source_fp") if isinstance(prev_doc, dict) else None
 
-                set_enrich_via(merged)
+        source_changed = True if prev_source_fp is None else (prev_source_fp != cur_source_fp)
 
-                _ensure_stage_flags(merged)
+        # If the KO is unchanged by our definition, reuse previous snapshot (including heavy fields),
+        # and skip the content API call.
+        if (not source_changed) and isinstance(prev_doc, dict) and skip_content_if_unchanged:
+            merged = dict(prev_doc)  # keep previous ko_content_flat + enriched/improved outputs
+            merged.update(cleaned)   # refresh normalised metadata fields
+            merged["_orig_id"] = logical_layer_id
 
-                if os.getenv("LOG_LEVEL", "").upper() == "DEBUG":
-                    logging.debug("[ReuseUnchanged] id=%s ko_updated_at=%s", logical_layer_id, cleaned.get("ko_updated_at"))
+            set_enrich_via(merged)
+            _ensure_stage_flags(merged)
 
-                dl_fp, enr_fp, imp_fp = _compute_fps(merged)
-                merged["_dl_fp"] = dl_fp
-                merged["_enricher_fp"] = enr_fp
-                merged["_improver_fp"] = imp_fp
-                merged["_field_hashes"] = compute_field_hashes(merged)
-                merged["_fields_fp"] = _sha256_obj(merged["_field_hashes"])
+            # Store fingerprints on the document
+            merged["_source_fp"] = cur_source_fp
+            merged["_content_fp"] = compute_content_fp(merged)
 
-                prev_dl_fp = None
-                if prev_index and isinstance(prev_index.get(logical_layer_id), dict):
-                    prev_dl_fp = prev_index[logical_layer_id].get("_dl_fp")
-                source_changed = True if prev_dl_fp is None else (prev_dl_fp != dl_fp)
+            # --- per-field hashes (for "which fields changed") ---
+            merged["_field_hashes"] = compute_field_hashes(merged)
 
-                return merged, None, None, "emitted", None, source_changed, dl_fp, enr_fp, imp_fp
+            prev_hashes = prev_doc.get("_field_hashes") if isinstance(prev_doc, dict) else None
+            cur_hashes = merged["_field_hashes"]
 
+            changed_fields: List[str] = []
+            if isinstance(prev_hashes, dict):
+                for k, v in cur_hashes.items():
+                    if prev_hashes.get(k) != v:
+                        changed_fields.append(k)
+            else:
+                # no previous hashes available -> treat all as changed
+                changed_fields = list(cur_hashes.keys())
+
+            merged["_changed_fields"] = changed_fields
+            merged["_changed_field_count"] = len(changed_fields)
+
+            return merged, None, None, "emitted", None, False, None, None, None
 
         # --- hosted content fetch via content API ---
         content_list = get_ko_content(backend_cfg, logical_layer_id)
@@ -710,20 +762,27 @@ def prepare_one_doc(
 
         _ensure_stage_flags(combined)
 
-        dl_fp, enr_fp, imp_fp = _compute_fps(combined)
-        combined["_dl_fp"] = dl_fp
-        combined["_enricher_fp"] = enr_fp
-        combined["_improver_fp"] = imp_fp
+        # --- fingerprints + per-field hashes ---
+        combined["_source_fp"] = cur_source_fp
+        combined["_content_fp"] = compute_content_fp(combined)
+
         combined["_field_hashes"] = compute_field_hashes(combined)
-        combined["_fields_fp"] = _sha256_obj(combined["_field_hashes"])
 
-        prev_dl_fp = None
-        if prev_index and isinstance(prev_index.get(logical_layer_id), dict):
-            prev_dl_fp = prev_index[logical_layer_id].get("_dl_fp")
+        prev_hashes = prev_doc.get("_field_hashes") if isinstance(prev_doc, dict) else None
+        cur_hashes = combined["_field_hashes"]
 
-        source_changed = True if prev_dl_fp is None else (prev_dl_fp != dl_fp)
+        changed_fields: List[str] = []
+        if isinstance(prev_hashes, dict):
+            for k, v in cur_hashes.items():
+                if prev_hashes.get(k) != v:
+                    changed_fields.append(k)
+        else:
+            changed_fields = list(cur_hashes.keys())
 
-        return combined, None, None, "emitted", None, source_changed, dl_fp, enr_fp, imp_fp
+        combined["_changed_fields"] = changed_fields
+        combined["_changed_field_count"] = len(changed_fields)
+
+        return combined, None, None, "emitted", None, source_changed, None, None, None
 
     except Exception as e:
         logging.exception("prepare_one_doc failed for _id=%r: %s", doc.get("_id"), e)
@@ -748,6 +807,7 @@ def _process_page(
     List[Dict[str, Any]],
     int,  # changed_count
     int,  # unchanged_count
+    List[str],  # changed_ids
 ]:
 
     """
@@ -759,7 +819,7 @@ def _process_page(
       (docs, url_tasks, media_tasks, emitted_count, dropped_count)
     """
     if not kos_page:
-        return [], [], [], 0, 0, {}, [], 0, 0
+        return [], [], [], 0, 0, {}, [], 0, 0, []
 
     # filter published
     before = len(kos_page)
@@ -784,6 +844,7 @@ def _process_page(
     dropped = 0
     changed_count = 0
     unchanged_count = 0
+    changed_ids: List[str] = []
 
     drop_reasons: Dict[str, int] = {}
     dropped_items: List[Dict[str, Any]] = []
@@ -804,7 +865,7 @@ def _process_page(
         ]
 
         for fut in as_completed(futs):
-            doc_out, url_task, media_task, status, drop_info, changed, dl_fp, enr_fp, imp_fp = fut.result()
+            doc_out, url_task, media_task, status, drop_info, changed, _, _, _ = fut.result()
             if status != "emitted" or not doc_out:
                 if drop_info:
                     dropped_items.append(drop_info)
@@ -820,6 +881,10 @@ def _process_page(
             docs_out.append(doc_out)
 
             if changed:
+                # Prefer _orig_id for stability, fall back to @id
+                cid = doc_out.get("_orig_id") or doc_out.get("@id")
+                if isinstance(cid, str) and cid.strip():
+                    changed_ids.append(cid.strip())
                 changed_count += 1
             else:
                 unchanged_count += 1
@@ -847,6 +912,7 @@ def _process_page(
         dropped_items,
         changed_count,
         unchanged_count,
+        changed_ids,
     )
 
 
@@ -886,6 +952,7 @@ def download_and_prepare(
         media_task_total = 0
         changed_total = 0
         unchanged_total = 0
+        changed_ids_all: List[str] = []
 
         docs_all: List[Dict[str, Any]] = []
         url_tasks_all: List[Dict[str, Any]] = []
@@ -911,8 +978,14 @@ def download_and_prepare(
             )
 
             dt_fetch = time.perf_counter() - t_fetch
-            if dt_fetch > float(os.getenv("SLOW_PAGE_FETCH_SEC", "1.0")):
-                logging.warning("[SlowPageFetch] env=%s page=%s dt=%.2fs", env_mode, page, dt_fetch)
+
+            # Always log as a metric at INFO (keeps WARN meaningful)
+            logging.info("[PageFetch] env=%s Page=%s dt=%.2fs", env_mode, page, dt_fetch)
+
+            # Only WARN if it’s *actually* slow
+            warn_thr = float(os.getenv("PAGE_FETCH_WARN_SEC", "5.0"))
+            if dt_fetch > warn_thr:
+                logging.warning("[PageFetchSlow] env=%s Page=%s dt=%.2fs thr=%.2fs", env_mode, page, dt_fetch, warn_thr)
 
             kos_page = payload.get("data", []) or payload.get("results", []) or []
             if not kos_page:
@@ -921,9 +994,9 @@ def download_and_prepare(
             pagination = payload.get("pagination") or {}
             next_page = pagination.get("next_page")
 
-            logging.info("[KO API] env=%s page=%s fetched=%s next=%r", env_mode, page, len(kos_page), next_page)
+            logging.info("[KO API] env=%s Page=%s fetched=%s next=%r", env_mode, page, len(kos_page), next_page)
 
-            docs_p, url_p, media_p, emitted_p, dropped_p, drop_reasons, dropped_items, changed_p, unchanged_p = _process_page(
+            docs_p, url_p, media_p, emitted_p, dropped_p, drop_reasons, dropped_items, changed_p, unchanged_p, changed_ids_p = _process_page(
                 backend_cfg,
                 kos_page,
                 workers=max_workers,
@@ -931,13 +1004,13 @@ def download_and_prepare(
             )
 
             logging.info(
-                "[PageDone] env=%s page=%s emitted=%s dropped=%s url_tasks=%s media_tasks=%s dt=%.2fs",
+                "[PageDone] env=%s Page=%s Emitted=%s Dropped=%s url_tasks=%s media_tasks=%s dt=%.2fs",
                 env_mode, page, emitted_p, dropped_p, len(url_p), len(media_p),
                 time.perf_counter() - t_page
             )
 
             if drop_reasons:
-                logging.info("[PageDrops] env=%s page=%s reasons=%s", env_mode, page, drop_reasons)
+                logging.info("[PageDrops] env=%s Page=%s Reasons=%s", env_mode, page, drop_reasons)
 
             max_show = int(os.getenv("DROP_LOG_MAX", "100"))
             if dropped_items:
@@ -947,7 +1020,7 @@ def download_and_prepare(
                 # One KO per line for readability in logs
                 for i, item in enumerate(dropped_items[:show_n], start=1):
                     logging.info(
-                        "[DroppedKOs] env=%s page=%s showing=%s/%s reason=%r missing_pre_fields=%r logical_layer_id=%r title=%r",
+                        "[DroppedKOs] env=%s Page=%s showing=%s/%s Reason=%r missing_pre_fields=%r logical_layer_id=%r title=%r",
                         env_mode,
                         page,
                         i,
@@ -961,22 +1034,23 @@ def download_and_prepare(
                 # Optional: make it explicit if we truncated the list
                 if show_n < total:
                     logging.info(
-                        "[DroppedKOs] env=%s page=%s truncated (showing %s/%s). Increase DROP_LOG_MAX to see more.",
+                        "[DroppedKOs] env=%s Page=%s truncated (showing %s/%s). Increase DROP_LOG_MAX to see more.",
                         env_mode,
                         page,
                         show_n,
                         total,
                     )
 
-                drops_path = _write_drops_report(
+                drops_path = upsert_dropped_kos(
                     env_mode=env_mode,
                     output_root=output_root,
                     run_id=run_id,
                     page=page,
-                    dropped_items=dropped_items,
+                    dropped_records=dropped_items,
                 )
                 if drops_path:
-                    logging.info("[DropsReport] wrote=%s count=%s", drops_path, len(dropped_items))
+                    logging.info("[DroppedKOsFile] Updated=%s Count Added or Updated=%s", drops_path,
+                                 len(dropped_items))
 
             docs_all.extend(docs_p)
             url_tasks_all.extend(url_p)
@@ -987,6 +1061,8 @@ def download_and_prepare(
 
             changed_total += changed_p
             unchanged_total += unchanged_p
+
+            changed_ids_all.extend(changed_ids_p)
 
             url_task_total += len(url_p)
             media_task_total += len(media_p)
@@ -1015,7 +1091,7 @@ def download_and_prepare(
         }
 
         logging.warning(
-            "[Downloader] env=%s emitted=%s dropped=%s changed=%s unchanged=%s url_tasks=%s media_tasks=%s elapsed=%.2fs",
+            "[Downloader] env=%s Emitted=%s Dropped=%s Changed=%s unChanged=%s url_tasks=%s media_tasks=%s elapsed=%.2fs",
             stats["env_mode"],
             emitted_total,
             dropped_total,
@@ -1025,6 +1101,27 @@ def download_and_prepare(
             media_task_total,
             elapsed,
         )
+
+        # ---------------- End-of-run change summary ----------------
+        if changed_total > 0:
+            # de-dup but preserve order
+            seen = set()
+            uniq = []
+            for x in changed_ids_all:
+                if x not in seen:
+                    uniq.append(x)
+                    seen.add(x)
+
+            max_show = int(os.getenv("DL_CHANGED_IDS_MAX", "25"))
+            show = uniq[:max_show]
+
+            logging.warning("[DownloaderSummary] Changed=%s Unchanged Reused=%s", changed_total, unchanged_total)
+            logging.warning("[DownloaderSummary] Changed IDs=%s", ", ".join(show))
+            if len(uniq) > max_show:
+                logging.warning("[DownloaderSummary] Changed IDs Truncated Total=%s Shown=%s", len(uniq), max_show)
+        else:
+            logging.warning("[DownloaderSummary] No changes detected. Emitted=%s Dropped=%s", emitted_total, dropped_total)
+            logging.warning("[DownloaderSummary] Unchanged Reused=%s", unchanged_total)
 
         # --- Optional: persist downloader output for independent stage runs ---
         should_write_output = os.getenv("DL_WRITE_OUTPUT", "1").strip().lower() in {"1", "true", "yes", "y", "on"}
@@ -1054,7 +1151,7 @@ def download_and_prepare(
             update_latest_pointer(env_mode, output_root, "latest_downloaded.json", out_path)
 
         elif should_write_output and not has_meaningful_changes:
-            logging.warning("[Downloader] no_changes=True (skipping write of final_output_*)")
+            logging.warning("[Downloader] No changes detected (skipping writing of final_output)")
 
 
         return DownloadResult(

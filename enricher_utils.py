@@ -13,6 +13,8 @@ from urllib.parse import urlparse
 
 import requests
 
+from downloader_utils import sha256_obj, stable_str
+from io_helpers import resolve_latest_pointer, find_latest_matching
 from requests.auth import HTTPBasicAuth
 
 
@@ -21,6 +23,50 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------- Small utilities ----------------
+def load_latest_downloader_output(env_mode: str, output_root: str) -> Tuple[Path, List[Dict[str, Any]]]:
+    # Prefer pointer file first
+    p = resolve_latest_pointer(env_mode, output_root, "latest_downloaded.json")
+    if p is None:
+        p = find_latest_matching(env_mode, output_root, "final_output_*.json")
+    if p is None:
+        raise RuntimeError(f"No downloader output found under {output_root}/{env_mode.upper()}/")
+
+    payload = load_stage_payload(p)
+
+    # Support both shapes: full payload dict OR raw docs list
+    if isinstance(payload, dict):
+        docs = payload.get("docs") or []
+    elif isinstance(payload, list):
+        docs = payload
+    else:
+        raise RuntimeError(f"Unexpected payload shape in {p}: {type(payload)}")
+
+    if not isinstance(docs, list):
+        raise RuntimeError(f"Invalid docs in {p}")
+
+    return p, docs
+
+def load_latest_enricher_output(env_mode: str, output_root: str) -> Tuple[Optional[Path], List[Dict[str, Any]]]:
+    # Prefer pointer file first
+    p = resolve_latest_pointer(env_mode, output_root, "latest_enriched.json")
+    if p is None:
+        p = find_latest_matching(env_mode, output_root, "final_enriched_*.json")
+    if p is None:
+        return None, []
+
+    payload = load_stage_payload(p)
+    if isinstance(payload, dict):
+        docs = payload.get("docs") or []
+    elif isinstance(payload, list):
+        docs = payload
+    else:
+        return p, []
+
+    if not isinstance(docs, list):
+        return p, []
+
+    return p, docs
+
 def load_stage_payload(path: Path) -> Dict[str, Any]:
     with path.open("r", encoding="utf-8") as fh:
         return json.load(fh)
@@ -34,6 +80,12 @@ def safe_host(url: Any) -> str:
         return f"{u.scheme}://{u.netloc}"
     except Exception:
         return "unknown://"
+
+def env_bool(name: str, default: bool = True) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return v.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 # ------------------------ HTTP session helpers ------------------------
 def get_public_session(timeout: int = 30) -> requests.Session:
@@ -441,3 +493,33 @@ def is_deapi_platform_url(u: str) -> bool:
         "twitch.tv/",
         "kick.com/",
     ))
+
+def compute_enrich_inputs_fp(doc: Dict[str, Any]) -> str:
+    """
+    Compute enricher-input fingerprint according to the 3 regimes we agreed.
+
+    A) URL-only (ko_is_hosted False) -> @id only
+    B) Hosted doc-like (hosted, non media, no enrich_via) -> @id + ko_file_id + ko_content_flat
+       (even if enricher does nothing, this FP is still useful for consistency)
+    C) Hosted media (video/audio/image) -> @id + ko_file_id
+    """
+    ko_is_hosted = as_bool(doc.get("ko_is_hosted"))
+    mimetype = (doc.get("ko_object_mimetype") or "").strip().lower()
+    at_id = stable_str(doc.get("@id"))
+    ko_file_id = stable_str(doc.get("ko_file_id"))
+    ko_content_flat = stable_str(doc.get("ko_content_flat"))
+
+    is_media = any(mimetype.startswith(x) for x in ("video/", "audio/", "image/"))
+
+    if not ko_is_hosted:
+        obj = {"mode": "url_only", "@id": at_id}
+        return sha256_obj(obj)
+
+    if is_media:
+        obj = {"mode": "hosted_media", "@id": at_id, "ko_file_id": ko_file_id}
+        return sha256_obj(obj)
+
+    # hosted, non-media
+    obj = {"mode": "hosted_doc", "@id": at_id, "ko_file_id": ko_file_id, "ko_content_flat": ko_content_flat}
+    return sha256_obj(obj)
+

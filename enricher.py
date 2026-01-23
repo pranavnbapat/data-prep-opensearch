@@ -19,60 +19,17 @@ except Exception:
 
 from deapi_transcribe import transcribe_video, DeapiError
 from job_lock import acquire_job_lock, release_job_lock
-from io_helpers import (resolve_latest_pointer, find_latest_matching, atomic_write_json, update_latest_pointer,
+from io_helpers import (atomic_write_json, update_latest_pointer,
                         run_stamp, output_dir)
-from enricher_utils import (pagesense_one, custom_transcribe_one, load_stage_payload, classify_url_for_enrichment,
+from enricher_utils import (pagesense_one, custom_transcribe_one, classify_url_for_enrichment,
                             target_url_for_enrichment, has_enrich_via, should_skip, is_placeholder_content,
-                            is_deapi_platform_url)
+                            is_deapi_platform_url, load_latest_downloader_output, load_latest_enricher_output, 
+                            env_bool)
 
 
 logger = logging.getLogger(__name__)
 
-def load_latest_downloader_output(env_mode: str, output_root: str) -> Tuple[Path, List[Dict[str, Any]]]:
-    # Prefer pointer file first
-    p = resolve_latest_pointer(env_mode, output_root, "latest_downloaded.json")
-    if p is None:
-        p = find_latest_matching(env_mode, output_root, "final_output_*.json")
-    if p is None:
-        raise RuntimeError(f"No downloader output found under {output_root}/{env_mode.upper()}/")
-
-    payload = load_stage_payload(p)
-
-    # Support both shapes: full payload dict OR raw docs list
-    if isinstance(payload, dict):
-        docs = payload.get("docs") or []
-    elif isinstance(payload, list):
-        docs = payload
-    else:
-        raise RuntimeError(f"Unexpected payload shape in {p}: {type(payload)}")
-
-    if not isinstance(docs, list):
-        raise RuntimeError(f"Invalid docs in {p}")
-
-    return p, docs
-
-def load_latest_enricher_output(env_mode: str, output_root: str) -> Tuple[Optional[Path], List[Dict[str, Any]]]:
-    # Prefer pointer file first
-    p = resolve_latest_pointer(env_mode, output_root, "latest_enriched.json")
-    if p is None:
-        p = find_latest_matching(env_mode, output_root, "final_enriched_*.json")
-    if p is None:
-        return None, []
-
-    payload = load_stage_payload(p)
-    if isinstance(payload, dict):
-        docs = payload.get("docs") or []
-    elif isinstance(payload, list):
-        docs = payload
-    else:
-        return p, []
-
-    if not isinstance(docs, list):
-        return p, []
-
-    return p, docs
-
-def _index_docs_by_llid(docs: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+def index_docs_by_llid(docs: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     idx: Dict[str, Dict[str, Any]] = {}
     for d in docs:
         llid = d.get("_orig_id") or d.get("_id")
@@ -80,30 +37,8 @@ def _index_docs_by_llid(docs: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]
             idx[llid] = d
     return idx
 
-def _now_perf() -> float:
-    return time.perf_counter()
-
 def _inc(counter: Dict[str, int], key: str, n: int = 1) -> None:
     counter[key] = counter.get(key, 0) + n
-
-def _env_bool(name: str, default: bool = True) -> bool:
-    v = os.getenv(name)
-    if v is None:
-        return default
-    return v.strip().lower() in {"1", "true", "yes", "y", "on"}
-
-def _norm_mimetype(m: Any) -> str:
-    if not isinstance(m, str):
-        return ""
-    return m.strip().lower()
-
-def _norm_ext(e: Any) -> str:
-    if not isinstance(e, str):
-        return ""
-    e = e.strip().lower()
-    if e.startswith("."):
-        e = e[1:]
-    return e
 
 # ---------------- Small utilities ----------------
 
@@ -119,7 +54,7 @@ def transcribe_with_deapi(*, video_url: Optional[str] = None, video_path: Option
         return None
 
     model = (os.getenv("DEAPI_TRANSCRIBE_MODEL") or "WhisperLargeV3").strip() or "WhisperLargeV3"
-    include_ts = _env_bool("DEAPI_INCLUDE_TIMESTAMPS", False)
+    include_ts = env_bool("DEAPI_INCLUDE_TIMESTAMPS", False)
 
     # Polling knobs (transcription can take time)
     timeout_s = int(os.getenv("DEAPI_HTTP_TIMEOUT", "60"))
@@ -347,11 +282,11 @@ def enrich_docs_via_routes(
     if not docs:
         return {"patched": 0, "skipped": 0, "failed": 0}
 
-    enable_pagesense = _env_bool("ENRICH_ENABLE_URL_EXTRACT", True)
-    enable_api_transcribe = _env_bool("ENRICH_ENABLE_API_TRANSCRIBE", True)
-    enable_custom_transcribe = _env_bool("ENRICH_ENABLE_CUSTOM_TRANSCRIBE", True)
+    enable_pagesense = env_bool("ENRICH_ENABLE_URL_EXTRACT", True)
+    enable_api_transcribe = env_bool("ENRICH_ENABLE_API_TRANSCRIBE", True)
+    enable_custom_transcribe = env_bool("ENRICH_ENABLE_CUSTOM_TRANSCRIBE", True)
 
-    idx = _index_docs_by_llid(docs)
+    idx = index_docs_by_llid(docs)
 
     # ---- build candidates ----
     candidates: List[Tuple[str, str, str]] = []  # (llid, route, target_url)
@@ -563,7 +498,7 @@ def run_enricher_stage(
         in_path, docs = load_latest_downloader_output(env_mode, output_root)
 
         prev_path, prev_docs = load_latest_enricher_output(env_mode, output_root)
-        prev_index = _index_docs_by_llid(prev_docs)
+        prev_index = index_docs_by_llid(prev_docs)
 
         stats = enrich_docs_via_routes(
             docs,

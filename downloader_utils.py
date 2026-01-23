@@ -1,5 +1,7 @@
 # downloader_utils.py
 
+import hashlib
+import json
 import threading
 import logging
 import os
@@ -84,6 +86,33 @@ def get_session(backend_cfg: BackendCfg, timeout: int = 15) -> requests.Session:
         _tls.session = sess
         _tls.session_key = key
     return sess
+
+def valid_year(yyyy: str, min_year: int = 1000, max_year: int = 2100) -> bool:
+    try:
+        y = int(yyyy)
+        return min_year <= y <= max_year
+    except Exception:
+        return False
+
+def is_blank(val: Any) -> bool:
+    if val is None:
+        return True
+    if isinstance(val, str):
+        return not val.strip()
+    if isinstance(val, list):
+        return len(val) == 0 or all((not isinstance(x, str)) or (not x.strip()) for x in val)
+    if isinstance(val, dict):
+        return len(val) == 0
+    return False
+
+def sha256_obj(obj: Any) -> str:
+    """Hash a python object deterministically using JSON canonicalisation."""
+    # IMPORTANT: ensure_ascii=False keeps unicode stable; sort_keys stabilises key order
+    s = json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+def stable_str(v: Any) -> str:
+    return (v or "").strip() if isinstance(v, str) else ("" if v is None else str(v))
 
 def build_session(backend_cfg: BackendCfg, timeout: int = 15) -> requests.Session:
     """

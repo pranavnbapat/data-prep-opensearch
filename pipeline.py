@@ -145,25 +145,25 @@ def run_pipeline(
         dl_media_tasks: List[Dict[str, Any]] = dl.media_tasks if dl else []
 
         # Optional: truncate latest downloader final_output_* to a small random sample (DEV convenience)
-        truncate_final = env_flag("TRUNCATE_FINAL_OUTPUT", False)
-        if truncate_final and dl:
-            try:
-                truncated_path, truncated_docs = truncate_latest_final_output(
-                    env_mode=env_mode,
-                    output_root=output_root,
-                    n_keep=10,
-                )
-
-                # Use truncated docs as the working set for downstream stages
-                dl_docs = truncated_docs
-
-                logger.warning(
-                    "[Pipeline] TRUNCATE_FINAL_OUTPUT=1 → truncated %s to %d docs (downstream will use truncated set)",
-                    str(truncated_path),
-                    len(truncated_docs),
-                )
-            except Exception as e:
-                logger.warning("[Pipeline] TRUNCATE_FINAL_OUTPUT requested but truncation failed: %s", e)
+        # truncate_final = env_flag("TRUNCATE_FINAL_OUTPUT", False)
+        # if truncate_final and dl:
+        #     try:
+        #         truncated_path, truncated_docs = truncate_latest_final_output(
+        #             env_mode=env_mode,
+        #             output_root=output_root,
+        #             n_keep=10,
+        #         )
+        #
+        #         # Use truncated docs as the working set for downstream stages
+        #         dl_docs = truncated_docs
+        #
+        #         logger.warning(
+        #             "[Pipeline] TRUNCATE_FINAL_OUTPUT=1 → truncated %s to %d docs (downstream will use truncated set)",
+        #             str(truncated_path),
+        #             len(truncated_docs),
+        #         )
+        #     except Exception as e:
+        #         logger.warning("[Pipeline] TRUNCATE_FINAL_OUTPUT requested but truncation failed: %s", e)
 
         # Step 2: enrich (cascading: only runs if downloader ran and enable_enricher=True)
         enrich_res: Dict[str, Any] = {}
@@ -252,10 +252,10 @@ def run_pipeline(
             logger.warning("[Pipeline] Improver disabled; skipping.")
 
         downloader_stats = dl.stats if dl else {"changed": 0, "emitted": 0, "dropped": 0, "notes": "disabled"}
-        if truncate_final and dl:
-            # avoid mutating dl.stats; just override in the stats we report
-            downloader_stats = dict(downloader_stats)
-            downloader_stats["emitted"] = len(dl_docs)
+        # if truncate_final and dl:
+        #     # avoid mutating dl.stats; just override in the stats we report
+        #     downloader_stats = dict(downloader_stats)
+        #     downloader_stats["emitted"] = len(dl_docs)
 
         # If nothing changed since previous snapshot, don't create new final_* files.
         # Still refresh latest.json (optional) so reuse continues to work.
