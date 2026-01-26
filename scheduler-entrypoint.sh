@@ -1,7 +1,8 @@
 #!/bin/sh
 set -eu
 
-: "${TARGET_URL:=http://data-prep-opensearch:8000/run_pipeline}"
+: "${TARGET_URL:=http://data-prep-opensearch:8000/run-pipeline}"
+: "${HEALTH_URL:=http://data-prep-opensearch:8000/healthz}"
 : "${ENV_MODE:=PRD}"
 : "${TZ:=UTC}"    # avoid unbound var in echo under set -u
 : "${SPLAY:=0}"   # optional random delay in seconds to avoid thundering herd
@@ -13,7 +14,7 @@ echo "Scheduler started. Posting to: $TARGET_URL  (env_mode=$ENV_MODE)  TZ=$TZ"
 
 # Wait until the target endpoint responds (simple readiness gate)
 # This avoids missing the first day's run if the app isn't up yet.
-until curl -fsS "${TARGET_URL%/run_pipeline}/healthz" >/dev/null 2>&1; do
+until curl -fsS "$HEALTH_URL" >/dev/null 2>&1; do
   echo "Waiting for app healthz..."
   sleep 5
 done

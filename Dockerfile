@@ -9,7 +9,17 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py db_bootstrap.py download_mongodb_data.py utils.py ./
+COPY \
+  app.py pipeline.py db_bootstrap.py download_mongodb_data.py utils.py \
+  downloader.py downloader_utils.py \
+  enricher.py enricher_utils.py \
+  improver.py improver_config.py improver_engine.py improver_extractors.py \
+  improver_llm_client.py improver_prompts.py improver_text_utils.py improver_utils.py \
+  io_helpers.py \
+  deapi_transcribe.py \
+  job_lock.py \
+  ./
+
 
 RUN mkdir -p /app/output \
  && useradd -m -u 10001 appuser \

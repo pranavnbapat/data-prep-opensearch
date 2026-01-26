@@ -96,7 +96,7 @@ def sample_docs_in_place(json_path: Path, n_keep: int) -> None:
 def main() -> int:
     env_mode = load_env_mode()
 
-    root = Path("output") / env_mode
+    root = Path("../output") / env_mode
     latest_file = find_latest_final_output(root)
 
     sample_docs_in_place(latest_file, N_KEEP)

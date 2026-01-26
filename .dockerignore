@@ -23,6 +23,8 @@ logs/
 venv/
 ENV/
 env/
+testing/
+mysql_data/
 venv*/
 .python-version
 
