@@ -305,7 +305,7 @@ def upsert_dropped_kos(
 
     existing["dropped_by_id"] = dropped_by_id
 
-    # Atomic write (you already have atomic_write_json)
+    # Atomic write
     atomic_write_json(path, existing)
     return str(path)
 
@@ -567,9 +567,11 @@ def prepare_one_doc(
             full_doc["_orig_id"] = logical_layer_id
 
         # Add drop metadata *into* the doc (in this order)
-        drop_meta = {
+        drop_meta: Dict[str, Any] = {
             "_drop_reason": f"drop:{reason}",
         }
+        if isinstance(details, dict):
+            drop_meta["_drop_details"] = details
 
         # Put drop_meta "just above _id" by rebuilding dict in order
         ordered_doc = dict(drop_meta)
@@ -630,19 +632,25 @@ def prepare_one_doc(
         cleaned["creators"] = dedup_case_insensitive(cleaned.get("creators"))
 
         # enforce date_of_completion
-        if is_blank(cleaned.get("date_of_completion")):
-            return _drop("missing_date_of_completion", cleaned)
+        # if is_blank(cleaned.get("date_of_completion")):
+        #     return _drop(
+        #         "missing_date_of_completion",
+        #         cleaned,
+        #         details={"message": "Missing required field: date_of_completion"},
+        #     )
 
         # pre-enrichment required fields
-        required_pre = ["project_id", "title", "@id", "topics", "themes", "date_of_completion"]
+        required_pre = ["project_id", "@id", "date_of_completion"]
         missing_pre = [f for f in required_pre if is_blank(cleaned.get(f))]
         if missing_pre:
+            pretty = ", ".join(missing_pre)
+
             return _drop(
                 "missing_required_pre",
                 cleaned,
                 details={
                     "missing_pre_fields": missing_pre,
-                    "drop_message": f"missing pre-enrichment fields: {missing_pre}",
+                    "message": f"Missing required fields before enrichment: {pretty}",
                 },
             )
 
@@ -651,8 +659,16 @@ def prepare_one_doc(
 
         # post-enrichment required fields
         required_post = ["project_name", "project_acronym"]
-        if any(is_blank(cleaned.get(f)) for f in required_post):
-            return _drop("missing_project_fields", cleaned)
+        missing_post = [f for f in required_post if is_blank(cleaned.get(f))]
+        if missing_post:
+            return _drop(
+                "missing_project_fields",
+                cleaned,
+                details={
+                    "missing_post_fields": missing_post,
+                    "message": f"Missing required fields after enrichment: {', '.join(missing_post)}",
+                },
+            )
 
         # logical layer id
         logical_layer_id = str(doc.get("_id", "")).strip()
@@ -1019,16 +1035,22 @@ def download_and_prepare(
 
                 # One KO per line for readability in logs
                 for i, item in enumerate(dropped_items[:show_n], start=1):
+                    doc = item.get("doc") if isinstance(item, dict) else None
+                    doc = doc if isinstance(doc, dict) else {}
+
+                    details = doc.get("_drop_details") if isinstance(doc.get("_drop_details"), dict) else {}
+                    missing_pre = details.get("missing_pre_fields")
+
                     logging.info(
                         "[DroppedKOs] env=%s Page=%s showing=%s/%s Reason=%r missing_pre_fields=%r logical_layer_id=%r title=%r",
                         env_mode,
                         page,
                         i,
                         total,
-                        item.get("reason"),
-                        item.get("missing_pre_fields"),
+                        doc.get("_drop_reason"),
+                        missing_pre,
                         item.get("logical_layer_id"),
-                        item.get("title"),
+                        doc.get("title"),
                     )
 
                 # Optional: make it explicit if we truncated the list

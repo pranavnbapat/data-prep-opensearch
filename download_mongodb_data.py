@@ -910,7 +910,7 @@ def transcribe_media_url(url: str, session: requests.Session) -> str:
     if not endpoint:
         raise RuntimeError("TRANSCRIBE_ENDPOINT_URL env var is not set")
 
-    # You want to skip YouTube completely
+    # Skip YouTube completely
     if is_youtube_url(url):
         return ""
 
@@ -1117,7 +1117,6 @@ def patch_url_only_docs_with_extracted_text(
         time.sleep(random.uniform(0.2, 0.8))
         _sema.acquire()
         try:
-            # You can reuse the global session you already have if desired:
             sess = get_session(timeout=int(os.getenv("EXTRACTOR_HTTP_TIMEOUT", "35")))
             # --- 1) YouTube: try captions first (fast, no download) ---
             if is_youtube_url(url):
@@ -1133,7 +1132,7 @@ def patch_url_only_docs_with_extracted_text(
                             vid,
                             preferred_langs=pref,
                             translate_to=translate_to,
-                            http_client=sess,  # shares cookies/proxies if you set them on the session
+                            http_client=sess,  # shares cookies/proxies
                         )
                         # Convert to plain text
                         text_from_caps = "\n".join(s["text"] for s in segs if s.get("text"))

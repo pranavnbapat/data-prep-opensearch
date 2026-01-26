@@ -24,7 +24,7 @@ from io_helpers import (atomic_write_json, update_latest_pointer,
 from enricher_utils import (pagesense_one, custom_transcribe_one, classify_url_for_enrichment,
                             target_url_for_enrichment, has_enrich_via, should_skip, is_placeholder_content,
                             is_deapi_platform_url, load_latest_downloader_output, load_latest_enricher_output, 
-                            env_bool)
+                            env_bool, compute_enrich_inputs_fp)
 
 
 logger = logging.getLogger(__name__)
@@ -303,7 +303,12 @@ def enrich_docs_via_routes(
             skipped_no_route += 1
             continue
 
+        doc["_enrich_inputs_fp"] = compute_enrich_inputs_fp(doc)
         prev = prev_enriched_index.get(llid)
+
+        # Backfill fp for older snapshots that didn’t have it
+        if prev is not None and not isinstance(prev.get("_enrich_inputs_fp"), str):
+            prev["_enrich_inputs_fp"] = compute_enrich_inputs_fp(prev)
 
         # Carry forward previous enrichment so we don't overwrite good content with placeholders
         if carry_forward_enrichment(doc, prev):
@@ -375,6 +380,7 @@ def enrich_docs_via_routes(
         doc["ko_content_source"] = source  # "pagesense" or "api_transcribe" or "custom_transcribe"
         doc["ko_content_url"] = url
         doc["enriched"] = 1
+        doc["_enrich_inputs_fp"] = compute_enrich_inputs_fp(doc)
 
     # ---- sequential runner: one KO at a time, with per-record retries ----
     per_record_delay = float(os.getenv("ENRICH_PER_RECORD_DELAY_SEC", "0.25"))

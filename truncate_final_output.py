@@ -51,7 +51,7 @@ def truncate_latest_final_output(*, env_mode: str, output_root: str = "output", 
 
     payload["docs"] = sampled
 
-    # Keep meta intact; adjust stats emitted to match the truncated docs.
+    # Keep meta intact
     stats = payload.get("stats")
     if isinstance(stats, dict):
         stats["emitted"] = len(sampled)

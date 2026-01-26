@@ -271,53 +271,53 @@ class PerJobLogHandler(logging.Handler):
 def healthz():
     return {"ok": True}
 
-def _run_job(job_id: str, page_size: int, env_mode: EnvMode):
-    with JOB_LOCK:
-        job = JOBS[job_id]
-        job.status = JobStatus.running
-        job.started_at = datetime.utcnow()
-
-    # attach per-job log capture
-    log_dir = _log_file_path(JOBS[job_id]).parent  # uses job's stored bucket/year/month
-    handler = PerJobLogHandler(job_id, persist_dir=str(log_dir))
-    handler.setLevel(logging.INFO)
-    handler.setFormatter(logging.Formatter("%(message)s"))
-    root_logger = logging.getLogger()
-    root_logger.addHandler(handler)
-
-    try:
-        # switch backend credentials/host for this run
-        select_environment(env_mode.value)
-
-        # static knobs from env
-        mw = int(os.getenv("DL_MAX_WORKERS", "10"))
-        sc = int(os.getenv("DL_SORT_CRITERIA", "1"))
-        ps = _effective_page_size(page_size)
-
-        logging.info("Starting data-prep (env=%s, page_size=%s, workers=%s, sort=%s)", env_mode, ps, mw, sc)
-        summary = get_ko_metadata(max_workers=mw, page_size=ps, sort_criteria=sc)
-
-        with JOB_LOCK:
-            job.emitted = summary.get("emitted")
-            job.dropped = summary.get("dropped")
-            job.output_file = summary.get("output_file")
-            job.status = JobStatus.success
-            job.finished_at = datetime.utcnow()
-        _write_job_to_disk(job)
-        logging.info("Data-prep finished (emitted=%s, dropped=%s, file=%r)",
-                     job.emitted, job.dropped, job.output_file)
-    except Exception as e:
-        err_txt = f"{e.__class__.__name__}: {e}"
-        tb = traceback.format_exc()
-        with JOB_LOCK:
-            job.status = JobStatus.error
-            job.error = err_txt + "\n" + tb
-            job.finished_at = datetime.utcnow()
-        _write_job_to_disk(job)
-        logging.exception("Data-prep failed: %s", err_txt)
-    finally:
-        root_logger.removeHandler(handler)
-        handler.close()
+# def _run_job(job_id: str, page_size: int, env_mode: EnvMode):
+#     with JOB_LOCK:
+#         job = JOBS[job_id]
+#         job.status = JobStatus.running
+#         job.started_at = datetime.utcnow()
+#
+#     # attach per-job log capture
+#     log_dir = _log_file_path(JOBS[job_id]).parent  # uses job's stored bucket/year/month
+#     handler = PerJobLogHandler(job_id, persist_dir=str(log_dir))
+#     handler.setLevel(logging.INFO)
+#     handler.setFormatter(logging.Formatter("%(message)s"))
+#     root_logger = logging.getLogger()
+#     root_logger.addHandler(handler)
+#
+#     try:
+#         # switch backend credentials/host for this run
+#         select_environment(env_mode.value)
+#
+#         # static knobs from env
+#         mw = int(os.getenv("DL_MAX_WORKERS", "10"))
+#         sc = int(os.getenv("DL_SORT_CRITERIA", "1"))
+#         ps = _effective_page_size(page_size)
+#
+#         logging.info("Starting data-prep (env=%s, page_size=%s, workers=%s, sort=%s)", env_mode, ps, mw, sc)
+#         summary = get_ko_metadata(max_workers=mw, page_size=ps, sort_criteria=sc)
+#
+#         with JOB_LOCK:
+#             job.emitted = summary.get("emitted")
+#             job.dropped = summary.get("dropped")
+#             job.output_file = summary.get("output_file")
+#             job.status = JobStatus.success
+#             job.finished_at = datetime.utcnow()
+#         _write_job_to_disk(job)
+#         logging.info("Data-prep finished (emitted=%s, dropped=%s, file=%r)",
+#                      job.emitted, job.dropped, job.output_file)
+#     except Exception as e:
+#         err_txt = f"{e.__class__.__name__}: {e}"
+#         tb = traceback.format_exc()
+#         with JOB_LOCK:
+#             job.status = JobStatus.error
+#             job.error = err_txt + "\n" + tb
+#             job.finished_at = datetime.utcnow()
+#         _write_job_to_disk(job)
+#         logging.exception("Data-prep failed: %s", err_txt)
+#     finally:
+#         root_logger.removeHandler(handler)
+#         handler.close()
 
 def _clean_error_message(e: Exception) -> str:
     """
@@ -326,7 +326,7 @@ def _clean_error_message(e: Exception) -> str:
     """
     txt = str(e).strip()
 
-    # Heuristic: keep everything up to "Traceback" if present (your JobLockHeldError includes a nice block)
+    # Heuristic: keep everything up to "Traceback" if present (JobLockHeldError includes a nice block)
     if "Traceback (most recent call last):" in txt:
         txt = txt.split("Traceback (most recent call last):", 1)[0].rstrip()
 
@@ -348,7 +348,7 @@ def _run_pipeline_job(job_id: str, page_size: int, env_mode: EnvMode):
     root_logger.addHandler(handler)
 
     try:
-        # Keep consistent with your existing /run job
+        # Keep consistent with existing /run job
         select_environment(env_mode.value)
 
         # Pull pipeline knobs from env (same as pipeline CLI does)
@@ -419,39 +419,39 @@ def _run_pipeline_job(job_id: str, page_size: int, env_mode: EnvMode):
         root_logger.removeHandler(handler)
         handler.close()
 
-@app.post("/run")
-def trigger_run(params: RunParams, bg: BackgroundTasks):
-    # prevent concurrent runs
-    with JOB_LOCK:
-        if any(j.status == JobStatus.running for j in JOBS.values()):
-            raise HTTPException(status_code=409, detail="Another job is already running")
-
-    env_mode_val = (params.env_mode.value if params.env_mode
-                    else (os.getenv("ENV_MODE") or "DEV")).upper()
-    try:
-        resolved_env_mode = EnvMode(env_mode_val)
-    except ValueError:
-        raise HTTPException(status_code=400, detail=f"Invalid ENV_MODE {env_mode_val!r}. Use DEV or PRD")
-
-    byear, bmonth = _bucket_parts_now()
-
-    job_id = uuid4().hex
-    job = Job(
-        id=job_id,
-        status=JobStatus.queued,
-        created_at=datetime.utcnow(),
-        env_mode=resolved_env_mode,
-        page_size=_effective_page_size(params.page_size),
-        bucket_year=byear,
-        bucket_month=bmonth,
-    )
-    with JOB_LOCK:
-        JOBS[job_id] = job
-
-    _write_job_to_disk(job)
-
-    bg.add_task(_run_job, job_id, job.page_size, job.env_mode)
-    return {"status": "scheduled", "job_id": job_id}
+# @app.post("/run")
+# def trigger_run(params: RunParams, bg: BackgroundTasks):
+#     # prevent concurrent runs
+#     with JOB_LOCK:
+#         if any(j.status == JobStatus.running for j in JOBS.values()):
+#             raise HTTPException(status_code=409, detail="Another job is already running")
+#
+#     env_mode_val = (params.env_mode.value if params.env_mode
+#                     else (os.getenv("ENV_MODE") or "DEV")).upper()
+#     try:
+#         resolved_env_mode = EnvMode(env_mode_val)
+#     except ValueError:
+#         raise HTTPException(status_code=400, detail=f"Invalid ENV_MODE {env_mode_val!r}. Use DEV or PRD")
+#
+#     byear, bmonth = _bucket_parts_now()
+#
+#     job_id = uuid4().hex
+#     job = Job(
+#         id=job_id,
+#         status=JobStatus.queued,
+#         created_at=datetime.utcnow(),
+#         env_mode=resolved_env_mode,
+#         page_size=_effective_page_size(params.page_size),
+#         bucket_year=byear,
+#         bucket_month=bmonth,
+#     )
+#     with JOB_LOCK:
+#         JOBS[job_id] = job
+#
+#     _write_job_to_disk(job)
+#
+#     bg.add_task(_run_job, job_id, job.page_size, job.env_mode)
+#     return {"status": "scheduled", "job_id": job_id}
 
 @app.post("/run-pipeline")
 def trigger_pipeline_run(params: PipelineRunParams, bg: BackgroundTasks):

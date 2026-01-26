@@ -20,6 +20,8 @@ from requests.auth import HTTPBasicAuth
 
 _tls = threading.local()
 logger = logging.getLogger(__name__)
+_RESOLVE_CACHE: Dict[str, str] = {}
+_RESOLVE_LOCK = threading.Lock()
 
 
 # ---------------- Small utilities ----------------
@@ -80,6 +82,83 @@ def safe_host(url: Any) -> str:
         return f"{u.scheme}://{u.netloc}"
     except Exception:
         return "unknown://"
+
+def _host(url: str) -> str:
+    try:
+        return (urlparse(url).netloc or "").lower()
+    except Exception:
+        return ""
+
+def resolve_final_url_cached(url: Any, *, timeout: int = 8) -> Optional[str]:
+    if not isinstance(url, str):
+        return None
+    u = url.strip()
+    if not u:
+        return None
+
+    with _RESOLVE_LOCK:
+        cached = _RESOLVE_CACHE.get(u)
+    if cached is not None:
+        return cached or None  # we store "" for failures
+
+    final = resolve_final_url_http_only(u, timeout=timeout)
+
+    with _RESOLVE_LOCK:
+        _RESOLVE_CACHE[u] = final or ""
+
+    return final
+
+def is_youtube_host(host: str) -> bool:
+    # Keep it strict: only YouTube domains
+    # (youtu.be is a redirector too)
+    h = (host or "").lower()
+    if h.startswith("www."):
+        h = h[4:]
+    return h in {"youtube.com", "youtu.be"} or h.endswith(".youtube.com")
+
+def resolve_final_url_http_only(url: Any, *, timeout: int = 8) -> Optional[str]:
+    """
+    Resolve HTTP redirects (not JS redirects). Returns final URL or None.
+    Uses a shared public session to benefit from connection pooling.
+    """
+    if not isinstance(url, str):
+        return None
+    u = url.strip()
+    if not u:
+        return None
+
+    sess = get_public_session(timeout=timeout)
+
+    try:
+        r = sess.head(u, allow_redirects=True)
+        # Some servers don't support HEAD well; fall back to GET.
+        if r.status_code >= 400:
+            r = sess.get(u, allow_redirects=True)
+        return r.url
+    except Exception:
+        return None
+
+def resolves_to_youtube(url: Any) -> bool:
+    final = resolve_final_url_cached(url, timeout=int(os.getenv("URL_RESOLVE_TIMEOUT", "8")))
+    return bool(final and is_youtube_host(_host(final)))
+
+def insert_after_key(d: Dict[str, Any], *, after_key: str, insert_key: str, insert_value: Any) -> None:
+    """
+    Rebuild dict to ensure insert_key appears immediately after after_key.
+    No-op if after_key not present.
+    """
+    if after_key not in d:
+        d[insert_key] = insert_value
+        return
+
+    new_d: Dict[str, Any] = {}
+    for k, v in d.items():
+        new_d[k] = v
+        if k == after_key:
+            new_d[insert_key] = insert_value
+
+    d.clear()
+    d.update(new_d)
 
 def env_bool(name: str, default: bool = True) -> bool:
     v = os.getenv(name)
@@ -316,6 +395,8 @@ def classify_url_for_enrichment(url: Any) -> Tuple[bool, str]:
 
     return True, "ok"
 
+
+
 def target_url_for_enrichment(doc: Dict[str, Any]) -> Optional[str]:
     """
     Decide what URL we enrich from.
@@ -338,9 +419,9 @@ def target_url_for_enrichment(doc: Dict[str, Any]) -> Optional[str]:
     if via == "api_transcribe":
         # hosted media (video/audio/image) -> use hosted file url
         if (not ko_is_hosted) and any(mimetype.startswith(x) for x in ("video/", "audio/")):
-            return ko_file_id.strip() if ko_file_id and ko_file_id.strip() else None
+            return at_id.strip() if at_id and at_id.strip() else None
 
-        # non-hosted media platforms -> use @id
+        # Non-hosted media platforms -> use @id (YouTube etc.)
         return at_id.strip() if at_id and at_id.strip() else None
 
     if via == "custom_transcribe":
@@ -352,6 +433,35 @@ def target_url_for_enrichment(doc: Dict[str, Any]) -> Optional[str]:
         return at_id.strip() if at_id and at_id.strip() else None
 
     return None
+
+def looks_like_media_url(u: Any) -> bool:
+    """
+    Heuristic for URL-only KOs: decide if URL likely needs transcription.
+    Mirrors the CSV exporter tie-breaker.
+    """
+    if not isinstance(u, str):
+        return False
+    s = u.strip().lower()
+    if not s:
+        return False
+
+    # YouTube (explicit)
+    if "youtube.com" in s or "youtu.be" in s:
+        return True
+
+    # Common media extensions
+    if any(s.endswith(ext) for ext in (
+        ".mp4", ".mov", ".mkv", ".webm", ".avi",
+        ".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg",
+        ".jpg", ".jpeg", ".png", ".gif", ".webp", ".tiff",
+    )):
+        return True
+
+    # A couple of conservative host hints
+    if any(h in s for h in ("vimeo.com", "soundcloud.com")):
+        return True
+
+    return False
 
 def is_media_mimetype(m: Any) -> bool:
     """
@@ -441,22 +551,65 @@ def as_bool(v: Any) -> bool:
 
 def set_enrich_via(d: Dict[str, Any]) -> None:
     ko_is_hosted = as_bool(d.get("ko_is_hosted"))
-    mimetype = d.get("ko_object_mimetype")
+    mimetype = (d.get("ko_object_mimetype") or "").strip() if isinstance(d.get("ko_object_mimetype"), str) else ""
+    ko_file_id = (d.get("ko_file_id") or "").strip() if isinstance(d.get("ko_file_id"), str) else ""
     at_id = d.get("@id")
 
+    # 1) Hosted + media mimetype => custom_transcribe
     if ko_is_hosted and is_media_mimetype(mimetype):
         d["enrich_via"] = "custom_transcribe"
         return
 
-    if (not ko_is_hosted) and is_video_platform_url(at_id):
-        d["enrich_via"] = "api_transcribe"
-        return
-
+    # Everything below is only for non-hosted URLs
     if not ko_is_hosted:
+        # inside set_enrich_via(d)
+        ko_is_hosted = as_bool(d.get("ko_is_hosted"))
+        at_id = d.get("@id")
+
+        # Store resolved_url (non-hosted only), and keep it right after @id
+        resolved_url: Optional[str] = None
+        if isinstance(at_id, str) and at_id.strip():
+            resolved_url = resolve_final_url_cached(at_id, timeout=int(os.getenv("URL_RESOLVE_TIMEOUT", "8")))
+            if isinstance(resolved_url, str) and resolved_url.strip():
+                d["resolved_url"] = resolved_url.strip()
+                insert_after_key(d, after_key="@id", insert_key="resolved_url", insert_value=d["resolved_url"])
+            else:
+                d.pop("resolved_url", None)  # keep output clean
+
+        # Optional: only do this expensive check when we otherwise would choose pagesense.
+        # Focus only on YouTube, as requested.
+        resolve_enabled = env_bool("ENABLE_URL_RESOLVE_YOUTUBE", default=True)
+
+        # 2) URL-only case (non-hosted + no mimetype + no file id)
+        if mimetype == "" and ko_file_id == "":
+            # If it's already obviously a video platform, no need to resolve.
+            if is_video_platform_url(at_id) or looks_like_media_url(at_id):
+                d["enrich_via"] = "api_transcribe"
+                return
+
+            # Otherwise, try to detect if it *redirects* to YouTube.
+            if resolve_enabled:
+                final_for_check = resolved_url or None
+                if final_for_check and is_youtube_host(_host(final_for_check)):
+                    d["enrich_via"] = "api_transcribe"
+                    return
+
+            d["enrich_via"] = "pagesense"
+            return
+
+        # 3) Non-hosted (general fallback)
+        if is_video_platform_url(at_id):
+            d["enrich_via"] = "api_transcribe"
+            return
+
+        # if resolve_enabled and resolves_to_youtube(at_id):
+        #     d["enrich_via"] = "api_transcribe"
+        #     return
+
         d["enrich_via"] = "pagesense"
         return
 
-    # Hosted but non-media: no external enrichment route needed (keep it absent)
+    # Hosted but non-media: no external enrichment route needed
     d.pop("enrich_via", None)
 
 def has_enrich_via(doc: Dict[str, Any]) -> bool:
@@ -471,13 +624,26 @@ def already_enriched(prev_doc: Dict[str, Any]) -> bool:
     return prev_doc.get("enriched") == 1 and not is_placeholder_content(prev_doc.get("ko_content_flat"))
 
 def should_skip(current: Dict[str, Any], prev_doc: Optional[Dict[str, Any]]) -> bool:
+    """
+    Skip re-enrichment iff:
+      - previous doc exists
+      - previous doc has actual enrichment (enriched=1 and ko_content_flat not placeholder)
+      - and enricher inputs fingerprint is unchanged
+    """
     if not prev_doc:
         return False
-    # skip only if target didn't change
-    if (prev_doc.get("@id") or "") != (current.get("@id") or ""):
+
+    if not already_enriched(prev_doc):
         return False
-    # and previous enrichment exists
-    return already_enriched(prev_doc)
+
+    prev_fp = prev_doc.get("_enrich_inputs_fp")
+    cur_fp = current.get("_enrich_inputs_fp")
+
+    # If either side lacks fp, fall back to conservative behaviour (do NOT skip).
+    if not isinstance(prev_fp, str) or not isinstance(cur_fp, str):
+        return False
+
+    return prev_fp == cur_fp
 
 def is_deapi_platform_url(u: str) -> bool:
     """

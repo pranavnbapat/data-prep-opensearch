@@ -179,8 +179,8 @@ def run_pipeline(
         enriched_media_tasks: List[Dict[str, Any]] = dl_media_tasks
 
 
+        logger.warning("--------------- START OF ENRICHER ---------------")
         if enable_enricher:
-            logger.warning("--------------- START OF ENRICHER ---------------")
             if not dl:
                 # Should never happen due to cascading flags, but keep it defensive.
                 logger.warning("[Pipeline] Enricher enabled but downloader did not run; skipping enricher.")
@@ -219,9 +219,9 @@ def run_pipeline(
         # Default to whatever we currently have in memory (downloader/enricher output)
         improved_docs: List[Dict[str, Any]] = enriched_docs
 
-        if enable_improver:
-            logger.warning("--------------- START OF IMPROVER ---------------")
 
+        logger.warning("--------------- START OF IMPROVER ---------------")
+        if enable_improver:
             # The improver stage resolves its own latest_enriched input via pointer,
             # writes final_improved_*.json, and updates latest_improved.json
             improve_res = run_improver_stage(
@@ -250,6 +250,8 @@ def run_pipeline(
                 # Keep enriched_docs as-is
         else:
             logger.warning("[Pipeline] Improver disabled; skipping.")
+
+        logger.warning("--------------- END OF IMPROVER ---------------")
 
         downloader_stats = dl.stats if dl else {"changed": 0, "emitted": 0, "dropped": 0, "notes": "disabled"}
         # if truncate_final and dl:
