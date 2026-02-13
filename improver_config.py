@@ -12,6 +12,8 @@ if not RUNPOD_VLLM_HOST:
 
 BASE_VLLM_HOST = RUNPOD_VLLM_HOST
 
+VLLM_API_KEY = (os.getenv("VLLM_API_KEY") or "").strip()
+
 PRIMARY_MODEL = (os.getenv("VLLM_MODEL") or "").strip()
 
 # Context/limits

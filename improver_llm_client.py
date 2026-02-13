@@ -9,7 +9,7 @@ from typing import Any, Dict, Optional
 import requests
 from requests.adapters import HTTPAdapter, Retry
 
-from improver_config import BASE_VLLM_HOST, PER_REQUEST_TIMEOUT
+from improver_config import BASE_VLLM_HOST, PER_REQUEST_TIMEOUT, VLLM_API_KEY
 
 
 logger = logging.getLogger(__name__)
@@ -24,6 +24,15 @@ _retries = Retry(
 )
 _session.mount("https://", HTTPAdapter(max_retries=_retries))
 _session.mount("http://", HTTPAdapter(max_retries=_retries))
+
+
+def _auth_headers() -> Dict[str, str]:
+    """
+    vLLM (OpenAI-compatible) expects: Authorization: Bearer <key>
+    """
+    if not VLLM_API_KEY:
+        return {}
+    return {"Authorization": f"Bearer {VLLM_API_KEY}"}
 
 
 def warm_up_model(model: str, base_url: Optional[str] = None) -> None:
@@ -41,7 +50,9 @@ def warm_up_model(model: str, base_url: Optional[str] = None) -> None:
             "max_tokens": 4,
             "temperature": 0.0,
         }
-        resp = _session.post(url, json=payload, timeout=(10, 30))
+
+        resp = _session.post(url, json=payload, headers=_auth_headers(), timeout=(10, 30))
+
         if resp.status_code >= 400:
             logger.warning(
                 "[ImproverWarmup] status=%s url=%s body=%s",
@@ -93,7 +104,7 @@ def call_vllm_chat(
     # logger.warning("[ImproverHTTP] POST %r", url)
     logger.debug("[ImproverHTTP] request")
 
-    r = _session.post(url, json=payload, timeout=PER_REQUEST_TIMEOUT)
+    r = _session.post(url, json=payload, headers=_auth_headers(), timeout=PER_REQUEST_TIMEOUT)
 
     if r.status_code >= 400:
         cf_ray = r.headers.get("cf-ray", "")
@@ -110,7 +121,8 @@ def call_vllm_chat(
             )
             # Quick health probe: if models works, the 404 was likely transient routing.
             try:
-                probe = _session.get(f"{host}/v1/models", timeout=(5, 10))
+                probe = _session.get(f"{host}/v1/models", headers=_auth_headers(), timeout=(5, 10))
+
                 logger.error("[ImproverHTTP] 404 probe_models_status=%s", probe.status_code)
             except Exception as e:
                 logger.error("[ImproverHTTP] 404 probe_models_failed=%s", e)

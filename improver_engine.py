@@ -5,17 +5,9 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Tuple, Optional
 
-from improver_config import (
-    PRIMARY_MODEL,
-    EXTREME_CTX_THRESHOLD_TOK,
-    NEAR_LIMIT_CTX_THRESHOLD_TOK,
-    CHUNK_TARGET_TOK,
-    CHUNK_OVERLAP_TOK,
-    DEFAULT_NUM_PREDICT,
-    COMBINE_NUM_PREDICT,
-    SUMMARY_MAX_ATTEMPTS,
-    BASE_VLLM_HOST,
-)
+from improver_config import (PRIMARY_MODEL, EXTREME_CTX_THRESHOLD_TOK, NEAR_LIMIT_CTX_THRESHOLD_TOK, CHUNK_TARGET_TOK,
+                             CHUNK_OVERLAP_TOK, DEFAULT_NUM_PREDICT, COMBINE_NUM_PREDICT, SUMMARY_MAX_ATTEMPTS,
+                             BASE_VLLM_HOST, VLLM_API_KEY)
 from improver_llm_client import call_vllm_chat, warm_up_model
 from improver_prompts import (UNIVERSAL_SUMMARY_PROMPT, DEFAULT_PROMPT, CHUNK_SUMMARY_PROMPT, COMBINE_PROMPT,
                               METADATA_PROMPT)
@@ -31,6 +23,8 @@ def _require_model() -> str:
         raise RuntimeError("Missing VLLM_MODEL for improver")
     if not (BASE_VLLM_HOST or "").strip():
         raise RuntimeError("Missing RUNPOD_VLLM_HOST for improver")
+    if not (VLLM_API_KEY or "").strip():
+        raise RuntimeError("Missing VLLM_API_KEY (token) for improver")
     return model
 
 
