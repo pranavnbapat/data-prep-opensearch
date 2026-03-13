@@ -9,13 +9,12 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from uuid import uuid4
 
+load_dotenv()
+
 from api.job_runner import run_pipeline_job
 from api.job_store import (JOBS, JOB_LOGS, JOB_LOCK, bucket_parts_now, load_job_from_disk,
                            load_jobs_from_disk, log_file_path, recover_job_tmp_files, write_job_to_disk)
 from api.models import EnvMode, Job, JobStatus, PipelineRunParams, effective_page_size
-
-
-load_dotenv()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

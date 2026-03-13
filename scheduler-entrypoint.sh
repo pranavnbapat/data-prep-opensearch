@@ -22,12 +22,16 @@ done
 while true; do
   # sleep until the next 23:00 in the container's TZ
   # (TZ is controlled by the TZ env var; see docker-compose.yml)
-  h=$(date +%H)
-  m=$(date +%M)
-  s=$(date +%S)
+  h=$(date +%H | sed 's/^0*//')
+  m=$(date +%M | sed 's/^0*//')
+  s=$(date +%S | sed 's/^0*//')
 
-  # seconds since local midnight; use 10# to avoid octal interpretation on leading zeros
-  since_midnight=$(( 10#$h*3600 + 10#$m*60 + 10#$s ))
+  : "${h:=0}"
+  : "${m:=0}"
+  : "${s:=0}"
+
+  # seconds since local midnight
+  since_midnight=$(( h*3600 + m*60 + s ))
 
   target=82800            # 23 * 3600
   day=86400
@@ -41,7 +45,7 @@ while true; do
   sleep "$sleep_seconds"
 
   # fire the job
-  echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") posting job ^` "
+  echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") posting job..."
 
   curl -sS -H "Content-Type: application/json" -X POST \
     -d "{\"background\": true, \"env_mode\": \"${ENV_MODE}\"}" \

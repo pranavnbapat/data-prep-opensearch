@@ -3,7 +3,8 @@ FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONPATH=/app
 
 WORKDIR /app
 
@@ -17,9 +18,10 @@ RUN apt-get update \
 COPY requirements.txt .
 RUN pip install --no-compile -r requirements.txt
 
-COPY \
-  api common pipeline stages \
-  ./
+COPY api/ /app/api/
+COPY common/ /app/common/
+COPY pipeline/ /app/pipeline/
+COPY stages/ /app/stages/
 
 
 RUN mkdir -p /app/output \

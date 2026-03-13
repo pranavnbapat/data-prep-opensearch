@@ -109,6 +109,58 @@ cp .env.sample .env
 
 Then fill the required environment variables in `.env`.
 
+## Important Environment Variables
+
+The full sample is in `.env.sample`. These are the main ones by area.
+
+API / runtime:
+
+- `LOG_LEVEL`
+- `TZ`
+
+Downloader:
+
+- `BACKEND_CORE_HOST_DEV`
+- `BACKEND_CORE_HOST_PRD`
+- `BACKEND_CORE_USERNAME_DEV`
+- `BACKEND_CORE_PASSWORD_DEV`
+- `BACKEND_CORE_USERNAME_PRD`
+- `BACKEND_CORE_PASSWORD_PRD`
+- `DL_PAGE_SIZE`
+- `DL_HTTP_TIMEOUT`
+- `DL_MAX_WORKERS`
+
+Enricher:
+
+- `ENRICH_ENABLE_PAGESENSE`
+- `ENRICH_ENABLE_API_TRANSCRIBE`
+- `ENRICH_ENABLE_CUSTOM_TRANSCRIBE`
+- `ENRICH_ENABLE_VISION_FALLBACK`
+- `PAGESENSE_URL`
+- `PAGESENSE_API_KEY`
+- `DEAPI_URL`
+- `DEAPI_API_KEY`
+- `CUSTOM_TRANSCRIBE_URL`
+- `CUSTOM_TRANSCRIBE_API_KEY`
+- `CUSTOM_TRANSCRIBE_MAX_DURATION_SEC`
+- `EUF_VISION_URL`
+- `EUF_VISION_MODEL`
+- `EUF_VISION_API_KEY`
+
+Improver:
+
+- `VLLM_HOST`
+- `VLLM_MODEL`
+- `VLLM_API_KEY`
+- `IMPROVER_HTTP_TIMEOUT`
+- `IMPROVER_MAX_INPUT_CHARS`
+
+Notes:
+
+- `DEV` and `PRD` backend credentials are separate.
+- If a stage integration is disabled, its endpoint variables may be unused for that run.
+- Keep `.env` out of the image; the Docker setup already expects it at runtime.
+
 ## Docker
 
 Build the app image:
@@ -130,10 +182,60 @@ docker push ghcr.io/pranavnbapat/data-prep-opensearch:latest
 docker push ghcr.io/pranavnbapat/data-prep-opensearch-scheduler:latest
 ```
 
+Convenience script for building and pushing both images:
+
+```bash
+sh build_and_push_images.sh
+```
+
+With an explicit tag:
+
+```bash
+sh build_and_push_images.sh 2026-03-14
+```
+
+This script builds and pushes:
+
+- `ghcr.io/pranavnbapat/data-prep-opensearch:<tag>`
+- `ghcr.io/pranavnbapat/data-prep-opensearch-scheduler:<tag>`
+
+You can override the registry/image names with environment variables if needed:
+
+```bash
+REGISTRY=ghcr.io/pranavnbapat sh build_and_push_images.sh latest
+```
+
 Local compose:
 
 ```bash
 docker compose up --build
+```
+
+Server-side pull and restart helper:
+
+```bash
+sh pull_and_restart.sh
+```
+
+This runs:
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+Typical deployment flow from now on:
+
+1. Local machine:
+
+```bash
+sh build_and_push_images.sh latest
+```
+
+2. Server:
+
+```bash
+sh pull_and_restart.sh
 ```
 
 ## Runtime Notes
