@@ -42,3 +42,6 @@ output/
 *.tmp
 *.bak
 *.swp
+docs/
+docker-compose.yml
+.env.sample
