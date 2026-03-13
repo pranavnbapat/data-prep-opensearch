@@ -7,6 +7,7 @@ import logging
 import os
 import time
 
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 try:
@@ -15,12 +16,12 @@ try:
 except Exception:
     pass
 
-from job_lock import acquire_job_lock, release_job_lock
-from io_helpers import (atomic_write_json, update_latest_pointer, run_stamp, output_dir)
-from improver_config import BASE_VLLM_HOST
-from improver_engine import improve_doc_in_place
-from improver_utils import (load_latest_enricher_output, load_latest_improver_output, should_skip_improve,
-                            classify_failure, carry_forward_previous_improvements)
+from pipeline.io import atomic_write_json, update_latest_pointer, run_stamp, output_dir
+from pipeline.locks import acquire_job_lock, release_job_lock
+from stages.improver.config import BASE_VLLM_HOST
+from stages.improver.engine import improve_doc_in_place
+from stages.improver.utils import (load_latest_enricher_output, load_latest_improver_output, should_skip_improve,
+                                   classify_failure, carry_forward_previous_improvements)
 
 
 logger = logging.getLogger(__name__)
@@ -50,6 +51,8 @@ def run_improver_stage(
     env_mode: str,
     output_root: str,
     max_docs: Optional[int] = None,
+    input_path: Optional[str] = None,
+    input_docs: Optional[List[Dict[str, Any]]] = None,
     use_lock: bool = True,
 ) -> Optional[Dict[str, Any]]:
     lock = None
@@ -57,14 +60,18 @@ def run_improver_stage(
         lock = acquire_job_lock(env_mode=env_mode, output_root=output_root, entrypoint="improver")
 
     try:
-        try:
-            in_path, docs = load_latest_enricher_output(env_mode, output_root)
-        except RuntimeError as e:
-            msg = str(e)
-            if "No enricher output found" in msg:
-                logger.warning("[ImproverStage] no input found: %s", str(e))
-                return None
-            raise
+        if isinstance(input_docs, list):
+            docs = input_docs
+            in_path = Path(input_path) if input_path else None
+        else:
+            try:
+                in_path, docs = load_latest_enricher_output(env_mode, output_root)
+            except RuntimeError as e:
+                msg = str(e)
+                if "No enricher output found" in msg:
+                    logger.warning("[ImproverStage] no input found: %s", str(e))
+                    return None
+                raise
 
         logger.warning("[ImproverStart] env=%s input=%s total_docs=%d", env_mode.upper(), str(in_path), len(docs))
         logger.warning("[ImproverStart] vllm_host=%s model=%s", (BASE_VLLM_HOST or "").rstrip("/"),

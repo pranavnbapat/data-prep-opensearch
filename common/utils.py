@@ -1,6 +1,5 @@
 # utils.py
 
-import glob
 import json
 import logging
 import os
@@ -14,8 +13,7 @@ from bson import ObjectId
 from datetime import datetime, timezone
 from dateutil import parser as du_parser
 from html import unescape
-from types import SimpleNamespace
-from typing import Iterable, List, Optional, Callable, Dict, Any, TypedDict, Tuple
+from typing import Iterable, List, Optional, Callable, Dict, Any, Tuple
 from urllib.parse import urlparse, urlunparse, parse_qs
 from urllib3.util.retry import Retry
 from youtube_transcript_api import YouTubeTranscriptApi
@@ -872,6 +870,5 @@ def transcribe_media_url(url: str, session: requests.Session) -> str:
                 return text2.strip()
 
     return ""
-
 
 

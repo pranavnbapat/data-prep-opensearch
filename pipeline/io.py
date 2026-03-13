@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional, Tuple
 
-from utils import CustomJSONEncoder
+from common.utils import CustomJSONEncoder
 
 
 def env_flag(name: str, default: bool) -> bool:

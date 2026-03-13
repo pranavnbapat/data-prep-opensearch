@@ -5,14 +5,14 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Tuple, Optional
 
-from improver_config import (PRIMARY_MODEL, EXTREME_CTX_THRESHOLD_TOK, NEAR_LIMIT_CTX_THRESHOLD_TOK, CHUNK_TARGET_TOK,
-                             CHUNK_OVERLAP_TOK, DEFAULT_NUM_PREDICT, COMBINE_NUM_PREDICT, SUMMARY_MAX_ATTEMPTS,
-                             BASE_VLLM_HOST, VLLM_API_KEY)
-from improver_llm_client import call_vllm_chat, warm_up_model
-from improver_prompts import (UNIVERSAL_SUMMARY_PROMPT, DEFAULT_PROMPT, CHUNK_SUMMARY_PROMPT, COMBINE_PROMPT,
-                              METADATA_PROMPT)
-from improver_text_utils import approx_token_count, split_into_tokenish_chunks, should_summarise_text
-from improver_extractors import extract_summary_json, extract_metadata_text, extract_metadata_keywords
+from stages.improver.config import (PRIMARY_MODEL, EXTREME_CTX_THRESHOLD_TOK, NEAR_LIMIT_CTX_THRESHOLD_TOK,
+                                    CHUNK_TARGET_TOK, CHUNK_OVERLAP_TOK, DEFAULT_NUM_PREDICT,
+                                    COMBINE_NUM_PREDICT, SUMMARY_MAX_ATTEMPTS, BASE_VLLM_HOST, VLLM_API_KEY)
+from stages.improver.extractors import extract_summary_json, extract_metadata_text, extract_metadata_keywords
+from stages.improver.llm_client import call_vllm_chat, warm_up_model
+from stages.improver.prompts import (UNIVERSAL_SUMMARY_PROMPT, DEFAULT_PROMPT, CHUNK_SUMMARY_PROMPT,
+                                     COMBINE_PROMPT, METADATA_PROMPT)
+from stages.improver.text_utils import approx_token_count, split_into_tokenish_chunks, should_summarise_text
 
 logger = logging.getLogger(__name__)
 

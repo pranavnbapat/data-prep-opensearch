@@ -9,7 +9,7 @@ from typing import Any, Dict, Optional
 import requests
 from requests.adapters import HTTPAdapter, Retry
 
-from improver_config import BASE_VLLM_HOST, PER_REQUEST_TIMEOUT, VLLM_API_KEY
+from stages.improver.config import BASE_VLLM_HOST, PER_REQUEST_TIMEOUT, VLLM_API_KEY
 
 
 logger = logging.getLogger(__name__)

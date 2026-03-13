@@ -1,12 +1,14 @@
 services:
-
   data-prep-opensearch:
     build:
       context: .
     image: ghcr.io/pranavnbapat/data-prep-opensearch:latest
     container_name: data-prep-opensearch
+    command: ["uvicorn", "api.app:app", "--host", "0.0.0.0", "--port", "8000"]
     env_file:
       - .env
+    ports:
+      - "8000:8000"
     volumes:
       - ./output:/app/output
     restart: always
@@ -25,8 +27,11 @@ services:
     container_name: data-prep-opensearch-scheduler
     depends_on:
       data-prep-opensearch:
-        condition: service_started
+        condition: service_healthy
     env_file:
       - .env
+    environment:
+      TARGET_URL: http://data-prep-opensearch:8000/run-pipeline
+      HEALTH_URL: http://data-prep-opensearch:8000/healthz
     restart: always
     user: "${UID}:${GID}"

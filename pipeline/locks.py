@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from io_helpers import atomic_write_json
+from pipeline.io import atomic_write_json
 
 
 @dataclass(frozen=True)

@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import random
+import subprocess
 import threading
 import time
 
@@ -13,8 +14,8 @@ from urllib.parse import urlparse
 
 import requests
 
-from downloader_utils import sha256_obj, stable_str
-from io_helpers import resolve_latest_pointer, find_latest_matching
+from pipeline.io import resolve_latest_pointer, find_latest_matching
+from stages.downloader.utils import sha256_obj, stable_str
 from requests.auth import HTTPBasicAuth
 
 
@@ -342,6 +343,199 @@ def custom_transcribe_one(llid: str, url: str) -> Tuple[str, str, Optional[str],
     if text:
         return llid, url, text, "custom_transcribe"
     return llid, url, None, "custom_transcribe:failed"
+
+
+def probe_target_url(url: Any, *, timeout: int = 8) -> Tuple[bool, str]:
+    """
+    Lightweight reachability probe for expensive enrichment routes.
+
+    Returns:
+      (True, "ok")
+      (False, "<reason>")
+    """
+    if not isinstance(url, str) or not url.strip():
+        return False, "empty"
+
+    u = url.strip()
+    sess = get_public_session(timeout=timeout)
+
+    try:
+        r = sess.head(u, allow_redirects=True)
+        status = r.status_code
+        if status == 405:
+            r = sess.get(u, allow_redirects=True, stream=True)
+            status = r.status_code
+        try:
+            r.close()
+        except Exception:
+            pass
+
+        if 200 <= status < 400:
+            return True, "ok"
+        if status == 404:
+            return False, "http_404"
+        if status == 403:
+            return False, "http_403"
+        if 400 <= status < 500:
+            return False, f"http_{status}"
+        if 500 <= status < 600:
+            return False, f"http_{status}"
+        return False, f"http_{status}"
+    except requests.Timeout:
+        return False, "timeout"
+    except requests.ConnectionError:
+        return False, "connection_error"
+    except Exception:
+        return False, "probe_error"
+
+
+def probe_remote_content_type(url: Any, *, timeout: int = 8) -> Optional[str]:
+    if not isinstance(url, str) or not url.strip():
+        return None
+
+    u = url.strip()
+    sess = get_public_session(timeout=timeout)
+
+    try:
+        r = sess.head(u, allow_redirects=True)
+        status = r.status_code
+        if status == 405 or status >= 400:
+            r = sess.get(u, allow_redirects=True, stream=True)
+        content_type = (r.headers.get("content-type") or "").split(";", 1)[0].strip().lower() or None
+        try:
+            r.close()
+        except Exception:
+            pass
+        return content_type
+    except Exception:
+        return None
+
+
+def probe_media_duration_seconds(url: Any, *, timeout: int = 20) -> Optional[float]:
+    if not isinstance(url, str) or not url.strip():
+        return None
+
+    cmd = [
+        "/usr/bin/ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        url.strip(),
+    ]
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=max(timeout, 5),
+        )
+    except Exception as e:
+        logger.info("[MediaDurationProbeFail] host=%s err=%r", safe_host(url), e)
+        return None
+
+    if proc.returncode != 0:
+        logger.info(
+            "[MediaDurationProbeFail] host=%s rc=%s stderr=%s",
+            safe_host(url),
+            proc.returncode,
+            (proc.stderr or "")[:300],
+        )
+        return None
+
+    try:
+        value = float((proc.stdout or "").strip())
+    except Exception:
+        return None
+
+    return value if value > 0 else None
+
+
+def transcribe_with_custom_api_detailed(*, media_url: str) -> Tuple[Optional[str], str]:
+    """
+    Calls the RunPod /transcribe endpoint and returns (text, tag).
+    """
+    user = (os.getenv("CUSTOM_TRANSCRIBE_USER") or "").strip()
+    pwd = (os.getenv("CUSTOM_TRANSCRIBE_PASSWORD") or "").strip()
+
+    auth = None
+    if user and pwd:
+        auth = HTTPBasicAuth(user, pwd)
+
+    retries = int(os.getenv("CUSTOM_TRANSCRIBE_RETRIES", "2"))
+    backoff = float(os.getenv("CUSTOM_TRANSCRIBE_BACKOFF", "1.5"))
+    endpoint = (os.getenv("CUSTOM_TRANSCRIBE_ENDPOINT") or "").strip()
+
+    if not endpoint:
+        logger.error("[CustomTranscribe] Missing CUSTOM_TRANSCRIBE_ENDPOINT env var")
+        return None, "custom_transcribe:missing_endpoint"
+
+    max_duration_sec = float(os.getenv("CUSTOM_TRANSCRIBE_MAX_DURATION_SEC", "3000") or "3000")
+    duration_probe_timeout = int(os.getenv("CUSTOM_TRANSCRIBE_DURATION_PROBE_TIMEOUT", "20"))
+    if max_duration_sec > 0:
+        content_type = probe_remote_content_type(media_url, timeout=min(duration_probe_timeout, 10))
+        if isinstance(content_type, str) and content_type.startswith("video/"):
+            duration_sec = probe_media_duration_seconds(media_url, timeout=duration_probe_timeout)
+            if duration_sec is not None and duration_sec > max_duration_sec:
+                logger.warning(
+                    "[CustomTranscribeSkip] media_host=%s content_type=%s duration_sec=%.2f max_sec=%.2f",
+                    media_url,
+                    content_type,
+                    duration_sec,
+                    max_duration_sec,
+                )
+                return None, "custom_transcribe:too_long"
+
+    whisper_model = (os.getenv("CUSTOM_TRANSCRIBE_MODEL") or "large-v1").strip() or "large-v1"
+    timeout_s = float(os.getenv("CUSTOM_TRANSCRIBE_HTTP_TIMEOUT", "180"))
+
+    for attempt in range(retries + 1):
+        try:
+            sess = get_public_session(timeout=int(timeout_s))
+            r = sess.post(
+                endpoint.rstrip("/") + "/transcribe",
+                json={"url": media_url, "whisper_model": whisper_model},
+                headers={"accept": "application/json", "content-type": "application/json"},
+                auth=auth,
+            )
+
+            if r.status_code >= 400:
+                logger.error(
+                    "[CustomTranscribeFail] media_host=%s status=%s body=%s",
+                    media_url,
+                    r.status_code,
+                    (r.text or "")[:500],
+                )
+                if r.status_code == 524:
+                    return None, "custom_transcribe:proxy_timeout"
+                if r.status_code == 404:
+                    return None, "custom_transcribe:http_404"
+                if r.status_code == 429:
+                    return None, "custom_transcribe:http_429"
+                if 500 <= r.status_code < 600:
+                    return None, f"custom_transcribe:http_{r.status_code}"
+                return None, f"custom_transcribe:http_{r.status_code}"
+
+            r.raise_for_status()
+            data = r.json()
+            text = (((data or {}).get("whisper") or {}).get("text") or "")
+            text = text.strip() if isinstance(text, str) else ""
+            return (text or None), ("custom_transcribe" if text else "custom_transcribe:empty")
+        except requests.Timeout:
+            if attempt >= retries:
+                logger.error("[CustomTranscribeFail] host=%s err=timeout", safe_host(media_url))
+                return None, "custom_transcribe:timeout"
+            time.sleep(backoff ** attempt)
+        except Exception as e:
+            if attempt >= retries:
+                logger.error("[CustomTranscribeFail] host=%s err=%s", safe_host(media_url), e)
+                return None, "custom_transcribe:failed"
+            time.sleep(backoff ** attempt)
+
+    return None, "custom_transcribe:failed"
 
 def _normalise_netloc(netloc: str) -> str:
     n = (netloc or "").strip().lower()
@@ -688,4 +882,3 @@ def compute_enrich_inputs_fp(doc: Dict[str, Any]) -> str:
     # hosted, non-media
     obj = {"mode": "hosted_doc", "@id": at_id, "ko_file_id": ko_file_id, "ko_content_flat": ko_content_flat}
     return sha256_obj(obj)
-

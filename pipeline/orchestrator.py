@@ -10,12 +10,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from downloader import download_and_prepare, DownloadResult
-from enricher import run_enricher_stage
-from improver import run_improver_stage
-from io_helpers import run_stamp, output_dir, atomic_write_json, env_flag
-from job_lock import acquire_job_lock, release_job_lock
-from utils import CustomJSONEncoder
+from common.utils import CustomJSONEncoder
+from pipeline.io import run_stamp, output_dir, atomic_write_json, env_flag
+from pipeline.locks import acquire_job_lock, release_job_lock
+from stages.downloader.service import download_and_prepare, DownloadResult
+from stages.enricher.service import run_enricher_stage
+from stages.improver.service import run_improver_stage
 
 try:
     from dotenv import load_dotenv
@@ -227,6 +227,8 @@ def run_pipeline(
                 env_mode=env_mode,
                 output_root=output_root,
                 max_docs=(int(os.getenv("IMPROVER_MAX_DOCS", "0")) or None),
+                input_path=enrich_res.get("out") if enrich_res.get("out") else None,
+                input_docs=enriched_docs,
                 use_lock=False,
             ) or {}
 
@@ -336,8 +338,9 @@ def run_pipeline(
                 "media_tasks": len(enriched_media_tasks),
             },
             "paths": {
-                "downloader_out": enrich_res.get("in", ""),
+                "downloader_out": "",
                 "enriched_out": enrich_res.get("out", ""),
+                "improved_out": improve_res.get("out", ""),
                 "final_report": str(final_report_path),
                 "latest": str(latest_path),
             },

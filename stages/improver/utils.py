@@ -3,8 +3,8 @@
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from enricher_utils import load_stage_payload
-from io_helpers import resolve_latest_pointer, find_latest_matching
+from pipeline.io import resolve_latest_pointer, find_latest_matching
+from stages.enricher.utils import load_stage_payload
 
 
 # ---------------- Loading inputs ----------------
@@ -156,4 +156,3 @@ def carry_forward_previous_improvements(doc: Dict[str, Any], prev: Optional[Dict
             return False
 
     return changed
-
