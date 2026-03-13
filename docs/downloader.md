@@ -30,12 +30,13 @@ The downloader is the source-of-truth ingestion stage. It fetches knowledge obje
 | structural fields |
 +----+---------+----+
      |         |
-     | valid   | invalid
+   valid     invalid
+     |         |
      v         v
-+-------------------+    +-------------------+
-| Compute source    |    | dropped_kos.json  |
-| fingerprint       |    | with reason       |
-+---------+---------+    +-------------------+
++-------------------+   +-------------------+
+| Compute source    |   | dropped_kos.json  |
+| fingerprint       |   | with reason       |
++---------+---------+   +-------------------+
           |
           v
 +-------------------+
@@ -43,11 +44,12 @@ The downloader is the source-of-truth ingestion stage. It fetches knowledge obje
 | previous snapshot |
 +----+---------+----+
      |         |
-     | same    | new/updated
+   same    new/updated
+     |         |
      v         v
 +-------------------+
 | reuse previous    |
-| doc payload       |
+| or rebuild doc    |
 +---------+---------+
           |
           v
@@ -87,8 +89,6 @@ The downloader emits a full snapshot, not just changed documents.
 
 Important fields:
 - `docs`
-- `url_tasks`
-- `media_tasks`
 - stats:
   - `source_seen`
   - `emitted`

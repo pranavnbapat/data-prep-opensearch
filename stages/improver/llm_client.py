@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 
 from typing import Any, Dict, Optional
 
@@ -24,6 +25,8 @@ _retries = Retry(
 )
 _session.mount("https://", HTTPAdapter(max_retries=_retries))
 _session.mount("http://", HTTPAdapter(max_retries=_retries))
+_warm_lock = threading.Lock()
+_warmed_keys: set[tuple[str, str]] = set()
 
 
 def _auth_headers() -> Dict[str, str]:
@@ -39,6 +42,11 @@ def warm_up_model(model: str, base_url: Optional[str] = None) -> None:
     host = (base_url or BASE_VLLM_HOST).rstrip("/")
     if not host:
         return
+    key = (host, model)
+    with _warm_lock:
+        if key in _warmed_keys:
+            return
+        _warmed_keys.add(key)
     url = f"{host}/v1/chat/completions"
     try:
         payload = {

@@ -21,7 +21,7 @@ from pipeline.locks import acquire_job_lock, release_job_lock
 from stages.improver.config import BASE_VLLM_HOST
 from stages.improver.engine import improve_doc_in_place
 from stages.improver.utils import (load_latest_enricher_output, load_latest_improver_output, should_skip_improve,
-                                   classify_failure, carry_forward_previous_improvements)
+                                   classify_failure, carry_forward_previous_improvements, compute_improver_fp)
 
 
 logger = logging.getLogger(__name__)
@@ -102,6 +102,9 @@ def run_improver_stage(
                 continue
 
             prev = prev_index.get(llid)
+            d["_improver_fp"] = compute_improver_fp(d)
+            if isinstance(prev, dict) and not isinstance(prev.get("_improver_fp"), str):
+                prev["_improver_fp"] = compute_improver_fp(prev)
 
             # Always carry forward previous improvements if they exist
             if carry_forward_previous_improvements(d, prev):

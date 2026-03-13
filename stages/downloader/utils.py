@@ -31,8 +31,6 @@ class BackendCfg(TypedDict):
 @dataclass(frozen=True)
 class DownloadResult:
     docs: List[Dict[str, Any]]
-    url_tasks: List[Dict[str, Any]]
-    media_tasks: List[Dict[str, Any]]
     stats: Dict[str, Any]
 
 # ---------------- Backend config ----------------
@@ -155,4 +153,3 @@ def api_base(backend_cfg: BackendCfg) -> str:
     if not base:
         raise RuntimeError("Backend host is empty.")
     return base
-

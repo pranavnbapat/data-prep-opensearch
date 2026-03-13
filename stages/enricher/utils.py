@@ -603,11 +603,13 @@ def target_url_for_enrichment(doc: Dict[str, Any]) -> Optional[str]:
     via = doc.get("enrich_via")
     at_id = doc.get("@id") if isinstance(doc.get("@id"), str) else None
     ko_file_id = doc.get("ko_file_id") if isinstance(doc.get("ko_file_id"), str) else None
+    ko_is_hosted = bool(doc.get("ko_is_hosted"))
 
     if via == "pagesense":
+        if ko_is_hosted and ko_file_id and ko_file_id.strip():
+            return ko_file_id.strip()
         return at_id.strip() if at_id and at_id.strip() else None
 
-    ko_is_hosted = bool(doc.get("ko_is_hosted"))
     mimetype = (doc.get("ko_object_mimetype") or "").strip().lower()
 
     if via == "api_transcribe":
@@ -628,35 +630,6 @@ def target_url_for_enrichment(doc: Dict[str, Any]) -> Optional[str]:
 
     return None
 
-def looks_like_media_url(u: Any) -> bool:
-    """
-    Heuristic for URL-only KOs: decide if URL likely needs transcription.
-    Mirrors the CSV exporter tie-breaker.
-    """
-    if not isinstance(u, str):
-        return False
-    s = u.strip().lower()
-    if not s:
-        return False
-
-    # YouTube (explicit)
-    if "youtube.com" in s or "youtu.be" in s:
-        return True
-
-    # Common media extensions
-    if any(s.endswith(ext) for ext in (
-        ".mp4", ".mov", ".mkv", ".webm", ".avi",
-        ".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg",
-        ".jpg", ".jpeg", ".png", ".gif", ".webp", ".tiff",
-    )):
-        return True
-
-    # A couple of conservative host hints
-    if any(h in s for h in ("vimeo.com", "soundcloud.com")):
-        return True
-
-    return False
-
 def is_media_mimetype(m: Any) -> bool:
     """
     Treat image/*, audio/*, video/* as media requiring transcription.
@@ -668,63 +641,12 @@ def is_media_mimetype(m: Any) -> bool:
     return mm.startswith("audio/") or mm.startswith("video/")
 
 
-def is_video_platform_url(u: Any) -> bool:
-    """
-    True if URL is a known video/audio platform where "transcribe" makes sense.
-    Keep it conservative and domain-based (less false positives).
-    """
-    if not isinstance(u, str):
+def is_visual_document_mimetype(m: Any) -> bool:
+    if not isinstance(m, str):
         return False
-    s = u.strip()
-    if not s:
-        return False
+    mm = m.strip().lower()
+    return mm.startswith("image/") or mm == "application/pdf"
 
-    try:
-        p = urlparse(s)
-        host = (p.netloc or "").lower()
-        path = (p.path or "").lower()
-    except Exception:
-        return False
-
-    # normalise common "www."
-    if host.startswith("www."):
-        host = host[4:]
-
-    video_hosts = {
-        "youtube.com",
-        "youtu.be",
-        "m.youtube.com",
-        "dailymotion.com",
-        "dai.ly",
-        "vimeo.com",
-        "player.vimeo.com",
-        "tiktok.com",
-        "twitter.com",
-        "x.com",
-        "facebook.com",
-        "fb.watch",
-        "instagram.com",
-        "twitch.tv",
-    }
-
-    if host in video_hosts:
-        return True
-
-    # A few platforms use subdomains heavily (e.g. *.youtube.com)
-    if host.endswith(".youtube.com"):
-        return True
-    if host.endswith(".dailymotion.com"):
-        return True
-    if host.endswith(".tiktok.com"):
-        return True
-    if host.endswith(".twitch.tv"):
-        return True
-
-    # Optional: treat direct media file URLs as transcribe-worthy even if not hosted
-    if any(path.endswith(ext) for ext in (".mp4", ".mp3", ".wav", ".m4a", ".webm", ".mov", ".mkv", ".aac", ".ogg")):
-        return True
-
-    return False
 
 def as_bool(v: Any) -> bool:
     """Normalise common truthy/falsey representations."""
@@ -754,6 +676,11 @@ def set_enrich_via(d: Dict[str, Any]) -> None:
         d["enrich_via"] = "custom_transcribe"
         return
 
+    # Hosted image/PDF resources should still be enriched through the visual path.
+    if ko_is_hosted and is_visual_document_mimetype(mimetype):
+        d["enrich_via"] = "pagesense"
+        return
+
     # Everything below is only for non-hosted URLs
     if not ko_is_hosted:
         # inside set_enrich_via(d)
@@ -776,15 +703,14 @@ def set_enrich_via(d: Dict[str, Any]) -> None:
 
         # 2) URL-only case (non-hosted + no mimetype + no file id)
         if mimetype == "" and ko_file_id == "":
-            # If it's already obviously a video platform, no need to resolve.
-            if is_video_platform_url(at_id) or looks_like_media_url(at_id):
+            if is_deapi_platform_url(at_id):
                 d["enrich_via"] = "api_transcribe"
                 return
 
             # Otherwise, try to detect if it *redirects* to YouTube.
             if resolve_enabled:
                 final_for_check = resolved_url or None
-                if final_for_check and is_youtube_host(_host(final_for_check)):
+                if final_for_check and is_deapi_platform_url(final_for_check):
                     d["enrich_via"] = "api_transcribe"
                     return
 
@@ -792,13 +718,9 @@ def set_enrich_via(d: Dict[str, Any]) -> None:
             return
 
         # 3) Non-hosted (general fallback)
-        if is_video_platform_url(at_id):
+        if is_deapi_platform_url(at_id):
             d["enrich_via"] = "api_transcribe"
             return
-
-        # if resolve_enabled and resolves_to_youtube(at_id):
-        #     d["enrich_via"] = "api_transcribe"
-        #     return
 
         d["enrich_via"] = "pagesense"
         return

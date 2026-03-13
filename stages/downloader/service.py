@@ -41,16 +41,13 @@ def download_and_prepare(
         pages_seen = set()
         emitted_total = 0
         dropped_total = 0
-        url_task_total = 0
-        media_task_total = 0
         unchanged_total = 0
         new_total = 0
         updated_total = 0
         changed_ids_all: List[str] = []
         emitted_ids_all: List[str] = []
+        source_seen_ids_all: List[str] = []
         docs_all: List[Dict[str, Any]] = []
-        url_tasks_all: List[Dict[str, Any]] = []
-        media_tasks_all: List[Dict[str, Any]] = []
         t0 = time.perf_counter()
         source_seen_total = 0
 
@@ -96,20 +93,24 @@ def download_and_prepare(
             if not kos_page:
                 break
             source_seen_total += len(kos_page)
+            for ko in kos_page:
+                llid = ko.get("_id")
+                if isinstance(llid, str) and llid.strip():
+                    source_seen_ids_all.append(llid.strip())
 
             pagination = payload.get("pagination") or {}
             next_page = pagination.get("next_page")
             logging.info("[KO API] env=%s Page=%s fetched=%s next=%r", env_mode, page, len(kos_page), next_page)
 
-            docs_p, url_p, media_p, emitted_p, dropped_p, drop_reasons, dropped_items, unchanged_p, changed_ids_p, emitted_ids_p, new_p, updated_p = process_page(
+            docs_p, emitted_p, dropped_p, drop_reasons, dropped_items, unchanged_p, changed_ids_p, emitted_ids_p, new_p, updated_p = process_page(
                 backend_cfg,
                 kos_page,
                 workers=max_workers,
                 prev_index=prev_index,
             )
 
-            logging.info("[PageDone] env=%s Page=%s Emitted=%s Dropped=%s url_tasks=%s media_tasks=%s dt=%.2fs",
-                         env_mode, page, emitted_p, dropped_p, len(url_p), len(media_p), time.perf_counter() - t_page)
+            logging.info("[PageDone] env=%s Page=%s Emitted=%s Dropped=%s dt=%.2fs",
+                         env_mode, page, emitted_p, dropped_p, time.perf_counter() - t_page)
 
             if drop_reasons:
                 logging.info("[PageDrops] env=%s Page=%s Reasons=%s", env_mode, page, drop_reasons)
@@ -142,8 +143,6 @@ def download_and_prepare(
                     logging.info("[DroppedKOsFile] Updated=%s Count Added or Updated=%s", drops_path, len(dropped_items))
 
             docs_all.extend(docs_p)
-            url_tasks_all.extend(url_p)
-            media_tasks_all.extend(media_p)
             emitted_total += emitted_p
             dropped_total += dropped_p
             unchanged_total += unchanged_p
@@ -151,8 +150,6 @@ def download_and_prepare(
             updated_total += updated_p
             changed_ids_all.extend(changed_ids_p)
             emitted_ids_all.extend(emitted_ids_p)
-            url_task_total += len(url_p)
-            media_task_total += len(media_p)
 
             logging.info(
                 "[DownloaderProgress] env=%s page=%s source_seen_total=%s emitted_total=%s new_total=%s updated_total=%s unchanged_total=%s dropped_total=%s",
@@ -178,7 +175,7 @@ def download_and_prepare(
 
         changed_total = new_total + updated_total
         prev_ids = set(prev_index.keys()) if prev_index else set()
-        current_ids = set(emitted_ids_all)
+        current_ids = set(source_seen_ids_all)
         removed_from_source = len(prev_ids - current_ids) if prev_ids else 0
 
         elapsed = time.perf_counter() - t0
@@ -187,8 +184,6 @@ def download_and_prepare(
             "source_seen": source_seen_total,
             "emitted": emitted_total,
             "dropped": dropped_total,
-            "url_tasks": url_task_total,
-            "media_tasks": media_task_total,
             "changed": changed_total,
             "new_added": new_total,
             "updated": updated_total,
@@ -197,10 +192,9 @@ def download_and_prepare(
             "elapsed_sec": round(elapsed, 2),
         }
 
-        logging.warning("[Downloader] env=%s source_seen=%s emitted=%s new_added=%s updated=%s unchanged=%s dropped=%s removed=%s url_tasks=%s media_tasks=%s elapsed=%.2fs",
+        logging.warning("[Downloader] env=%s source_seen=%s emitted=%s new_added=%s updated=%s unchanged=%s dropped=%s removed=%s elapsed=%.2fs",
                         stats["env_mode"], source_seen_total, emitted_total, new_total, updated_total, unchanged_total,
-                        dropped_total, removed_from_source,
-                        url_task_total, media_task_total, elapsed)
+                        dropped_total, removed_from_source, elapsed)
 
         if changed_total > 0:
             seen = set()
@@ -237,8 +231,6 @@ def download_and_prepare(
                 },
                 "stats": stats,
                 "docs": docs_all,
-                "url_tasks": url_tasks_all,
-                "media_tasks": media_tasks_all,
             }
             atomic_write_json(out_path, payload)
             update_latest_pointer(env_mode, output_root, "latest_downloaded.json", out_path)
@@ -247,8 +239,6 @@ def download_and_prepare(
 
         return DownloadResult(
             docs=docs_all,
-            url_tasks=url_tasks_all,
-            media_tasks=media_tasks_all,
             stats=stats,
         )
     finally:

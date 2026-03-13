@@ -467,8 +467,6 @@ def process_page(
     prev_index: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Tuple[
     List[Dict[str, Any]],
-    List[Dict[str, Any]],
-    List[Dict[str, Any]],
     int,
     int,
     Dict[str, int],
@@ -480,7 +478,7 @@ def process_page(
     int,
 ]:
     if not kos_page:
-        return [], [], [], 0, 0, {}, [], 0, [], [], 0, 0
+        return [], 0, 0, {}, [], 0, [], [], 0, 0
 
     before = len(kos_page)
     kos_page = [d for d in kos_page if str(d.get("status", "")).strip().lower() == "published"]
@@ -496,8 +494,6 @@ def process_page(
     projects_index = fetch_projects_api(backend_cfg, unique_proj_ids)
 
     docs_out: List[Dict[str, Any]] = []
-    url_tasks: List[Dict[str, Any]] = []
-    media_tasks: List[Dict[str, Any]] = []
     emitted = 0
     dropped = 0
     unchanged_count = 0
@@ -511,7 +507,7 @@ def process_page(
     max_workers = workers if workers > 0 else int(os.getenv("DL_MAX_WORKERS", "10"))
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         skip_unchanged = os.getenv("DL_SKIP_UNCHANGED_CONTENT", "1").strip().lower() in {"1", "true", "yes", "y", "on"}
-        futs = [
+        futs = {
             ex.submit(
                 prepare_one_doc,
                 backend_cfg,
@@ -519,12 +515,28 @@ def process_page(
                 projects_index,
                 prev_index=prev_index,
                 skip_content_if_unchanged=skip_unchanged,
-            )
-            for doc in kos_page
-        ]
+            ): idx
+            for idx, doc in enumerate(kos_page)
+        }
+        ordered_results: List[Optional[Tuple[
+            Optional[Dict[str, Any]],
+            Optional[Dict[str, Any]],
+            Optional[Dict[str, Any]],
+            str,
+            Optional[Dict[str, Any]],
+            str,
+            Optional[str],
+            Optional[str],
+            Optional[str],
+        ]]] = [None] * len(futs)
 
         for fut in as_completed(futs):
-            doc_out, url_task, media_task, status, drop_info, change_kind, _, _, _ = fut.result()
+            ordered_results[futs[fut]] = fut.result()
+
+        for result in ordered_results:
+            if result is None:
+                continue
+            doc_out, _, _, status, drop_info, change_kind, _, _, _ = result
             if status != "emitted" or not doc_out:
                 if drop_info:
                     dropped_items.append(drop_info)
@@ -550,19 +562,12 @@ def process_page(
             else:
                 unchanged_count += 1
 
-            if url_task:
-                url_tasks.append(url_task)
-            if media_task:
-                media_tasks.append(media_task)
-
     dropped += skipped_non_published
     if skipped_non_published:
         drop_reasons["drop:not_published_prefilter"] = drop_reasons.get("drop:not_published_prefilter", 0) + skipped_non_published
 
     return (
         docs_out,
-        url_tasks,
-        media_tasks,
         emitted,
         dropped,
         drop_reasons,

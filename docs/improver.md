@@ -22,10 +22,18 @@ The improver is the LLM post-processing stage. It reads already-enriched documen
 | For each doc         |
 | carry forward prior  |
 | improvements         |
-+----+-------------+---+
-     |             |
-     | skip        | attempt
-     v             v
++----------+-----------+
+           |
+           v
++----------------------+
+| Skip if previous    |
+| improvement still   |
+| applies             |
++----+-----------+----+
+     |           |
+   yes           no
+     |           |
+     v           v
 +----------------------+   +----------------------+
 | unchanged / already  |   | call vLLM-compatible |
 | improved             |   | improver engine      |
@@ -51,8 +59,9 @@ The improver is the LLM post-processing stage. It reads already-enriched documen
    - This avoids accidentally resolving and reusing an older enriched file.
 2. Load the previous improved snapshot for reuse checks.
 3. For each document:
+   - compute `_improver_fp` from the current improver inputs
    - carry forward any previous improvements when valid
-   - skip if the previous improvement is still applicable
+   - skip if the previous improvement is still applicable and `_improver_fp` matches
    - otherwise call the improver engine
 4. The engine:
    - summarizes content
@@ -91,4 +100,5 @@ The improver writes the final document set used by the rest of the pipeline outp
 
 - A single model failure should not abort the full stage.
 - Previous improvements are reused to avoid unnecessary LLM calls.
+- Warm-up is cached per process per `(host, model)` pair.
 - Upstream `524` proxy failures are external-service issues, not parser issues.

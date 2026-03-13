@@ -60,14 +60,6 @@ def carry_forward_enrichment(doc: Dict[str, Any], prev: Optional[Dict[str, Any]]
     if isinstance(prev.get("ko_content_url"), str):
         doc["ko_content_url"] = prev["ko_content_url"]
 
-    if (
-        doc.get("ko_content_flat") == prev.get("ko_content_flat")
-        and int(doc.get("enriched") or 0) == int(prev.get("enriched") or 0)
-        and doc.get("ko_content_source") == prev.get("ko_content_source")
-        and doc.get("ko_content_url") == prev.get("ko_content_url")
-    ):
-        return False
-
     logger.info("[EnrichCarryForward] id=%s source=%s", doc.get("_orig_id") or doc.get("_id"), prev.get("ko_content_source"))
     return True
 
@@ -106,6 +98,8 @@ def enrich_docs_via_routes(
             "get_content_type_image",
             "get_content_type_pdf",
             "embedded_pdf",
+            "meta_image",
+            "single_img",
         }
 
         if env_bool("ENRICH_ENABLE_VISION_FALLBACK", True) and vision_enabled():

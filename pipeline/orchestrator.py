@@ -140,9 +140,6 @@ def run_pipeline(
 
         # Build a "working set" from downloader outputs (do NOT mutate dl, it may be frozen)
         dl_docs: List[Dict[str, Any]] = dl.docs if dl else []
-        dl_url_tasks: List[Dict[str, Any]] = dl.url_tasks if dl else []
-        dl_media_tasks: List[Dict[str, Any]] = dl.media_tasks if dl else []
-
         # Optional: truncate latest downloader final_output_* to a small random sample (DEV convenience)
         # truncate_final = env_flag("TRUNCATE_FINAL_OUTPUT", False)
         # if truncate_final and dl:
@@ -170,12 +167,8 @@ def run_pipeline(
 
         # Default to downloader outputs (only valid if downloader ran)
         # enriched_docs: List[Dict[str, Any]] = dl.docs if dl else []
-        # enriched_url_tasks: List[Dict[str, Any]] = dl.url_tasks if dl else []
-        # enriched_media_tasks: List[Dict[str, Any]] = dl.media_tasks if dl else []
         # Default to downloader outputs (or truncated working set)
         enriched_docs: List[Dict[str, Any]] = dl_docs
-        enriched_url_tasks: List[Dict[str, Any]] = dl_url_tasks
-        enriched_media_tasks: List[Dict[str, Any]] = dl_media_tasks
 
 
         logger.warning("--------------- START OF ENRICHER ---------------")
@@ -194,7 +187,7 @@ def run_pipeline(
                 )
                 enrich_stats = enrich_res.get("stats") or {"patched": 0, "notes": "missing_stats"}
 
-                # Enricher output contains only docs; tasks remain from downloader
+                # Enricher output contains docs only
                 try:
                     with Path(enrich_res["out"]).open("r", encoding="utf-8") as fh:
                         enriched_payload = json.load(fh)
@@ -204,7 +197,7 @@ def run_pipeline(
                         raise ValueError("enriched docs is not a list")
                 except Exception as e:
                     logger.warning("[Pipeline] Failed to load enriched output (%s): %s", enrich_res.get("out"), e)
-                    # Keep downloader docs/tasks as-is
+                    # Keep downloader docs as-is
         else:
             logger.warning("[Pipeline] Enricher disabled (or cascaded off); skipping.")
 
@@ -276,11 +269,9 @@ def run_pipeline(
                     logger.warning("[Pipeline] Failed to read existing latest.json (%s): %s", latest_path, e)
                     prev_payload = {}
 
-            # If current run didn't produce docs/tasks in memory (e.g. downloader disabled),
+            # If current run didn't produce docs in memory (e.g. downloader disabled),
             # preserve what was already in latest.json.
             docs_out = improved_docs if improved_docs else (prev_payload.get("docs") or [])
-            url_tasks_out = enriched_url_tasks if enriched_url_tasks else (prev_payload.get("url_tasks") or [])
-            media_tasks_out = enriched_media_tasks if enriched_media_tasks else (prev_payload.get("media_tasks") or [])
 
             latest_payload = {
                 "meta": {
@@ -295,8 +286,6 @@ def run_pipeline(
                     "improver": improve_stats,
                 },
                 "docs": docs_out,
-                "url_tasks": url_tasks_out,
-                "media_tasks": media_tasks_out,
             }
             atomic_write_json(latest_path, latest_payload)
 
@@ -334,8 +323,6 @@ def run_pipeline(
             },
             "counts": {
                 "docs": len(improved_docs),
-                "url_tasks": len(enriched_url_tasks),
-                "media_tasks": len(enriched_media_tasks),
             },
             "paths": {
                 "downloader_out": "",
@@ -352,8 +339,6 @@ def run_pipeline(
             "meta": report["meta"],
             "stats": report["stats"],
             "docs": improved_docs,
-            "url_tasks": enriched_url_tasks,
-            "media_tasks": enriched_media_tasks,
         }
         atomic_write_json(latest_path, payload)
 

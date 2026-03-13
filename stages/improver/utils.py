@@ -1,10 +1,40 @@
-# improver_utils.py
+import hashlib
+import json
 
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from pipeline.io import resolve_latest_pointer, find_latest_matching
 from stages.enricher.utils import load_stage_payload
+
+
+def _stable_value(v: Any) -> Any:
+    if v is None:
+        return None
+    if isinstance(v, str):
+        return v.strip()
+    if isinstance(v, (bool, int, float)):
+        return v
+    if isinstance(v, list):
+        out = [_stable_value(x) for x in v]
+        out = [x for x in out if x not in (None, "")]
+        return sorted(out, key=lambda x: str(x).casefold())
+    if isinstance(v, dict):
+        return {str(k): _stable_value(val) for k, val in v.items()}
+    return str(v)
+
+
+def compute_improver_fp(doc: Dict[str, Any]) -> str:
+    obj = {
+        "_orig_id": _stable_value(doc.get("_orig_id") or doc.get("_id")),
+        "ko_content_flat": _stable_value(doc.get("ko_content_flat")),
+        "title": _stable_value(doc.get("title")),
+        "subtitle": _stable_value(doc.get("subtitle")),
+        "description": _stable_value(doc.get("description")),
+        "keywords": _stable_value(doc.get("keywords")),
+    }
+    s = json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
 # ---------------- Loading inputs ----------------
@@ -69,7 +99,7 @@ def should_skip_improve(doc: Dict[str, Any], prev: Optional[Dict[str, Any]]) -> 
     Skip if previous snapshot already improved this doc AND the improver fingerprint matches.
 
     Uses:
-      - doc["_improver_fp"] (computed in downloader)
+      - doc["_improver_fp"]
       - prev["_improver_fp"]
       - prev["improved"] == 1
     """
@@ -146,13 +176,5 @@ def carry_forward_previous_improvements(doc: Dict[str, Any], prev: Optional[Dict
     # carry forward status too (optional, but keeps output self-describing)
     if changed:
         doc["improved"] = 1
-
-        # If after copying we are identical to prev, this is baseline reconstruction:
-        # treat as not meaningful (so it won't trigger a new snapshot).
-        if (
-            int(doc.get("improved") or 0) == int(prev.get("improved") or 0)
-            and all(doc.get(k) == prev.get(k) for k in keys)
-        ):
-            return False
 
     return changed
