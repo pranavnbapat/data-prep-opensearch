@@ -14,6 +14,7 @@ load_dotenv()
 from api.job_runner import run_pipeline_job
 from api.job_store import (JOBS, JOB_LOGS, JOB_LOCK, bucket_parts_now, load_job_from_disk,
                            load_jobs_from_disk, log_file_path, recover_job_tmp_files, write_job_to_disk)
+from api.job_store import request_job_cancel
 from api.models import EnvMode, Job, JobStatus, PipelineRunParams, effective_page_size
 
 @asynccontextmanager
@@ -79,9 +80,12 @@ def trigger_pipeline_run(params: PipelineRunParams, bg: BackgroundTasks):
     return {"status": "scheduled", "job_id": job_id}
 
 @app.get("/jobs")
-def list_jobs():
+def list_jobs(env_mode: EnvMode | None = None):
     with JOB_LOCK:
-        return [j.model_dump() for j in JOBS.values()]
+        jobs = JOBS.values()
+        if env_mode is not None:
+            jobs = [j for j in jobs if j.env_mode == env_mode]
+        return [j.model_dump() for j in jobs]
 
 @app.get("/jobs/{job_id}")
 def get_job(job_id: str):
@@ -93,6 +97,29 @@ def get_job(job_id: str):
         data = job.model_dump(mode="json")
         data.pop("error_trace", None)
         return data
+
+
+@app.post("/jobs/{job_id}/cancel")
+def cancel_job(job_id: str):
+    job = request_job_cancel(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job not found")
+
+    if job.status in {JobStatus.success, JobStatus.error, JobStatus.canceled}:
+        return {
+            "job_id": job_id,
+            "status": job.status.value,
+            "cancel_requested": bool(job.cancel_requested),
+            "message": "Job is already finished",
+        }
+
+    write_job_to_disk(job)
+    return {
+        "job_id": job_id,
+        "status": job.status.value,
+        "cancel_requested": True,
+        "message": "Cancellation requested",
+    }
 
 @app.get("/jobs/{job_id}/logs")
 def get_job_logs(job_id: str, tail: int = 200):

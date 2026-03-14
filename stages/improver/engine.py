@@ -13,6 +13,7 @@ from stages.improver.llm_client import call_vllm_chat, warm_up_model
 from stages.improver.prompts import (UNIVERSAL_SUMMARY_PROMPT, DEFAULT_PROMPT, CHUNK_SUMMARY_PROMPT,
                                      COMBINE_PROMPT, METADATA_PROMPT)
 from stages.improver.text_utils import approx_token_count, split_into_tokenish_chunks, should_summarise_text
+from stages.enricher.vision import describe_visual_url, vision_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +107,28 @@ def _run_metadata_field(
     return extract_metadata_text(raw)
 
 
+def _is_hosted_pdf(doc: Dict[str, Any]) -> bool:
+    return (
+        bool(doc.get("ko_is_hosted"))
+        and isinstance(doc.get("ko_file_id"), str)
+        and bool(doc.get("ko_file_id", "").strip())
+        and (str(doc.get("ko_object_mimetype") or "").strip().lower() == "application/pdf")
+    )
+
+
+def _summarise_hosted_pdf(doc: Dict[str, Any]) -> Optional[str]:
+    if not vision_enabled():
+        return None
+    pdf_url = str(doc.get("ko_file_id") or "").strip()
+    if not pdf_url:
+        return None
+    logger.info("[ImproverPdfSummary] id=%s target=%s", doc.get("_orig_id") or doc.get("_id"), pdf_url)
+    text = describe_visual_url(pdf_url, source_page_url=pdf_url)
+    if not isinstance(text, str) or not text.strip():
+        return None
+    return text.strip()
+
+
 def improve_doc_in_place(doc: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
     """
     Mutate doc:
@@ -132,8 +155,16 @@ def improve_doc_in_place(doc: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
         summary = doc.get(summary_field)
 
         if not (isinstance(summary, str) and summary.strip()):
+            if _is_hosted_pdf(doc):
+                pdf_summary = _summarise_hosted_pdf(doc)
+                if isinstance(pdf_summary, str) and pdf_summary.strip():
+                    doc[summary_field] = pdf_summary
+                elif not should_summarise_text(content):
+                    doc[summary_field] = content
+                else:
+                    doc[summary_field] = _summarise_text(model, content)
             # If it is too short, just copy content
-            if not should_summarise_text(content):
+            elif not should_summarise_text(content):
                 doc[summary_field] = content
             else:
                 doc[summary_field] = _summarise_text(model, content)

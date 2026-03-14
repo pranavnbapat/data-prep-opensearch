@@ -5,7 +5,9 @@ import os
 import traceback
 from datetime import datetime
 
-from api.job_store import JOBS, JOB_LOCK, PerJobLogHandler, log_file_path, write_job_to_disk
+from common.cancellation import JobCancelled
+from api.job_store import (JOBS, JOB_LOCK, PerJobLogHandler, clear_job_cancel, get_cancel_event,
+                           log_file_path, write_job_to_disk)
 from api.models import EnvMode, JobStatus
 from pipeline.orchestrator import run_pipeline
 
@@ -18,8 +20,15 @@ def clean_error_message(e: Exception) -> str:
 
 
 def run_pipeline_job(job_id: str, page_size: int, env_mode: EnvMode) -> None:
+    cancel_event = get_cancel_event(job_id)
     with JOB_LOCK:
         job = JOBS[job_id]
+        if cancel_event.is_set() or job.status == JobStatus.canceled:
+            job.status = JobStatus.canceled
+            job.finished_at = datetime.utcnow()
+            write_job_to_disk(job)
+            clear_job_cancel(job_id)
+            return
         job.status = JobStatus.running
         job.started_at = datetime.utcnow()
     write_job_to_disk(job)
@@ -51,6 +60,7 @@ def run_pipeline_job(job_id: str, page_size: int, env_mode: EnvMode) -> None:
             transcribe_workers=transcribe_workers,
             max_chars=max_chars,
             output_root=output_root,
+            should_cancel=cancel_event.is_set,
         )
 
         with JOB_LOCK:
@@ -67,6 +77,14 @@ def run_pipeline_job(job_id: str, page_size: int, env_mode: EnvMode) -> None:
         write_job_to_disk(job)
         logging.info("Pipeline finished (final=%r report=%r latest=%r)", res.final_path, res.report_path, res.latest_path)
 
+    except JobCancelled as e:
+        with JOB_LOCK:
+            job.status = JobStatus.canceled
+            job.error = str(e)
+            job.finished_at = datetime.utcnow()
+        write_job_to_disk(job)
+        logging.warning("Pipeline canceled: %s", e)
+
     except Exception as e:
         clean = f"{e.__class__.__name__}: {clean_error_message(e)}"
         tb = traceback.format_exc()
@@ -82,3 +100,4 @@ def run_pipeline_job(job_id: str, page_size: int, env_mode: EnvMode) -> None:
     finally:
         root_logger.removeHandler(handler)
         handler.close()
+        clear_job_cancel(job_id)

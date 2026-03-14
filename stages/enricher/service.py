@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 try:
     from dotenv import load_dotenv
@@ -28,6 +28,7 @@ def run_enricher_stage(
     transcribe_workers: int,
     max_chars: Optional[int],
     use_lock: bool = True,
+    should_cancel: Optional[Callable[[], bool]] = None,
 ) -> Dict[str, Any]:
     lock = None
     if use_lock:
@@ -44,6 +45,7 @@ def run_enricher_stage(
             extractor_workers=extractor_workers,
             transcribe_workers=transcribe_workers,
             max_chars=max_chars,
+            should_cancel=should_cancel,
         )
 
         patched = int(stats.get("patched") or 0)

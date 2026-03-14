@@ -72,6 +72,7 @@ Main endpoints:
 - `POST /run-pipeline`
 - `GET /jobs`
 - `GET /jobs/{job_id}`
+- `POST /jobs/{job_id}/cancel`
 - `GET /jobs/{job_id}/logs`
 
 Run locally:
@@ -92,6 +93,19 @@ Example trigger:
 curl -X POST http://127.0.0.1:8000/run-pipeline \
   -H "Content-Type: application/json" \
   -d '{"env_mode":"DEV","page_size":100}'
+```
+
+Example cancel:
+
+```bash
+curl -X POST http://127.0.0.1:8000/jobs/<job_id>/cancel
+```
+
+Example filtered job list:
+
+```bash
+curl http://127.0.0.1:8000/jobs?env_mode=DEV
+curl http://127.0.0.1:8000/jobs?env_mode=PRD
 ```
 
 ## Local Setup
@@ -146,6 +160,11 @@ Enricher:
 - `EUF_VISION_URL`
 - `EUF_VISION_MODEL`
 - `EUF_VISION_API_KEY`
+- `EUF_VISION_RETRIES`
+- `EUF_VISION_RETRY_BASE_SEC`
+- `EUF_VISION_MIN_INTERVAL_SEC`
+- `EUF_VISION_PDF_MAP_REDUCE_THRESHOLD`
+- `EUF_VISION_PDF_CHUNK_PAGES`
 
 Improver:
 
@@ -243,8 +262,11 @@ sh pull_and_restart.sh
 - The pipeline is file-backed. Latest pointers are stored as JSON files in `output/`.
 - Downloader emits a full snapshot, not just changed records.
 - Enricher only attempts external work for candidate documents that need it.
+- The data-prep vision path serializes requests and can use a light PDF map-reduce flow for longer PDFs.
+- The improver can generate `ko_content_flat_summarised` directly from hosted PDFs without overwriting `ko_content_flat`.
 - Improver reuses prior LLM output when the improver fingerprint is unchanged.
 - Long hosted videos can be skipped before custom transcription if they exceed the configured duration limit.
+- Job cancellation is cooperative. A running job stops between pages, documents, and stage boundaries rather than being force-killed mid-write.
 
 ## Stage Notes
 

@@ -45,6 +45,7 @@ def effective_page_size(raw_page_size: int | None, *, default: int = 100, max_si
 class JobStatus(str, Enum):
     queued = "queued"
     running = "running"
+    canceled = "canceled"
     success = "success"
     error = "error"
 
@@ -57,6 +58,7 @@ class Job(BaseModel):
     finished_at: Optional[datetime] = None
     env_mode: EnvMode
     page_size: int
+    cancel_requested: bool = False
     emitted: Optional[int] = None
     dropped: Optional[int] = None
     output_file: Optional[str] = None

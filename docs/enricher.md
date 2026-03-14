@@ -254,12 +254,27 @@ Current vision rendering behavior:
   - send directly to vision model
 - PDF URL:
   - download PDF
-  - render page 1 to PNG with `pdftoppm`
-  - send PNG as data URL
+  - count pages with `pdfinfo`
+  - if page count is `<= EUF_VISION_PDF_MAP_REDUCE_THRESHOLD`:
+    - render page 1 to PNG with `pdftoppm`
+    - send PNG as data URL
+  - if page count is greater than the threshold:
+    - render pages one by one
+    - process them in chunks of `EUF_VISION_PDF_CHUNK_PAGES`
+    - join chunk outputs into one final text
 - SVG image:
   - download SVG
   - rasterize with ImageMagick `convert`
   - send PNG as data URL
+
+Current vision request behavior:
+
+- data-prep serializes vision requests inside the process
+- a minimum spacing between vision requests is enforced with `EUF_VISION_MIN_INTERVAL_SEC`
+- `429` and `5xx` responses are retried with bounded backoff using:
+  - `EUF_VISION_RETRIES`
+  - `EUF_VISION_RETRY_BASE_SEC`
+- this reduces collisions from data-prep itself, but cannot fully prevent `429` if the same vision backend is shared with another service at the same time
 
 ## Success Patching
 

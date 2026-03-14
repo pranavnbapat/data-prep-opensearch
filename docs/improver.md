@@ -65,6 +65,8 @@ The improver is the LLM post-processing stage. It reads already-enriched documen
    - otherwise call the improver engine
 4. The engine:
    - summarizes content
+   - for hosted PDFs, prefers generating `ko_content_flat_summarised` from the file itself via the vision path
+   - keeps `ko_content_flat` unchanged; only the summary field changes
    - derives improved metadata fields
    - mutates the document in place
 5. Write:
@@ -83,6 +85,24 @@ It now tolerates:
 - plain-text fallback
 
 This reduces failures caused by malformed model responses.
+
+## Hosted PDF Summary Path
+
+Current behavior for hosted PDFs:
+
+- if `ko_is_hosted = true`
+- and `ko_object_mimetype = application/pdf`
+- and `ko_file_id` is present
+
+then the improver prefers generating `ko_content_flat_summarised` directly from the PDF file via the vision helper.
+
+That means:
+
+- the improver does not rely only on upstream `ko_content_flat` for the summary field
+- the raw content field is not overwritten
+- the summary can use the PDF-aware vision map-reduce logic already implemented in the enricher vision module
+
+If that file-based summary path fails, the improver falls back to the normal text-based summary flow from `ko_content_flat`.
 
 ## Output Contract
 

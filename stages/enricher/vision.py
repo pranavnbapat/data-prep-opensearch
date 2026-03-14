@@ -6,6 +6,8 @@ import re
 import base64
 import subprocess
 import tempfile
+import time
+import threading
 from html import unescape
 from typing import Any, Optional, Tuple
 from urllib.parse import urljoin, unquote_to_bytes
@@ -16,6 +18,8 @@ from stages.enricher.utils import get_public_session, safe_host
 
 
 logger = logging.getLogger(__name__)
+_VISION_CALL_LOCK = threading.Lock()
+_VISION_LAST_CALL_AT = 0.0
 
 _META_IMAGE_PATTERNS = [
     re.compile(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', re.I),
@@ -106,15 +110,24 @@ def _render_svg_bytes_to_png_data_url(svg_bytes: bytes, *, timeout: int) -> Opti
 
 
 def _render_pdf_first_page_data_url(pdf_url: str, *, timeout: int) -> Optional[str]:
+    pdf_bytes = _download_pdf_bytes(pdf_url, timeout=timeout)
+    if pdf_bytes is None:
+        return None
+    return _render_pdf_page_data_url(pdf_bytes, page_num=1, timeout=timeout)
+
+
+def _download_pdf_bytes(pdf_url: str, *, timeout: int) -> Optional[bytes]:
     sess = get_public_session(timeout=timeout)
     try:
         resp = sess.get(pdf_url, allow_redirects=True)
         resp.raise_for_status()
-        pdf_bytes = resp.content
+        return resp.content
     except Exception as e:
         logger.error("[VisionPdfFetchFail] target=%s err=%r", pdf_url, e)
         return None
 
+
+def _render_pdf_page_data_url(pdf_bytes: bytes, *, page_num: int, timeout: int) -> Optional[str]:
     try:
         with tempfile.TemporaryDirectory(prefix="vision_pdf_") as tmpdir:
             pdf_path = os.path.join(tmpdir, "input.pdf")
@@ -126,7 +139,9 @@ def _render_pdf_first_page_data_url(pdf_url: str, *, timeout: int) -> Optional[s
                 "/usr/bin/pdftoppm",
                 "-png",
                 "-f",
-                "1",
+                str(page_num),
+                "-l",
+                str(page_num),
                 "-singlefile",
                 pdf_path,
                 out_prefix,
@@ -134,8 +149,8 @@ def _render_pdf_first_page_data_url(pdf_url: str, *, timeout: int) -> Optional[s
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=max(timeout, 30))
             if proc.returncode != 0:
                 logger.error(
-                    "[VisionPdfRenderFail] target=%s rc=%s stderr=%s",
-                    pdf_url,
+                    "[VisionPdfRenderFail] page=%s rc=%s stderr=%s",
+                    page_num,
                     proc.returncode,
                     (proc.stderr or "")[:500],
                 )
@@ -145,8 +160,124 @@ def _render_pdf_first_page_data_url(pdf_url: str, *, timeout: int) -> Optional[s
             with open(png_path, "rb") as f:
                 return _png_data_url_from_bytes(f.read())
     except Exception as e:
-        logger.error("[VisionPdfRenderFail] target=%s err=%r", pdf_url, e)
+        logger.error("[VisionPdfRenderFail] page=%s err=%r", page_num, e)
         return None
+
+
+def _pdf_page_count(pdf_bytes: bytes, *, timeout: int) -> Optional[int]:
+    try:
+        with tempfile.TemporaryDirectory(prefix="vision_pdfinfo_") as tmpdir:
+            pdf_path = os.path.join(tmpdir, "input.pdf")
+            with open(pdf_path, "wb") as f:
+                f.write(pdf_bytes)
+            cmd = ["/usr/bin/pdfinfo", pdf_path]
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=max(timeout, 30))
+            if proc.returncode != 0:
+                logger.error("[VisionPdfInfoFail] rc=%s stderr=%s", proc.returncode, (proc.stderr or "")[:500])
+                return None
+            m = re.search(r"^Pages:\s+(\d+)\s*$", proc.stdout or "", flags=re.M)
+            if not m:
+                return None
+            return int(m.group(1))
+    except Exception as e:
+        logger.error("[VisionPdfInfoFail] err=%r", e)
+        return None
+
+
+def _join_chunk_texts(chunks: list[str]) -> str:
+    cleaned = []
+    seen = set()
+    for chunk in chunks:
+        text = (chunk or "").strip()
+        if not text:
+            continue
+        key = text[:500]
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(text)
+    return "\n\n".join(cleaned).strip()
+
+
+def _describe_visual_payload(resolved_target: str, *, target_url: str, source_page_url: Optional[str], timeout: float) -> Optional[str]:
+    base_url = (os.getenv("EUF_VISION_URL") or "").rstrip("/")
+    model = (os.getenv("EUF_VISION_MODEL") or "").strip()
+    api_key = (os.getenv("EUF_VISION_API_KEY") or "").strip()
+    url = f"{base_url}/v1/chat/completions"
+
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": VISION_PROMPT},
+                    {"type": "image_url", "image_url": {"url": resolved_target}},
+                ],
+            }
+        ],
+        "temperature": 0.1,
+        "max_tokens": int(os.getenv("EUF_VISION_MAX_TOKENS", "900")),
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+    retries = max(1, int(os.getenv("EUF_VISION_RETRIES", "3")))
+    base_sleep = max(0.1, float(os.getenv("EUF_VISION_RETRY_BASE_SEC", "2.0")))
+    min_interval = max(0.0, float(os.getenv("EUF_VISION_MIN_INTERVAL_SEC", "1.5")))
+
+    global _VISION_LAST_CALL_AT
+    for attempt in range(1, retries + 1):
+        try:
+            with _VISION_CALL_LOCK:
+                now = time.monotonic()
+                wait_for = (_VISION_LAST_CALL_AT + min_interval) - now
+                if wait_for > 0:
+                    logger.info("[VisionThrottle] target=%s sleep=%.2fs", target_url, wait_for)
+                    time.sleep(wait_for)
+                resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
+                _VISION_LAST_CALL_AT = time.monotonic()
+
+            if resp.status_code == 429 or 500 <= resp.status_code < 600:
+                retry_after = (resp.headers.get("Retry-After") or "").strip()
+                sleep_s = max(0.1, float(retry_after)) if retry_after.isdigit() else (base_sleep * attempt)
+                logger.warning(
+                    "[VisionRetry] target=%s page=%s status=%s attempt=%s/%s sleep=%.2fs",
+                    target_url,
+                    source_page_url,
+                    resp.status_code,
+                    attempt,
+                    retries,
+                    sleep_s,
+                )
+                if attempt < retries:
+                    time.sleep(sleep_s)
+                    continue
+
+            if resp.status_code >= 400:
+                logger.error(
+                    "[VisionFail] target=%s page=%s status=%s body=%s",
+                    target_url,
+                    source_page_url,
+                    resp.status_code,
+                    (resp.text or "")[:500],
+                )
+                return None
+            data = resp.json()
+            text = ((data.get("choices") or [{}])[0].get("message") or {}).get("content")
+            text = text.strip() if isinstance(text, str) else ""
+            if not text:
+                logger.info("[VisionSkip] empty response target=%s page=%s", target_url, source_page_url)
+                return None
+            return text
+        except Exception as e:
+            logger.error("[VisionFail] target=%s page=%s host=%s err=%r",
+                         target_url, source_page_url, safe_host(target_url), e)
+            return None
+    return None
 
 
 def _fetch_binary_target(target_url: str, *, timeout: int) -> Tuple[Optional[bytes], Optional[str]]:
@@ -214,11 +345,49 @@ def describe_visual_url(target_url: str, *, source_page_url: Optional[str] = Non
         logger.info("[VisionSkip] missing vision configuration")
         return None
 
-    url = f"{base_url}/v1/chat/completions"
     resolved_target = target_url
     target_content_type = probe_content_type(target_url, timeout=10)[0]
     if target_url.lower().endswith(".pdf") or target_content_type == "application/pdf":
-        rendered = _render_pdf_first_page_data_url(target_url, timeout=int(timeout))
+        pdf_bytes = _download_pdf_bytes(target_url, timeout=int(timeout))
+        if pdf_bytes is None:
+            return None
+        page_count = _pdf_page_count(pdf_bytes, timeout=int(timeout)) or 1
+        map_reduce_threshold = max(1, int(os.getenv("EUF_VISION_PDF_MAP_REDUCE_THRESHOLD", "3")))
+        chunk_size = max(1, int(os.getenv("EUF_VISION_PDF_CHUNK_PAGES", "3")))
+
+        if page_count > map_reduce_threshold:
+            logger.info(
+                "[VisionPdfMapReduce] target=%s page_count=%s chunk_pages=%s threshold=%s",
+                target_url,
+                page_count,
+                chunk_size,
+                map_reduce_threshold,
+            )
+            chunk_texts: list[str] = []
+            for start in range(1, page_count + 1, chunk_size):
+                end = min(start + chunk_size - 1, page_count)
+                page_texts: list[str] = []
+                for page_num in range(start, end + 1):
+                    rendered = _render_pdf_page_data_url(pdf_bytes, page_num=page_num, timeout=int(timeout))
+                    if not rendered:
+                        continue
+                    text = _describe_visual_payload(
+                        rendered,
+                        target_url=target_url,
+                        source_page_url=f"{source_page_url or target_url}#page={page_num}",
+                        timeout=timeout,
+                    )
+                    if text:
+                        page_texts.append(text)
+                if page_texts:
+                    chunk_texts.append(_join_chunk_texts(page_texts))
+
+            combined = _join_chunk_texts(chunk_texts)
+            if combined:
+                return combined
+            return None
+
+        rendered = _render_pdf_page_data_url(pdf_bytes, page_num=1, timeout=int(timeout))
         if not rendered:
             return None
         resolved_target = rendered
@@ -230,46 +399,9 @@ def describe_visual_url(target_url: str, *, source_page_url: Optional[str] = Non
         if not rendered:
             return None
         resolved_target = rendered
-
-    payload: dict[str, Any] = {
-        "model": model,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": VISION_PROMPT},
-                    {"type": "image_url", "image_url": {"url": resolved_target}},
-                ],
-            }
-        ],
-        "temperature": 0.1,
-        "max_tokens": int(os.getenv("EUF_VISION_MAX_TOKENS", "900")),
-    }
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
-
-    try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
-        if resp.status_code >= 400:
-            logger.error(
-                "[VisionFail] target=%s page=%s status=%s body=%s",
-                target_url,
-                source_page_url,
-                resp.status_code,
-                (resp.text or "")[:500],
-            )
-            return None
-        data = resp.json()
-        text = ((data.get("choices") or [{}])[0].get("message") or {}).get("content")
-        text = text.strip() if isinstance(text, str) else ""
-        if not text:
-            logger.info("[VisionSkip] empty response target=%s page=%s", target_url, source_page_url)
-            return None
-        return text
-    except Exception as e:
-        logger.error("[VisionFail] target=%s page=%s host=%s err=%r",
-                     target_url, source_page_url, safe_host(target_url), e)
-        return None
+    return _describe_visual_payload(
+        resolved_target,
+        target_url=target_url,
+        source_page_url=source_page_url,
+        timeout=timeout,
+    )

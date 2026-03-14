@@ -8,7 +8,7 @@ import os
 import time
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 try:
     from dotenv import load_dotenv
@@ -16,6 +16,7 @@ try:
 except Exception:
     pass
 
+from common.cancellation import JobCancelled
 from pipeline.io import atomic_write_json, update_latest_pointer, run_stamp, output_dir
 from pipeline.locks import acquire_job_lock, release_job_lock
 from stages.improver.config import BASE_VLLM_HOST
@@ -54,6 +55,7 @@ def run_improver_stage(
     input_path: Optional[str] = None,
     input_docs: Optional[List[Dict[str, Any]]] = None,
     use_lock: bool = True,
+    should_cancel: Optional[Callable[[], bool]] = None,
 ) -> Optional[Dict[str, Any]]:
     lock = None
     if use_lock:
@@ -95,6 +97,8 @@ def run_improver_stage(
         t0 = time.perf_counter()
 
         for i, d in enumerate(docs, start=1):
+            if should_cancel and should_cancel():
+                raise JobCancelled("Job canceled during improver execution")
             llid = d.get("_orig_id") or d.get("_id")
             if not isinstance(llid, str) or not llid:
                 failed += 1

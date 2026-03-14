@@ -2,8 +2,9 @@ import json
 import logging
 import os
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
+from common.cancellation import JobCancelled
 from common.utils import CustomJSONEncoder
 from pipeline.io import run_stamp, output_dir, atomic_write_json, update_latest_pointer, resolve_latest_pointer
 from pipeline.locks import acquire_job_lock, release_job_lock, JobLockHeldError
@@ -27,7 +28,8 @@ def download_and_prepare(
     sort_criteria: int = 1,
     max_workers: int = 10,
     prev_index: Optional[Dict[str, Dict[str, Any]]] = None,
-    use_lock: bool = True
+    use_lock: bool = True,
+    should_cancel: Optional[Callable[[], bool]] = None,
 ) -> DownloadResult:
     output_root = os.getenv("OUTPUT_ROOT", "output")
     lock = None
@@ -62,6 +64,8 @@ def download_and_prepare(
         )
 
         while True:
+            if should_cancel and should_cancel():
+                raise JobCancelled("Job canceled during downloader page fetch loop")
             if page in pages_seen:
                 logging.warning("Breaking due to repeated page indicator: %s", page)
                 break
@@ -108,6 +112,8 @@ def download_and_prepare(
                 workers=max_workers,
                 prev_index=prev_index,
             )
+            if should_cancel and should_cancel():
+                raise JobCancelled("Job canceled during downloader page processing")
 
             logging.info("[PageDone] env=%s Page=%s Emitted=%s Dropped=%s dt=%.2fs",
                          env_mode, page, emitted_p, dropped_p, time.perf_counter() - t_page)

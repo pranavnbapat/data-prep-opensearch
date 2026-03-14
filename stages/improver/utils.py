@@ -28,6 +28,9 @@ def compute_improver_fp(doc: Dict[str, Any]) -> str:
     obj = {
         "_orig_id": _stable_value(doc.get("_orig_id") or doc.get("_id")),
         "ko_content_flat": _stable_value(doc.get("ko_content_flat")),
+        "ko_is_hosted": _stable_value(doc.get("ko_is_hosted")),
+        "ko_object_mimetype": _stable_value(doc.get("ko_object_mimetype")),
+        "ko_file_id": _stable_value(doc.get("ko_file_id")),
         "title": _stable_value(doc.get("title")),
         "subtitle": _stable_value(doc.get("subtitle")),
         "description": _stable_value(doc.get("description")),

@@ -8,8 +8,9 @@ import os
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
+from common.cancellation import JobCancelled, check_cancel
 from common.utils import CustomJSONEncoder
 from pipeline.io import run_stamp, output_dir, atomic_write_json, env_flag
 from pipeline.locks import acquire_job_lock, release_job_lock
@@ -108,6 +109,7 @@ def run_pipeline(
     transcribe_workers: int,
     max_chars: Optional[int],
     output_root: str = "output",
+    should_cancel: Optional[Callable[[], bool]] = None,
 ) -> PipelineResult:
 
     lock = acquire_job_lock(env_mode=env_mode, output_root=output_root, entrypoint="pipeline")
@@ -124,6 +126,7 @@ def run_pipeline(
 
         dl: Optional[DownloadResult] = None
         if enable_downloader:
+            check_cancel(should_cancel, "downloader setup")
             logger.warning("--------------- START OF DOWNLOADER ---------------")
             dl = download_and_prepare(
                 env_mode=env_mode,
@@ -131,12 +134,14 @@ def run_pipeline(
                 sort_criteria=sort_criteria,
                 max_workers=dl_workers,
                 prev_index=prev_index,
-                use_lock=False
+                use_lock=False,
+                should_cancel=should_cancel,
             )
         else:
             logger.warning("[Pipeline] Downloader disabled; downstream stages will resolve latest inputs themselves.")
 
         logger.warning("--------------- END OF DOWNLOADER ---------------")
+        check_cancel(should_cancel, "downloader completion")
 
         # Build a "working set" from downloader outputs (do NOT mutate dl, it may be frozen)
         dl_docs: List[Dict[str, Any]] = dl.docs if dl else []
@@ -173,6 +178,7 @@ def run_pipeline(
 
         logger.warning("--------------- START OF ENRICHER ---------------")
         if enable_enricher:
+            check_cancel(should_cancel, "enricher setup")
             if not dl:
                 # Should never happen due to cascading flags, but keep it defensive.
                 logger.warning("[Pipeline] Enricher enabled but downloader did not run; skipping enricher.")
@@ -184,6 +190,7 @@ def run_pipeline(
                     transcribe_workers=transcribe_workers,
                     max_chars=max_chars,
                     use_lock=False,
+                    should_cancel=should_cancel,
                 )
                 enrich_stats = enrich_res.get("stats") or {"patched": 0, "notes": "missing_stats"}
 
@@ -203,6 +210,7 @@ def run_pipeline(
 
         enrich_res = enrich_res or {}
         logger.warning("--------------- END OF ENRICHER ---------------")
+        check_cancel(should_cancel, "enricher completion")
 
         # Step 3: improver
         improve_res: Dict[str, Any] = {}
@@ -214,6 +222,7 @@ def run_pipeline(
 
         logger.warning("--------------- START OF IMPROVER ---------------")
         if enable_improver:
+            check_cancel(should_cancel, "improver setup")
             # The improver stage resolves its own latest_enriched input via pointer,
             # writes final_improved_*.json, and updates latest_improved.json
             improve_res = run_improver_stage(
@@ -223,6 +232,7 @@ def run_pipeline(
                 input_path=enrich_res.get("out") if enrich_res.get("out") else None,
                 input_docs=enriched_docs,
                 use_lock=False,
+                should_cancel=should_cancel,
             ) or {}
 
             improve_stats = improve_res.get("stats") or {"improved": 0, "notes": "missing_stats"}
@@ -246,6 +256,7 @@ def run_pipeline(
             logger.warning("[Pipeline] Improver disabled; skipping.")
 
         logger.warning("--------------- END OF IMPROVER ---------------")
+        check_cancel(should_cancel, "improver completion")
 
         downloader_stats = dl.stats if dl else {"changed": 0, "emitted": 0, "dropped": 0, "notes": "disabled"}
         # if truncate_final and dl:

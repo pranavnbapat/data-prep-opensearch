@@ -4,8 +4,9 @@ import logging
 import os
 import random
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from common.cancellation import JobCancelled
 from stages.enricher.transcription import transcribe_with_deapi
 from stages.enricher.vision import describe_visual_url, extract_visual_target_url, vision_enabled
 from stages.enricher.utils import (pagesense_one, classify_url_for_enrichment,
@@ -71,6 +72,7 @@ def enrich_docs_via_routes(
     extractor_workers: int,
     transcribe_workers: int,
     max_chars: Optional[int],
+    should_cancel: Optional[Callable[[], bool]] = None,
 ) -> Dict[str, Any]:
     def retry_n(*, fn, attempts: int, base_sleep_s: float, jitter_s: float, label: str):
         last = None
@@ -224,6 +226,8 @@ def enrich_docs_via_routes(
     carry_forward_copied = 0
 
     for llid, doc in idx.items():
+        if should_cancel and should_cancel():
+            raise JobCancelled("Job canceled during enricher candidate selection")
         if not has_enrich_via(doc):
             logger.debug("[EnrichSkip] id=%s reason=no_route", llid)
             skipped_no_route += 1
@@ -308,6 +312,8 @@ def enrich_docs_via_routes(
         doc["_enrich_inputs_fp"] = compute_enrich_inputs_fp(doc)
 
     for n, (llid, route, target) in enumerate(candidates, start=1):
+        if should_cancel and should_cancel():
+            raise JobCancelled("Job canceled during enricher execution")
         doc = idx.get(llid)
         if not doc:
             continue

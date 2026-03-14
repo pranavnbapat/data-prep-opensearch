@@ -5,7 +5,7 @@ import logging
 from collections import deque
 from datetime import datetime
 from pathlib import Path
-from threading import Lock
+from threading import Event, Lock
 from typing import Optional
 
 from api.models import Job, JobStatus
@@ -13,6 +13,7 @@ from api.models import Job, JobStatus
 
 JOBS: dict[str, Job] = {}
 JOB_LOGS: dict[str, deque[str]] = {}
+JOB_CANCEL_FLAGS: dict[str, Event] = {}
 JOB_LOCK = Lock()
 
 
@@ -89,6 +90,7 @@ def load_jobs_from_disk() -> None:
     with JOB_LOCK:
         JOBS.clear()
         JOBS.update(loaded)
+        JOB_CANCEL_FLAGS.clear()
 
 
 def load_job_from_disk(job_id: str) -> Optional[Job]:
@@ -102,6 +104,35 @@ def load_job_from_disk(job_id: str) -> Optional[Job]:
     with JOB_LOCK:
         JOBS[job_id] = job
     return job
+
+
+def get_cancel_event(job_id: str) -> Event:
+    with JOB_LOCK:
+        return JOB_CANCEL_FLAGS.setdefault(job_id, Event())
+
+
+def is_cancel_requested(job_id: str) -> bool:
+    return get_cancel_event(job_id).is_set()
+
+
+def request_job_cancel(job_id: str) -> Optional[Job]:
+    with JOB_LOCK:
+        job = JOBS.get(job_id)
+        if job is None:
+            return None
+        if job.status in {JobStatus.success, JobStatus.error, JobStatus.canceled}:
+            return job
+        JOB_CANCEL_FLAGS.setdefault(job_id, Event()).set()
+        job.cancel_requested = True
+        if job.status == JobStatus.queued:
+            job.status = JobStatus.canceled
+            job.finished_at = datetime.utcnow()
+        return job
+
+
+def clear_job_cancel(job_id: str) -> None:
+    with JOB_LOCK:
+        JOB_CANCEL_FLAGS.pop(job_id, None)
 
 
 class PerJobLogHandler(logging.Handler):
