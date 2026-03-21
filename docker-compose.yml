@@ -1,4 +1,43 @@
 services:
+  data-prep-opensearch-mysql:
+    image: mysql:8.4
+    container_name: data-prep-opensearch-mysql
+    env_file:
+      - .env
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    volumes:
+      - ./mysql_data:/var/lib/mysql
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  data-prep-opensearch-phpmyadmin:
+    image: phpmyadmin:5-apache
+    container_name: data-prep-opensearch-phpmyadmin
+    depends_on:
+      data-prep-opensearch-mysql:
+        condition: service_healthy
+    environment:
+      PMA_HOST: data-prep-opensearch-mysql
+      PMA_PORT: 3306
+      PMA_USER: ${MYSQL_USER}
+      PMA_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+    ports:
+      - "8401:80"
+    restart: always
+
   data-prep-opensearch:
     build:
       context: .
@@ -7,8 +46,11 @@ services:
     command: ["uvicorn", "api.app:app", "--host", "0.0.0.0", "--port", "8000"]
     env_file:
       - .env
+    depends_on:
+      data-prep-opensearch-mysql:
+        condition: service_healthy
     ports:
-      - "8000:8000"
+      - "8400:8000"
     volumes:
       - ./output:/app/output
     restart: always
@@ -20,18 +62,21 @@ services:
       retries: 3
       start_period: 10s
 
-  data-prep-opensearch-scheduler:
-    build:
-      context: .
-      dockerfile: Dockerfile.scheduler
-    container_name: data-prep-opensearch-scheduler
-    depends_on:
-      data-prep-opensearch:
-        condition: service_healthy
-    env_file:
-      - .env
-    environment:
-      TARGET_URL: http://data-prep-opensearch:8000/run-pipeline
-      HEALTH_URL: http://data-prep-opensearch:8000/healthz
-    restart: always
-    user: "${UID}:${GID}"
+#  data-prep-opensearch-scheduler:
+#    build:
+#      context: .
+#      dockerfile: Dockerfile.scheduler
+#    image: ghcr.io/pranavnbapat/data-prep-opensearch-scheduler:latest
+#    container_name: data-prep-opensearch-scheduler
+#    depends_on:
+#      data-prep-opensearch-mysql:
+#        condition: service_healthy
+#      data-prep-opensearch:
+#        condition: service_healthy
+#    env_file:
+#      - .env
+#    environment:
+#      TARGET_URL: http://data-prep-opensearch:8000/run-pipeline
+#      HEALTH_URL: http://data-prep-opensearch:8000/healthz
+#    restart: always
+#    user: "${UID}:${GID}"

@@ -8,7 +8,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from common.cancellation import JobCancelled
 from stages.enricher.transcription import transcribe_with_deapi
-from stages.enricher.vision import describe_visual_url, extract_visual_target_url, vision_enabled
+from stages.enricher.vision import describe_visual_url, describe_visual_url_detailed, extract_visual_target_url, vision_enabled
 from stages.enricher.utils import (pagesense_one, classify_url_for_enrichment,
                                    target_url_for_enrichment, has_enrich_via, should_skip,
                                    is_placeholder_content, is_deapi_platform_url,
@@ -17,6 +17,12 @@ from stages.enricher.utils import (pagesense_one, classify_url_for_enrichment,
 
 
 logger = logging.getLogger(__name__)
+
+
+def _normalized_content_source(source: str) -> str:
+    if source in {"vision_fallback", "vision_pdf_map_reduce"}:
+        return "vision_model"
+    return source
 
 
 def index_docs_by_llid(docs: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
@@ -37,8 +43,11 @@ def carry_forward_enrichment(doc: Dict[str, Any], prev: Optional[Dict[str, Any]]
         return False
 
     prev_text = prev.get("ko_content_flat")
+    prev_vision_text = prev.get("ko_content_flat_vision")
     prev_enriched = int(prev.get("enriched") or 0) == 1
-    if not prev_enriched or not isinstance(prev_text, str) or is_placeholder_content(prev_text):
+    has_prev_text = isinstance(prev_text, str) and not is_placeholder_content(prev_text)
+    has_prev_vision = isinstance(prev_vision_text, str) and not is_placeholder_content(prev_vision_text)
+    if not prev_enriched or not (has_prev_text or has_prev_vision):
         return False
 
     cur_text = doc.get("ko_content_flat")
@@ -48,13 +57,20 @@ def carry_forward_enrichment(doc: Dict[str, Any], prev: Optional[Dict[str, Any]]
 
     if (
         doc.get("ko_content_flat") == prev_text
+        and doc.get("ko_content_flat_vision") == prev.get("ko_content_flat_vision")
+        and doc.get("ko_content_is_summary") == prev.get("ko_content_is_summary")
         and int(doc.get("enriched") or 0) == 1
         and doc.get("ko_content_source") == prev.get("ko_content_source")
         and doc.get("ko_content_url") == prev.get("ko_content_url")
     ):
         return False
 
-    doc["ko_content_flat"] = prev_text
+    if has_prev_text:
+        doc["ko_content_flat"] = prev_text
+    if has_prev_vision:
+        doc["ko_content_flat_vision"] = prev_vision_text
+    if prev.get("ko_content_is_summary") is not None:
+        doc["ko_content_is_summary"] = prev.get("ko_content_is_summary")
     doc["enriched"] = 1
     if isinstance(prev.get("ko_content_source"), str):
         doc["ko_content_source"] = prev["ko_content_source"]
@@ -72,6 +88,7 @@ def enrich_docs_via_routes(
     extractor_workers: int,
     transcribe_workers: int,
     max_chars: Optional[int],
+    checkpoint_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
     should_cancel: Optional[Callable[[], bool]] = None,
 ) -> Dict[str, Any]:
     def retry_n(*, fn, attempts: int, base_sleep_s: float, jitter_s: float, label: str):
@@ -92,7 +109,7 @@ def enrich_docs_via_routes(
                 time.sleep(delay)
         return None
 
-    def pagesense_try(llid: str, url: str) -> Tuple[Optional[str], str]:
+    def pagesense_try(doc: Dict[str, Any], llid: str, url: str) -> Tuple[Optional[str], str]:
         vision_probe_timeout = int(os.getenv("ENRICH_VISION_PROBE_TIMEOUT", "12"))
         prefer_vision_reasons = {
             "content_type_image",
@@ -114,9 +131,13 @@ def enrich_docs_via_routes(
                     visual_target,
                     visual_reason,
                 )
-                vision_text = describe_visual_url(visual_target, source_page_url=url)
+                vision_text, vision_tag = describe_visual_url_detailed(visual_target, source_page_url=url)
                 if vision_text and not is_placeholder_content(vision_text):
-                    return vision_text, "vision_fallback"
+                    return vision_text, "vision_pdf_map_reduce" if vision_tag == "vision_pdf_map_reduce" else "vision_fallback"
+                existing_text = doc.get("ko_content_flat")
+                if vision_tag == "pdf_too_many_pages" and isinstance(existing_text, str) and not is_placeholder_content(existing_text):
+                    logger.info("[VisionPreferredSkipKeepUpstream] id=%s page=%s target=%s reason=%s", llid, url, visual_target, vision_tag)
+                    return existing_text, "upstream_preserved"
                 logger.warning(
                     "[VisionPreferredFail] id=%s page=%s target=%s reason=%s",
                     llid,
@@ -152,9 +173,13 @@ def enrich_docs_via_routes(
                 if visual_target:
                     logger.info("[VisionFallbackTry] id=%s page=%s target=%s reason=%s",
                                 llid, url, visual_target, visual_reason)
-                    vision_text = describe_visual_url(visual_target, source_page_url=url)
+                    vision_text, vision_tag = describe_visual_url_detailed(visual_target, source_page_url=url)
                     if vision_text and not is_placeholder_content(vision_text):
-                        return vision_text, "vision_fallback"
+                        return vision_text, "vision_pdf_map_reduce" if vision_tag == "vision_pdf_map_reduce" else "vision_fallback"
+                    existing_text = doc.get("ko_content_flat")
+                    if vision_tag == "pdf_too_many_pages" and isinstance(existing_text, str) and not is_placeholder_content(existing_text):
+                        logger.info("[VisionFallbackSkipKeepUpstream] id=%s page=%s target=%s reason=%s", llid, url, visual_target, vision_tag)
+                        return existing_text, "upstream_preserved"
             return None, "pagesense:empty"
         return out[0], "pagesense"
 
@@ -224,6 +249,7 @@ def enrich_docs_via_routes(
     skipped_bad_target = 0
     skipped_missing_target = 0
     carry_forward_copied = 0
+    route_counts: Dict[str, int] = {}
 
     for llid, doc in idx.items():
         if should_cancel and should_cancel():
@@ -278,7 +304,7 @@ def enrich_docs_via_routes(
                 skipped_bad_target += 1
                 continue
 
-        logger.info("[EnrichQueue] ID=%s route=%s target_host=%s", llid, route, target)
+        route_counts[route] = route_counts.get(route, 0) + 1
         candidates.append((llid, route, target))
 
     if not candidates:
@@ -294,6 +320,16 @@ def enrich_docs_via_routes(
             "candidates": 0,
         }
 
+    logger.info(
+        "[EnrichQueueSummary] candidates=%d pagesense=%d api_transcribe=%d custom_transcribe=%d skipped_prev=%d carry_forward=%d",
+        len(candidates),
+        route_counts.get("pagesense", 0),
+        route_counts.get("api_transcribe", 0),
+        route_counts.get("custom_transcribe", 0),
+        skipped_prev_done,
+        carry_forward_copied,
+    )
+
     patched_pagesense = 0
     patched_transcribe = 0
     failed_pagesense = 0
@@ -302,11 +338,38 @@ def enrich_docs_via_routes(
     per_record_delay = float(os.getenv("ENRICH_PER_RECORD_DELAY_SEC", "0.25"))
     total = len(candidates)
 
+    def current_stats() -> Dict[str, Any]:
+        patched_total = patched_pagesense + patched_transcribe
+        failed_total = failed_pagesense + failed_transcribe
+        return {
+            "total_docs": len(docs),
+            "candidates": len(candidates),
+            "patched": patched_total,
+            "patched_pagesense": patched_pagesense,
+            "patched_transcribe": patched_transcribe,
+            "failed": failed_total,
+            "failed_pagesense": failed_pagesense,
+            "failed_transcribe": failed_transcribe,
+            "skipped_no_route": skipped_no_route,
+            "skipped_prev_done": skipped_prev_done,
+            "skipped_disabled": skipped_disabled,
+            "skipped_missing_target": skipped_missing_target,
+            "carry_forward_copied": carry_forward_copied,
+            "failure_reasons": failure_reasons,
+        }
+
     def apply_success(doc: Dict[str, Any], *, text: str, source: str, url: str) -> None:
         if isinstance(max_chars, int) and max_chars > 0:
             text = text[:max_chars]
-        doc["ko_content_flat"] = text
-        doc["ko_content_source"] = source
+        normalized_source = _normalized_content_source(source)
+        if normalized_source == "vision_model":
+            doc["ko_content_flat_vision"] = text
+            doc["ko_content_is_summary"] = 1
+        else:
+            doc["ko_content_flat"] = text
+            doc["ko_content_is_summary"] = 0
+        doc["ko_content_source"] = normalized_source
+        doc["enrich_via"] = normalized_source
         doc["ko_content_url"] = url
         doc["enriched"] = 1
         doc["_enrich_inputs_fp"] = compute_enrich_inputs_fp(doc)
@@ -323,16 +386,20 @@ def enrich_docs_via_routes(
             time.sleep(per_record_delay + random.uniform(0.0, 0.15))
 
         if route == "pagesense":
-            text, tag = pagesense_try(llid, target)
+            text, tag = pagesense_try(doc, llid, target)
             if not text:
                 failed_pagesense += 1
                 inc(failure_reasons, tag)
                 logger.warning("[EnrichFail] %d/%d id=%s route=%s reason=%s dt=%.2fs", n, total, llid, route, tag, time.perf_counter() - t0)
+                if checkpoint_cb:
+                    checkpoint_cb(current_stats())
                 continue
-            source = "vision_fallback" if tag == "vision_fallback" else "pagesense"
+            source = tag if tag in {"vision_fallback", "upstream_preserved", "vision_pdf_map_reduce"} else "pagesense"
             apply_success(doc, text=text, source=source, url=target)
             patched_pagesense += 1
             logger.info("[EnrichOK] %d/%d id=%s route=%s chars=%d dt=%.2fs", n, total, llid, route, len(text), time.perf_counter() - t0)
+            if checkpoint_cb:
+                checkpoint_cb(current_stats())
             continue
 
         if route == "api_transcribe":
@@ -341,10 +408,14 @@ def enrich_docs_via_routes(
                 failed_transcribe += 1
                 inc(failure_reasons, tag)
                 logger.warning("[EnrichFail] %d/%d id=%s route=%s reason=%s dt=%.2fs", n, total, llid, route, tag, time.perf_counter() - t0)
+                if checkpoint_cb:
+                    checkpoint_cb(current_stats())
                 continue
             apply_success(doc, text=text, source="api_transcribe", url=target)
             patched_transcribe += 1
             logger.info("[EnrichOK] %d/%d id=%s route=%s chars=%d dt=%.2fs", n, total, llid, route, len(text), time.perf_counter() - t0)
+            if checkpoint_cb:
+                checkpoint_cb(current_stats())
             continue
 
         if route == "custom_transcribe":
@@ -353,28 +424,17 @@ def enrich_docs_via_routes(
                 failed_transcribe += 1
                 inc(failure_reasons, tag)
                 logger.warning("[EnrichFail] %d/%d id=%s route=%s reason=%s dt=%.2fs", n, total, llid, route, tag, time.perf_counter() - t0)
+                if checkpoint_cb:
+                    checkpoint_cb(current_stats())
                 continue
             apply_success(doc, text=text, source="custom_transcribe", url=target)
             patched_transcribe += 1
             logger.info("[EnrichOK] %d/%d id=%s route=%s chars=%d dt=%.2fs", n, total, llid, route, len(text), time.perf_counter() - t0)
+            if checkpoint_cb:
+                checkpoint_cb(current_stats())
 
     patched_total = patched_pagesense + patched_transcribe
     failed_total = failed_pagesense + failed_transcribe
     logger.warning("[EnricherDone] candidates=%d patched=%d failed=%d skipped_prev=%d",
                    len(candidates), patched_total, failed_total, skipped_prev_done)
-    return {
-        "total_docs": len(docs),
-        "candidates": len(candidates),
-        "patched": patched_total,
-        "patched_pagesense": patched_pagesense,
-        "patched_transcribe": patched_transcribe,
-        "failed": failed_total,
-        "failed_pagesense": failed_pagesense,
-        "failed_transcribe": failed_transcribe,
-        "skipped_no_route": skipped_no_route,
-        "skipped_prev_done": skipped_prev_done,
-        "skipped_disabled": skipped_disabled,
-        "skipped_missing_target": skipped_missing_target,
-        "carry_forward_copied": carry_forward_copied,
-        "failure_reasons": failure_reasons,
-    }
+    return current_stats()

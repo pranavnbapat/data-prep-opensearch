@@ -7,15 +7,35 @@ from typing import Any, Dict, List, Tuple, Optional
 
 from stages.improver.config import (PRIMARY_MODEL, EXTREME_CTX_THRESHOLD_TOK, NEAR_LIMIT_CTX_THRESHOLD_TOK,
                                     CHUNK_TARGET_TOK, CHUNK_OVERLAP_TOK, DEFAULT_NUM_PREDICT,
-                                    COMBINE_NUM_PREDICT, SUMMARY_MAX_ATTEMPTS, BASE_VLLM_HOST, VLLM_API_KEY)
+                                    COMBINE_NUM_PREDICT, SUMMARY_MAX_ATTEMPTS, METADATA_MAX_ATTEMPTS,
+                                    BASE_VLLM_HOST, VLLM_API_KEY)
 from stages.improver.extractors import extract_summary_json, extract_metadata_text, extract_metadata_keywords
 from stages.improver.llm_client import call_vllm_chat, warm_up_model
 from stages.improver.prompts import (UNIVERSAL_SUMMARY_PROMPT, DEFAULT_PROMPT, CHUNK_SUMMARY_PROMPT,
-                                     COMBINE_PROMPT, METADATA_PROMPT)
+                                     COMBINE_PROMPT, METADATA_PROMPT, POLISH_PROMPT)
 from stages.improver.text_utils import approx_token_count, split_into_tokenish_chunks, should_summarise_text
-from stages.enricher.vision import describe_visual_url, vision_enabled
-
 logger = logging.getLogger(__name__)
+
+
+def _summary_stats(source_text: str, summary_payload: Dict[str, Any], *, mode: str) -> Dict[str, Any]:
+    source_words = len((source_text or "").split())
+    summary_text = str(summary_payload.get("summary") or "").strip()
+    summary_words = len(summary_text.split())
+    compression_ratio = round(source_words / max(summary_words, 1), 3) if source_words > 0 else None
+    return {
+        "mode": mode,
+        "summary": summary_text,
+        "coverage_score": summary_payload.get("coverage_score"),
+        "density_score": summary_payload.get("density_score"),
+        "compression_judgement": summary_payload.get("compression_judgement"),
+        "faithfulness_confidence": summary_payload.get("faithfulness_confidence"),
+        "notes": summary_payload.get("notes"),
+        "source_word_count": source_words,
+        "summary_word_count": summary_words,
+        "source_char_count": len(source_text or ""),
+        "summary_char_count": len(summary_text),
+        "compression_ratio": compression_ratio,
+    }
 
 
 def _require_model() -> str:
@@ -29,7 +49,7 @@ def _require_model() -> str:
     return model
 
 
-def _summarise_text(model: str, text: str) -> str:
+def _summarise_text(model: str, text: str) -> Dict[str, Any]:
     tok = approx_token_count(text)
 
     for attempt in range(1, SUMMARY_MAX_ATTEMPTS + 1):
@@ -56,7 +76,7 @@ def _summarise_text(model: str, text: str) -> str:
                     content=combined,
                     options_override={"max_tokens": COMBINE_NUM_PREDICT},
                 )
-                return extract_summary_json(raw)["summary"]
+                return extract_summary_json(raw)
 
             max_toks = DEFAULT_NUM_PREDICT if tok <= NEAR_LIMIT_CTX_THRESHOLD_TOK else DEFAULT_NUM_PREDICT
             raw = call_vllm_chat(
@@ -65,12 +85,29 @@ def _summarise_text(model: str, text: str) -> str:
                 content=text,
                 options_override={"max_tokens": DEFAULT_NUM_PREDICT},
             )
-            return extract_summary_json(raw)["summary"]
+            return extract_summary_json(raw)
 
 
         except Exception as e:
             if attempt < SUMMARY_MAX_ATTEMPTS:
                 logger.warning("[Improver] summary attempt %d failed: %s", attempt, e)
+            else:
+                raise
+
+
+def _polish_summary_text(model: str, text: str) -> Dict[str, Any]:
+    for attempt in range(1, SUMMARY_MAX_ATTEMPTS + 1):
+        try:
+            raw = call_vllm_chat(
+                model=model,
+                prompt=POLISH_PROMPT,
+                content=text,
+                options_override={"max_tokens": DEFAULT_NUM_PREDICT, "temperature": 0.1},
+            )
+            return extract_summary_json(raw)
+        except Exception as e:
+            if attempt < SUMMARY_MAX_ATTEMPTS:
+                logger.warning("[Improver] polish attempt %d failed: %s", attempt, e)
             else:
                 raise
 
@@ -94,39 +131,30 @@ def _run_metadata_field(
         f"SUMMARY:\n{summary_en}"
     )
 
-    raw = call_vllm_chat(
-        model=model,
-        prompt=METADATA_PROMPT,
-        content=meta_context,
-        options_override={"max_tokens": DEFAULT_NUM_PREDICT, "temperature": 0.3},
-    )
+    last_error: Exception | None = None
+    for attempt in range(1, METADATA_MAX_ATTEMPTS + 1):
+        try:
+            raw = call_vllm_chat(
+                model=model,
+                prompt=METADATA_PROMPT,
+                content=meta_context,
+                options_override={"max_tokens": DEFAULT_NUM_PREDICT, "temperature": 0.3},
+            )
 
-    if field == "KEYWORDS":
-        return extract_metadata_keywords(raw)
+            if field == "KEYWORDS":
+                return extract_metadata_keywords(raw)
 
-    return extract_metadata_text(raw)
+            return extract_metadata_text(raw)
+        except Exception as e:
+            last_error = e
+            if attempt < METADATA_MAX_ATTEMPTS:
+                logger.warning("[Improver] metadata field=%s attempt %d failed: %s", field, attempt, e)
+            else:
+                raise
 
-
-def _is_hosted_pdf(doc: Dict[str, Any]) -> bool:
-    return (
-        bool(doc.get("ko_is_hosted"))
-        and isinstance(doc.get("ko_file_id"), str)
-        and bool(doc.get("ko_file_id", "").strip())
-        and (str(doc.get("ko_object_mimetype") or "").strip().lower() == "application/pdf")
-    )
-
-
-def _summarise_hosted_pdf(doc: Dict[str, Any]) -> Optional[str]:
-    if not vision_enabled():
-        return None
-    pdf_url = str(doc.get("ko_file_id") or "").strip()
-    if not pdf_url:
-        return None
-    logger.info("[ImproverPdfSummary] id=%s target=%s", doc.get("_orig_id") or doc.get("_id"), pdf_url)
-    text = describe_visual_url(pdf_url, source_page_url=pdf_url)
-    if not isinstance(text, str) or not text.strip():
-        return None
-    return text.strip()
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"Metadata generation failed for field={field}")
 
 
 def improve_doc_in_place(doc: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
@@ -152,22 +180,51 @@ def improve_doc_in_place(doc: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
 
         # --- summary ---
         summary_field = "ko_content_flat_summarised"
+        summary_stats_field = "ko_content_flat_summarised_stats"
         summary = doc.get(summary_field)
+        summary_flag = int(doc.get("ko_content_is_summary") or 0) == 1
+        vision_summary = doc.get("ko_content_flat_vision")
 
         if not (isinstance(summary, str) and summary.strip()):
-            if _is_hosted_pdf(doc):
-                pdf_summary = _summarise_hosted_pdf(doc)
-                if isinstance(pdf_summary, str) and pdf_summary.strip():
-                    doc[summary_field] = pdf_summary
-                elif not should_summarise_text(content):
-                    doc[summary_field] = content
-                else:
-                    doc[summary_field] = _summarise_text(model, content)
-            # If it is too short, just copy content
+            if summary_flag and isinstance(vision_summary, str) and vision_summary.strip():
+                polished_payload = _polish_summary_text(model, vision_summary)
+                doc[summary_field] = polished_payload["summary"]
+                doc[summary_stats_field] = _summary_stats(
+                    vision_summary,
+                    polished_payload,
+                    mode="light_polish_from_vision_summary",
+                )
             elif not should_summarise_text(content):
                 doc[summary_field] = content
+                doc[summary_stats_field] = _summary_stats(
+                    content,
+                    {
+                        "summary": content,
+                        "coverage_score": 1.0,
+                        "density_score": 1.0,
+                        "compression_judgement": "low",
+                        "faithfulness_confidence": 1.0,
+                        "notes": "Summary skipped because content was already short.",
+                    },
+                    mode="copied_short_content",
+                )
             else:
-                doc[summary_field] = _summarise_text(model, content)
+                summary_payload = _summarise_text(model, content)
+                doc[summary_field] = summary_payload["summary"]
+                doc[summary_stats_field] = _summary_stats(content, summary_payload, mode="llm")
+        elif not isinstance(doc.get(summary_stats_field), dict):
+            doc[summary_stats_field] = _summary_stats(
+                content,
+                {
+                    "summary": summary,
+                    "coverage_score": None,
+                    "density_score": None,
+                    "compression_judgement": None,
+                    "faithfulness_confidence": None,
+                    "notes": "Summary stats reconstructed from existing summary.",
+                },
+                mode="reconstructed",
+            )
 
         summary_text = doc.get(summary_field)
         summary_text = summary_text if isinstance(summary_text, str) else ""

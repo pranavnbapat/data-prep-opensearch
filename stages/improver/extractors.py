@@ -22,13 +22,37 @@ def _strip_fences(raw: str) -> str:
     return s
 
 
-def _extract_summary_from_dict(obj: Any) -> Dict[str, Any]:
+def _to_unit_float(v: Any) -> float | None:
+    try:
+        x = float(v)
+    except Exception:
+        return None
+    if x < 0.0:
+        x = 0.0
+    if x > 1.0:
+        x = 1.0
+    return round(x, 3)
+
+
+def _normalize_summary_payload(obj: Any) -> Dict[str, Any]:
     if not isinstance(obj, dict) or "summary" not in obj:
         raise ValueError("Summary output must contain a summary field")
     summary = obj.get("summary")
     if not isinstance(summary, str) or not summary.strip():
         raise ValueError("Empty summary")
-    return {"summary": summary.strip()}
+    notes = obj.get("notes")
+    if not isinstance(notes, str) or not notes.strip():
+        notes = None
+    return {
+        "summary": summary.strip(),
+        "coverage_score": _to_unit_float(obj.get("coverage_score")),
+        "density_score": _to_unit_float(obj.get("density_score")),
+        "compression_judgement": (
+            str(obj.get("compression_judgement")).strip() if obj.get("compression_judgement") is not None else None
+        ),
+        "faithfulness_confidence": _to_unit_float(obj.get("faithfulness_confidence")),
+        "notes": notes.strip() if isinstance(notes, str) and notes.strip() else None,
+    }
 
 
 def extract_summary_json(raw: str) -> Dict[str, Any]:
@@ -36,7 +60,7 @@ def extract_summary_json(raw: str) -> Dict[str, Any]:
 
     # Best case: valid JSON object.
     try:
-        return _extract_summary_from_dict(json.loads(s))
+        return _normalize_summary_payload(json.loads(s))
     except Exception:
         pass
 
@@ -45,7 +69,7 @@ def extract_summary_json(raw: str) -> Dict[str, Any]:
     end = s.rfind("}")
     if start != -1 and end != -1 and end > start:
         try:
-            return _extract_summary_from_dict(json.loads(s[start:end + 1]))
+            return _normalize_summary_payload(json.loads(s[start:end + 1]))
         except Exception:
             pass
 
@@ -76,7 +100,14 @@ def extract_summary_json(raw: str) -> Dict[str, Any]:
             except Exception:
                 pass
             if isinstance(candidate, str) and candidate.strip():
-                return {"summary": candidate.strip()}
+                return {
+                    "summary": candidate.strip(),
+                    "coverage_score": None,
+                    "density_score": None,
+                    "compression_judgement": None,
+                    "faithfulness_confidence": None,
+                    "notes": "Recovered from malformed JSON output.",
+                }
 
     # Last resort: treat the raw output as plain summary text.
     plain = s.strip()
@@ -84,7 +115,14 @@ def extract_summary_json(raw: str) -> Dict[str, Any]:
         plain = plain[1:-1].strip()
     plain = _SUMMARY_FIELD_RE.sub("", plain).strip(" \n\r\t:,'\"")
     if plain:
-        return {"summary": plain}
+        return {
+            "summary": plain,
+            "coverage_score": None,
+            "density_score": None,
+            "compression_judgement": None,
+            "faithfulness_confidence": None,
+            "notes": "Used plain-text fallback parser.",
+        }
     raise ValueError("Empty summary")
 
 

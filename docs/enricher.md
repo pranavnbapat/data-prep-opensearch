@@ -2,7 +2,7 @@
 
 ## Purpose
 
-The enricher fills `ko_content_flat` for documents that require external extraction or transcription. It works on the latest downloader snapshot and may reuse prior enrichment results when the enrichment inputs are unchanged.
+The enricher fills content fields for documents that require external extraction or transcription. It works on the latest downloader snapshot and may reuse prior enrichment results when the enrichment inputs are unchanged.
 
 ## High-Level Flow
 
@@ -157,6 +157,7 @@ After `enrich_via` is set, the enricher filters candidates:
   - missing host
   - bad TLD
   - homepage / bare domain
+  - low-value GitHub dashboard/project pages
 - optionally probe target URL first:
   - `custom_transcribe` probes by default
   - `pagesense` probing is optional and off by default
@@ -255,13 +256,17 @@ Current vision rendering behavior:
 - PDF URL:
   - download PDF
   - count pages with `pdfinfo`
+  - if page count is greater than `EUF_VISION_PDF_MAX_PAGES`:
+    - skip PDF vision processing
+    - preserve existing upstream `ko_content_flat` if it already contains usable content
   - if page count is `<= EUF_VISION_PDF_MAP_REDUCE_THRESHOLD`:
     - render page 1 to PNG with `pdftoppm`
     - send PNG as data URL
   - if page count is greater than the threshold:
     - render pages one by one
-    - process them in chunks of `EUF_VISION_PDF_CHUNK_PAGES`
-    - join chunk outputs into one final text
+    - process them in non-overlapping chunks of `EUF_VISION_PDF_CHUNK_PAGES`
+    - reduce page outputs into one chunk summary
+    - reduce chunk summaries again into one final PDF summary
 - SVG image:
   - download SVG
   - rasterize with ImageMagick `convert`
@@ -274,6 +279,8 @@ Current vision request behavior:
 - `429` and `5xx` responses are retried with bounded backoff using:
   - `EUF_VISION_RETRIES`
   - `EUF_VISION_RETRY_BASE_SEC`
+- PDF reduce fan-in is bounded with:
+  - `EUF_VISION_REDUCE_PARTS_PER_PASS`
 - this reduces collisions from data-prep itself, but cannot fully prevent `429` if the same vision backend is shared with another service at the same time
 
 ## Success Patching
@@ -281,10 +288,23 @@ Current vision request behavior:
 On successful enrichment, the stage patches:
 
 - `ko_content_flat`
+- `ko_content_flat_vision` for PDF VLM summaries
+- `ko_content_is_summary = 1` when the VLM output is already a document summary
 - `ko_content_source`
 - `ko_content_url`
 - `enriched = 1`
 - `_enrich_inputs_fp` is recomputed
+
+Current PDF policy:
+
+- keep upstream `ko_content_flat` unchanged
+- if hosted PDF page count is `<= EUF_VISION_PDF_MAX_PAGES`:
+  - run PDF vision map-reduce
+  - store the VLM result in `ko_content_flat_vision`
+  - set `ko_content_is_summary = 1`
+- if hosted PDF page count is above the cap:
+  - do not run PDF map-reduce
+  - preserve upstream `ko_content_flat` if it is usable
 
 ## Output Files
 
@@ -292,6 +312,12 @@ The enricher writes:
 
 - `final_enriched_<run_id>.json`
 - `latest_enriched.json`
+
+Checkpointing:
+
+- `latest_enriched.json` is updated after each enricher record, not only at full stage completion.
+- The same `final_enriched_<run_id>.json` path is rewritten atomically during the run and finalized again when the stage completes.
+- This allows reruns after cancellation to reuse the latest persisted enrichment work.
 
 If there are no patched docs and no counted carry-forward copies, it may keep the previous enriched file as-is.
 After the recent fix, carried-forward enrichments are counted correctly.

@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Any, Callable, Dict, Optional
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional
 
 try:
     from dotenv import load_dotenv
@@ -27,6 +28,8 @@ def run_enricher_stage(
     extractor_workers: int,
     transcribe_workers: int,
     max_chars: Optional[int],
+    input_path: Optional[str] = None,
+    input_docs: Optional[List[Dict[str, Any]]] = None,
     use_lock: bool = True,
     should_cancel: Optional[Callable[[], bool]] = None,
 ) -> Dict[str, Any]:
@@ -35,9 +38,32 @@ def run_enricher_stage(
         lock = acquire_job_lock(env_mode=env_mode, output_root=output_root, entrypoint="enricher")
 
     try:
-        in_path, docs = load_latest_downloader_output(env_mode, output_root)
+        if isinstance(input_docs, list):
+            docs = input_docs
+            in_path = Path(input_path) if input_path else None
+        else:
+            in_path, docs = load_latest_downloader_output(env_mode, output_root)
         prev_path, prev_docs = load_latest_enricher_output(env_mode, output_root)
         prev_index = index_docs_by_llid(prev_docs)
+        run_id = run_stamp()
+        out_dir = output_dir(env_mode, root=output_root)
+        out_path = out_dir / f"final_enriched_{run_id}.json"
+
+        def write_checkpoint(stats: Dict[str, Any], *, complete: bool) -> None:
+            payload = {
+                "meta": {
+                    "env_mode": env_mode.upper(),
+                    "run_id": run_id,
+                    "created_from": (str(in_path) if in_path else None),
+                    "created_from_prev_enriched": (str(prev_path) if prev_path else None),
+                    "stage": "enricher",
+                    "checkpoint_complete": complete,
+                },
+                "stats": stats,
+                "docs": docs,
+            }
+            atomic_write_json(out_path, payload)
+            update_latest_pointer(env_mode, output_root, "latest_enriched.json", out_path)
 
         stats = enrich_docs_via_routes(
             docs,
@@ -45,6 +71,7 @@ def run_enricher_stage(
             extractor_workers=extractor_workers,
             transcribe_workers=transcribe_workers,
             max_chars=max_chars,
+            checkpoint_cb=lambda current_stats: write_checkpoint(current_stats, complete=False),
             should_cancel=should_cancel,
         )
 
@@ -52,27 +79,11 @@ def run_enricher_stage(
         carried = int(stats.get("carry_forward_copied") or 0)
         if patched == 0 and carried == 0 and prev_path is not None:
             logger.warning("[EnricherStage] no_changes; keeping_prev=%s", str(prev_path))
-            return {"in": str(in_path), "out": str(prev_path), "stats": stats, "no_changes": True}
+            return {"in": (str(in_path) if in_path else None), "out": str(prev_path), "stats": stats, "no_changes": True}
 
-        run_id = run_stamp()
-        out_dir = output_dir(env_mode, root=output_root)
-        out_path = out_dir / f"final_enriched_{run_id}.json"
-        payload = {
-            "meta": {
-                "env_mode": env_mode.upper(),
-                "run_id": run_id,
-                "created_from": str(in_path),
-                "created_from_prev_enriched": (str(prev_path) if prev_path else None),
-                "stage": "enricher",
-            },
-            "stats": stats,
-            "docs": docs,
-        }
-
-        atomic_write_json(out_path, payload)
-        update_latest_pointer(env_mode, output_root, "latest_enriched.json", out_path)
+        write_checkpoint(stats, complete=True)
         logger.warning("[EnricherStage] in=%s out=%s", str(in_path), str(out_path))
-        return {"in": str(in_path), "out": str(out_path), "stats": stats}
+        return {"in": (str(in_path) if in_path else None), "out": str(out_path), "stats": stats}
 
     finally:
         if lock is not None:

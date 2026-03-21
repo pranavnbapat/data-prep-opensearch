@@ -56,6 +56,7 @@ def run_improver_stage(
     input_docs: Optional[List[Dict[str, Any]]] = None,
     use_lock: bool = True,
     should_cancel: Optional[Callable[[], bool]] = None,
+    processed_callback: Optional[Callable[[Dict[str, Any], Dict[str, Any]], None]] = None,
 ) -> Optional[Dict[str, Any]]:
     lock = None
     if use_lock:
@@ -81,6 +82,9 @@ def run_improver_stage(
 
         prev_path, prev_docs = load_latest_improver_output(env_mode, output_root)
         prev_index = _index_docs_by_llid(prev_docs)
+        run_id = run_stamp()
+        out_dir = output_dir(env_mode, root=output_root)
+        out_path = out_dir / f"final_improved_{run_id}.json"
 
         total = len(docs)
         if isinstance(max_docs, int) and max_docs > 0:
@@ -96,6 +100,45 @@ def run_improver_stage(
 
         t0 = time.perf_counter()
 
+        def current_stats() -> Dict[str, Any]:
+            elapsed = time.perf_counter() - t0
+            return {
+                "total_docs_in_input": total,
+                "docs_processed": len(docs),
+                "attempted": attempted,
+                "improved": improved,
+                "failed": failed,
+                "skipped_prev_done": skipped_prev_done,
+                "carry_forward_copied": carry_forward_copied,
+                "failure_reasons": failure_reasons,
+                "elapsed_sec": round(elapsed, 2),
+            }
+
+        def write_checkpoint(*, complete: bool) -> None:
+            payload = {
+                "meta": {
+                    "env_mode": env_mode.upper(),
+                    "run_id": run_id,
+                    "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "created_from": (str(in_path) if in_path else None),
+                    "created_from_prev_improved": (str(prev_path) if prev_path else None),
+                    "stage": "improver",
+                    "checkpoint_complete": complete,
+                },
+                "stats": current_stats(),
+                "docs": docs,
+            }
+            atomic_write_json(out_path, payload)
+            update_latest_pointer(env_mode, output_root, "latest_improved.json", out_path)
+
+        def persist_processed_doc(doc: Dict[str, Any]) -> None:
+            if processed_callback is None:
+                return
+            try:
+                processed_callback(doc, current_stats())
+            except Exception:
+                logger.exception("[ImproverStage] processed_callback failed")
+
         for i, d in enumerate(docs, start=1):
             if should_cancel and should_cancel():
                 raise JobCancelled("Job canceled during improver execution")
@@ -103,6 +146,7 @@ def run_improver_stage(
             if not isinstance(llid, str) or not llid:
                 failed += 1
                 failure_reasons["missing_llid"] = failure_reasons.get("missing_llid", 0) + 1
+                write_checkpoint(complete=False)
                 continue
 
             prev = prev_index.get(llid)
@@ -117,6 +161,8 @@ def run_improver_stage(
             # Now decide whether to skip
             if should_skip_improve(d, prev):
                 skipped_prev_done += 1
+                write_checkpoint(complete=False)
+                persist_processed_doc(d)
                 continue
 
             title = d.get("title") or ""
@@ -143,48 +189,21 @@ def run_improver_stage(
                 tag = classify_failure(reason)
                 failure_reasons[tag] = failure_reasons.get(tag, 0) + 1
 
+            write_checkpoint(complete=False)
+            persist_processed_doc(d)
+
             # Throttle between documents to avoid overloading vLLM / proxy
             if DOC_DELAY_SEC > 0:
                 time.sleep(DOC_DELAY_SEC)
 
-        elapsed = time.perf_counter() - t0
-
-        stats: Dict[str, Any] = {
-            "total_docs_in_input": total,
-            "docs_processed": len(docs),
-            "attempted": attempted,
-            "improved": improved,
-            "failed": failed,
-            "skipped_prev_done": skipped_prev_done,
-            "carry_forward_copied": carry_forward_copied,
-            "failure_reasons": failure_reasons,
-            "elapsed_sec": round(elapsed, 2),
-        }
+        stats: Dict[str, Any] = current_stats()
 
         # If nothing changed and we have a previous snapshot, don't create a new file
         if improved == 0 and carry_forward_copied == 0 and prev_path is not None:
             logger.warning("[ImproverStage] no_changes; keeping_prev=%s", str(prev_path))
             return {"in": str(in_path), "out": str(prev_path), "stats": stats, "no_changes": True}
 
-        run_id = run_stamp()
-        out_dir = output_dir(env_mode, root=output_root)
-        out_path = out_dir / f"final_improved_{run_id}.json"
-
-        payload = {
-            "meta": {
-                "env_mode": env_mode.upper(),
-                "run_id": run_id,
-                "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                "created_from": (str(in_path) if in_path else None),
-                "created_from_prev_improved": (str(prev_path) if prev_path else None),
-                "stage": "improver",
-            },
-            "stats": stats,
-            "docs": docs,
-        }
-
-        atomic_write_json(out_path, payload)
-        update_latest_pointer(env_mode, output_root, "latest_improved.json", out_path)
+        write_checkpoint(complete=True)
 
         logger.warning("[ImproverStage] in=%s out=%s stats=%s", str(in_path), str(out_path), stats)
         return {"in": str(in_path), "out": str(out_path), "stats": stats}

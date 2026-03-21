@@ -38,6 +38,13 @@ VISION_PROMPT = (
     "Return plain text only."
 )
 
+VISION_REDUCE_PROMPT = (
+    "You are combining summaries from a multi-page agricultural document. "
+    "Produce one factual, coherent plain-text summary that preserves important entities, numbers, "
+    "procedures, recommendations, and context. Avoid repetition and unsupported claims. "
+    "Return plain text only."
+)
+
 
 def vision_enabled() -> bool:
     return bool(
@@ -45,6 +52,16 @@ def vision_enabled() -> bool:
         and (os.getenv("EUF_VISION_MODEL") or "").strip()
         and (os.getenv("EUF_VISION_API_KEY") or "").strip()
     )
+
+
+def _vision_chat_url() -> str:
+    raw = (os.getenv("EUF_VISION_URL") or "").strip()
+    if not raw:
+        return ""
+    normalized = raw.rstrip("/")
+    if normalized.endswith("/v1/chat/completions"):
+        return normalized
+    return f"{normalized}/v1/chat/completions"
 
 
 def probe_content_type(url: str, *, timeout: int = 10) -> Tuple[Optional[str], Optional[str]]:
@@ -199,26 +216,10 @@ def _join_chunk_texts(chunks: list[str]) -> str:
     return "\n\n".join(cleaned).strip()
 
 
-def _describe_visual_payload(resolved_target: str, *, target_url: str, source_page_url: Optional[str], timeout: float) -> Optional[str]:
+def _call_vision_chat(payload: dict[str, Any], *, target_url: str, source_page_url: Optional[str], timeout: float) -> Optional[str]:
     base_url = (os.getenv("EUF_VISION_URL") or "").rstrip("/")
-    model = (os.getenv("EUF_VISION_MODEL") or "").strip()
     api_key = (os.getenv("EUF_VISION_API_KEY") or "").strip()
-    url = f"{base_url}/v1/chat/completions"
-
-    payload: dict[str, Any] = {
-        "model": model,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": VISION_PROMPT},
-                    {"type": "image_url", "image_url": {"url": resolved_target}},
-                ],
-            }
-        ],
-        "temperature": 0.1,
-        "max_tokens": int(os.getenv("EUF_VISION_MAX_TOKENS", "900")),
-    }
+    url = _vision_chat_url()
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -280,6 +281,71 @@ def _describe_visual_payload(resolved_target: str, *, target_url: str, source_pa
     return None
 
 
+def _describe_visual_payload(resolved_target: str, *, target_url: str, source_page_url: Optional[str], timeout: float) -> Optional[str]:
+    model = (os.getenv("EUF_VISION_MODEL") or "").strip()
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": VISION_PROMPT},
+                    {"type": "image_url", "image_url": {"url": resolved_target}},
+                ],
+            }
+        ],
+        "temperature": 0.1,
+        "max_tokens": int(os.getenv("EUF_VISION_MAX_TOKENS", "900")),
+    }
+    return _call_vision_chat(payload, target_url=target_url, source_page_url=source_page_url, timeout=timeout)
+
+
+def _reduce_text_parts(parts: list[str], *, target_url: str, timeout: float) -> Optional[str]:
+    cleaned = [(part or "").strip() for part in parts if (part or "").strip()]
+    if not cleaned:
+        return None
+
+    model = (os.getenv("EUF_VISION_MODEL") or "").strip()
+    parts_per_pass = max(2, int(os.getenv("EUF_VISION_REDUCE_PARTS_PER_PASS", "8")))
+    current = cleaned
+    pass_no = 1
+
+    while len(current) > 1:
+        logger.info("[VisionReduce] target=%s pass=%s parts=%s parts_per_pass=%s", target_url, pass_no, len(current), parts_per_pass)
+        nxt: list[str] = []
+        for start in range(0, len(current), parts_per_pass):
+            batch = current[start:start + parts_per_pass]
+            if len(batch) == 1:
+                nxt.append(batch[0])
+                continue
+            content = "\n\n".join(f"[PART {i + 1}]\n{part}" for i, part in enumerate(batch))
+            payload: dict[str, Any] = {
+                "model": model,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": VISION_REDUCE_PROMPT + "\n\nChunk summaries:\n\n" + content,
+                    }
+                ],
+                "temperature": 0.1,
+                "max_tokens": int(os.getenv("EUF_VISION_MAX_TOKENS", "900")),
+            }
+            reduced = _call_vision_chat(
+                payload,
+                target_url=target_url,
+                source_page_url=f"{target_url}#reduce_pass={pass_no}",
+                timeout=timeout,
+            )
+            if reduced:
+                nxt.append(reduced.strip())
+        if not nxt:
+            return _join_chunk_texts(current)
+        current = nxt
+        pass_no += 1
+
+    return current[0].strip() if current else None
+
+
 def _fetch_binary_target(target_url: str, *, timeout: int) -> Tuple[Optional[bytes], Optional[str]]:
     if target_url.startswith("data:"):
         return _load_data_url_bytes(target_url)
@@ -337,33 +403,44 @@ def extract_visual_target_url(url: str, *, timeout: int = 12) -> Tuple[Optional[
 
 
 def describe_visual_url(target_url: str, *, source_page_url: Optional[str] = None) -> Optional[str]:
+    text, _ = describe_visual_url_detailed(target_url, source_page_url=source_page_url)
+    return text
+
+
+def describe_visual_url_detailed(target_url: str, *, source_page_url: Optional[str] = None) -> Tuple[Optional[str], str]:
     base_url = (os.getenv("EUF_VISION_URL") or "").rstrip("/")
     model = (os.getenv("EUF_VISION_MODEL") or "").strip()
     api_key = (os.getenv("EUF_VISION_API_KEY") or "").strip()
     timeout = float(os.getenv("EUF_VISION_TIMEOUT", "90"))
     if not (base_url and model and api_key):
         logger.info("[VisionSkip] missing vision configuration")
-        return None
+        return None, "vision_not_configured"
 
     resolved_target = target_url
     target_content_type = probe_content_type(target_url, timeout=10)[0]
     if target_url.lower().endswith(".pdf") or target_content_type == "application/pdf":
         pdf_bytes = _download_pdf_bytes(target_url, timeout=int(timeout))
         if pdf_bytes is None:
-            return None
+            return None, "pdf_fetch_failed"
         page_count = _pdf_page_count(pdf_bytes, timeout=int(timeout)) or 1
         map_reduce_threshold = max(1, int(os.getenv("EUF_VISION_PDF_MAP_REDUCE_THRESHOLD", "3")))
         chunk_size = max(1, int(os.getenv("EUF_VISION_PDF_CHUNK_PAGES", "3")))
+        max_pages = max(1, int(os.getenv("EUF_VISION_PDF_MAX_PAGES", "80")))
+
+        if page_count > max_pages:
+            logger.warning("[VisionPdfSkip] target=%s page_count=%s max_pages=%s", target_url, page_count, max_pages)
+            return None, "pdf_too_many_pages"
 
         if page_count > map_reduce_threshold:
             logger.info(
-                "[VisionPdfMapReduce] target=%s page_count=%s chunk_pages=%s threshold=%s",
+                "[VisionPdfMapReduce] target=%s page_count=%s chunk_pages=%s threshold=%s max_pages=%s",
                 target_url,
                 page_count,
                 chunk_size,
                 map_reduce_threshold,
+                max_pages,
             )
-            chunk_texts: list[str] = []
+            chunk_summaries: list[str] = []
             for start in range(1, page_count + 1, chunk_size):
                 end = min(start + chunk_size - 1, page_count)
                 page_texts: list[str] = []
@@ -380,28 +457,37 @@ def describe_visual_url(target_url: str, *, source_page_url: Optional[str] = Non
                     if text:
                         page_texts.append(text)
                 if page_texts:
-                    chunk_texts.append(_join_chunk_texts(page_texts))
+                    chunk_summary = _reduce_text_parts(
+                        page_texts,
+                        target_url=f"{target_url}#pages={start}-{end}",
+                        timeout=timeout,
+                    )
+                    if chunk_summary:
+                        chunk_summaries.append(chunk_summary)
 
-            combined = _join_chunk_texts(chunk_texts)
+            combined = _reduce_text_parts(chunk_summaries, target_url=target_url, timeout=timeout)
             if combined:
-                return combined
-            return None
+                return combined, "vision_pdf_map_reduce"
+            return None, "vision_pdf_map_reduce_failed"
 
         rendered = _render_pdf_page_data_url(pdf_bytes, page_num=1, timeout=int(timeout))
         if not rendered:
-            return None
+            return None, "pdf_render_failed"
         resolved_target = rendered
     elif target_content_type == "image/svg+xml":
         raw, _ = _fetch_binary_target(target_url, timeout=int(timeout))
         if not raw:
-            return None
+            return None, "svg_fetch_failed"
         rendered = _render_svg_bytes_to_png_data_url(raw, timeout=int(timeout))
         if not rendered:
-            return None
+            return None, "svg_render_failed"
         resolved_target = rendered
-    return _describe_visual_payload(
+    text = _describe_visual_payload(
         resolved_target,
         target_url=target_url,
         source_page_url=source_page_url,
         timeout=timeout,
     )
+    if text:
+        return text, "vision"
+    return None, "vision_failed"

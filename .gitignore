@@ -13,6 +13,11 @@ logs/
 .vscode/
 .idea/
 *.iml
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
 
 # Environments
 .venv/
@@ -35,9 +40,7 @@ Thumbs.db
 output/
 testing/
 mysql_data/
+runpod_vllm_config/
 *.tmp
 *.bak
 *.swp
-*.csv*
-*.json
-*.jsonl

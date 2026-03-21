@@ -12,13 +12,25 @@ You will be given extracted text content in any language. Your task is to produc
 STRICT OUTPUT (MANDATORY):
 Return ONLY a single JSON object. No extra text, no preamble, no markdown, no comments.
 The JSON MUST have exactly these keys and nothing else:
-{"summary": "<summary>"}
+{
+  "summary": "<summary>",
+  "coverage_score": 0.0,
+  "density_score": 0.0,
+  "compression_judgement": "low|moderate|high",
+  "faithfulness_confidence": 0.0,
+  "notes": "<short warning or empty string>"
+}
 
 ROBUSTNESS (MANDATORY):
 - Ignore unreadable, duplicated, boilerplate or corrupted fragments; do not speculate about missing parts.
 - If the source is not in English, translate into British English while keeping original names of projects, programmes, organisations, datasets, and tools.
 - Do not include instructions, chain-of-thought, or explanations—only the final summary.
 - The value of "summary" must be valid JSON string content (escape quotes and newlines correctly).
+- `coverage_score` must be a number between 0 and 1 estimating how much important source content was preserved.
+- `density_score` must be a number between 0 and 1 estimating how dense / information-packed the summary is without becoming a raw dump.
+- `compression_judgement` must be one of: `low`, `moderate`, `high`.
+- `faithfulness_confidence` must be a number between 0 and 1 estimating how well the summary is supported by the source.
+- `notes` should be short and mention any uncertainty, corruption, or missing context; otherwise use an empty string.
 
 STYLE:
 - British English only.
@@ -155,7 +167,14 @@ ROBUSTNESS:
 STRICT OUTPUT (MANDATORY):
 Return ONLY a single JSON object. No extra text, no preamble, no markdown, no comments.
 The JSON MUST have exactly these keys and nothing else:
-{"summary":"<combined summary>"}
+{
+  "summary":"<combined summary>",
+  "coverage_score": 0.0,
+  "density_score": 0.0,
+  "compression_judgement": "low|moderate|high",
+  "faithfulness_confidence": 0.0,
+  "notes": "<short warning or empty string>"
+}
 """.strip()
 
 CHUNK_SUMMARY_PROMPT = """
@@ -181,3 +200,34 @@ ROBUSTNESS:
 - Output must be valid JSON. Escape any internal double quotes in the summary value.
 """.strip()
 
+
+POLISH_PROMPT = """
+You will be given text that is already a document summary.
+
+Your task is to lightly polish it for readability and retrieval quality without changing its meaning.
+
+STRICT OUTPUT (MANDATORY):
+Return ONLY a single JSON object. No extra text, no preamble, no markdown, no comments.
+The JSON MUST have exactly these keys and nothing else:
+{
+  "summary": "<polished summary>",
+  "coverage_score": 0.0,
+  "density_score": 0.0,
+  "compression_judgement": "low|moderate|high",
+  "faithfulness_confidence": 0.0,
+  "notes": "<short warning or empty string>"
+}
+
+RULES:
+- Do NOT re-summarise aggressively.
+- Do NOT shorten materially.
+- Do NOT remove important facts, entities, numbers, dates, locations, methods, or conclusions.
+- Do improve:
+  - grammar
+  - punctuation
+  - readability
+  - duplicated phrases
+  - awkward OCR-style joins
+- Keep the text factual and faithful.
+- British English only.
+""".strip()

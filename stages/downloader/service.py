@@ -28,6 +28,7 @@ def download_and_prepare(
     sort_criteria: int = 1,
     max_workers: int = 10,
     prev_index: Optional[Dict[str, Dict[str, Any]]] = None,
+    page_callback: Optional[Callable[[List[Dict[str, Any]], Dict[str, Any]], None]] = None,
     use_lock: bool = True,
     should_cancel: Optional[Callable[[], bool]] = None,
 ) -> DownloadResult:
@@ -39,6 +40,9 @@ def download_and_prepare(
     try:
         backend_cfg = load_backend_cfg(env_mode)
         run_id = run_stamp()
+        should_write_output = os.getenv("DL_WRITE_OUTPUT", "1").strip().lower() in {"1", "true", "yes", "y", "on"}
+        out_dir = output_dir(env_mode, root=output_root)
+        out_path = out_dir / f"final_output_{run_id}.json"
         page = 1
         pages_seen = set()
         emitted_total = 0
@@ -52,6 +56,42 @@ def download_and_prepare(
         docs_all: List[Dict[str, Any]] = []
         t0 = time.perf_counter()
         source_seen_total = 0
+
+        def write_checkpoint(*, complete: bool) -> None:
+            if not should_write_output:
+                return
+            elapsed = time.perf_counter() - t0
+            removed_from_source = 0
+            if prev_index:
+                prev_ids = set(prev_index.keys())
+                current_ids = set(source_seen_ids_all)
+                removed_from_source = len(prev_ids - current_ids)
+            stats = {
+                "env_mode": env_mode.upper(),
+                "source_seen": source_seen_total,
+                "emitted": emitted_total,
+                "dropped": dropped_total,
+                "changed": new_total + updated_total,
+                "new_added": new_total,
+                "updated": updated_total,
+                "unchanged_reused": unchanged_total,
+                "removed_from_source": removed_from_source,
+                "elapsed_sec": round(elapsed, 2),
+            }
+            payload = {
+                "meta": {
+                    "env_mode": env_mode.upper(),
+                    "run_id": run_id,
+                    "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "stage": "downloader",
+                    "checkpoint_complete": complete,
+                    "checkpoint_page": page,
+                },
+                "stats": stats,
+                "docs": docs_all,
+            }
+            atomic_write_json(out_path, payload)
+            update_latest_pointer(env_mode, output_root, "latest_downloaded.json", out_path)
 
         logging.info(
             "[DownloaderStart] env=%s page_size=%s workers=%s sort=%s backend=%s prev_docs=%s",
@@ -106,6 +146,7 @@ def download_and_prepare(
             next_page = pagination.get("next_page")
             logging.info("[KO API] env=%s Page=%s fetched=%s next=%r", env_mode, page, len(kos_page), next_page)
 
+            t_process = time.perf_counter()
             docs_p, emitted_p, dropped_p, drop_reasons, dropped_items, unchanged_p, changed_ids_p, emitted_ids_p, new_p, updated_p = process_page(
                 backend_cfg,
                 kos_page,
@@ -114,9 +155,48 @@ def download_and_prepare(
             )
             if should_cancel and should_cancel():
                 raise JobCancelled("Job canceled during downloader page processing")
+            dt_process = time.perf_counter() - t_process
+            dt_page = time.perf_counter() - t_page
 
-            logging.info("[PageDone] env=%s Page=%s Emitted=%s Dropped=%s dt=%.2fs",
-                         env_mode, page, emitted_p, dropped_p, time.perf_counter() - t_page)
+            logging.info(
+                "[PageDone] env=%s page=%s fetched=%s emitted=%s dropped=%s unchanged=%s new=%s updated=%s fetch_dt=%.2fs process_dt=%.2fs page_dt=%.2fs",
+                env_mode,
+                page,
+                len(kos_page),
+                emitted_p,
+                dropped_p,
+                unchanged_p,
+                new_p,
+                updated_p,
+                dt_fetch,
+                dt_process,
+                dt_page,
+            )
+
+            process_warn_thr = float(os.getenv("PAGE_PROCESS_WARN_SEC", "10.0"))
+            if dt_process > process_warn_thr:
+                logging.warning(
+                    "[PageProcessSlow] env=%s page=%s process_dt=%.2fs thr=%.2fs fetched=%s emitted=%s dropped=%s",
+                    env_mode,
+                    page,
+                    dt_process,
+                    process_warn_thr,
+                    len(kos_page),
+                    emitted_p,
+                    dropped_p,
+                )
+
+            page_warn_thr = float(os.getenv("PAGE_TOTAL_WARN_SEC", "15.0"))
+            if dt_page > page_warn_thr:
+                logging.warning(
+                    "[PageTotalSlow] env=%s page=%s page_dt=%.2fs thr=%.2fs fetch_dt=%.2fs process_dt=%.2fs",
+                    env_mode,
+                    page,
+                    dt_page,
+                    page_warn_thr,
+                    dt_fetch,
+                    dt_process,
+                )
 
             if drop_reasons:
                 logging.info("[PageDrops] env=%s Page=%s Reasons=%s", env_mode, page, drop_reasons)
@@ -169,6 +249,23 @@ def download_and_prepare(
                 dropped_total,
             )
 
+            if page_callback is not None:
+                page_stats = {
+                    "page": page,
+                    "fetched": len(kos_page),
+                    "emitted": emitted_p,
+                    "dropped": dropped_p,
+                    "unchanged": unchanged_p,
+                    "new": new_p,
+                    "updated": updated_p,
+                    "source_seen_total": source_seen_total,
+                    "emitted_total": emitted_total,
+                    "dropped_total": dropped_total,
+                }
+                page_callback(docs_p, page_stats)
+
+            write_checkpoint(complete=False)
+
             if not next_page:
                 break
             try:
@@ -220,28 +317,8 @@ def download_and_prepare(
             logging.warning("[DownloaderSummary] No new or updated documents. Emitted=%s Unchanged=%s Dropped=%s Removed=%s",
                             emitted_total, unchanged_total, dropped_total, removed_from_source)
 
-        should_write_output = os.getenv("DL_WRITE_OUTPUT", "1").strip().lower() in {"1", "true", "yes", "y", "on"}
-        prev_count = len(prev_index) if prev_index is not None else None
-        has_meaningful_changes = (changed_total > 0) or (prev_count is not None and len(docs_all) != prev_count)
-
-        if should_write_output and has_meaningful_changes:
-            run_id = run_stamp()
-            out_dir = output_dir(env_mode, root=output_root)
-            out_path = out_dir / f"final_output_{run_id}.json"
-            payload = {
-                "meta": {
-                    "env_mode": env_mode.upper(),
-                    "run_id": run_id,
-                    "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                    "stage": "downloader",
-                },
-                "stats": stats,
-                "docs": docs_all,
-            }
-            atomic_write_json(out_path, payload)
-            update_latest_pointer(env_mode, output_root, "latest_downloaded.json", out_path)
-        elif should_write_output and not has_meaningful_changes:
-            logging.warning("[Downloader] No changes detected (skipping writing of final_output)")
+        if should_write_output:
+            write_checkpoint(complete=True)
 
         return DownloadResult(
             docs=docs_all,

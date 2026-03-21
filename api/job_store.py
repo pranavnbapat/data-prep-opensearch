@@ -30,6 +30,10 @@ def log_file_path(job: Job) -> Path:
     return Path("output") / job.env_mode.value / job.bucket_year / job.bucket_month / "job-logs" / f"{job.id}.log"
 
 
+def run_log_path(job: Job) -> Path:
+    return Path("output") / job.env_mode.value / job.bucket_year / job.bucket_month / "logs.txt"
+
+
 def ensure_parent(fp: Path) -> None:
     fp.parent.mkdir(parents=True, exist_ok=True)
 
@@ -79,9 +83,14 @@ def load_jobs_from_disk() -> None:
             with fp.open("r", encoding="utf-8") as fh:
                 data = json.load(fh)
             job = Job.model_validate(data)
-            if job.status == JobStatus.running:
+            if job.status in {JobStatus.running, JobStatus.queued}:
+                previous = job.status
                 job.status = JobStatus.error
-                job.error = (job.error or "") + "\nServer restarted while job was running."
+                if previous == JobStatus.running:
+                    msg = "Server restarted while job was running."
+                else:
+                    msg = "Server restarted while job was still queued."
+                job.error = ((job.error or "").rstrip() + "\n" + msg).strip()
                 job.finished_at = now
             loaded[job.id] = job
         except Exception as e:
@@ -136,11 +145,19 @@ def clear_job_cancel(job_id: str) -> None:
 
 
 class PerJobLogHandler(logging.Handler):
-    def __init__(self, job_id: str, max_lines: int = 1000, persist_dir: Optional[str] = "output/job-logs"):
+    def __init__(
+        self,
+        job_id: str,
+        max_lines: int = 1000,
+        persist_dir: Optional[str] = "output/job-logs",
+        mirror_path: Optional[Path] = None,
+        mirror_mode: str = "a",
+    ):
         super().__init__()
         self.job_id = job_id
         self.buf = JOB_LOGS.setdefault(job_id, deque(maxlen=max_lines))
         self.persist_fp = None
+        self.mirror_fp = None
         if persist_dir:
             try:
                 Path(persist_dir).mkdir(parents=True, exist_ok=True)
@@ -148,6 +165,13 @@ class PerJobLogHandler(logging.Handler):
             except Exception as e:
                 self.persist_fp = None
                 logging.warning("PerJobLogHandler: file persistence disabled: %s", e)
+        if mirror_path is not None:
+            try:
+                ensure_parent(mirror_path)
+                self.mirror_fp = open(mirror_path, mirror_mode, encoding="utf-8")
+            except Exception as e:
+                self.mirror_fp = None
+                logging.warning("PerJobLogHandler: mirror file persistence disabled: %s", e)
 
     def emit(self, record: logging.LogRecord):
         msg = self.format(record)
@@ -160,10 +184,18 @@ class PerJobLogHandler(logging.Handler):
                     self.persist_fp.flush()
                 except Exception:
                     pass
+            if self.mirror_fp:
+                try:
+                    self.mirror_fp.write(line + "\n")
+                    self.mirror_fp.flush()
+                except Exception:
+                    pass
 
     def close(self):
         try:
             if self.persist_fp:
                 self.persist_fp.close()
+            if self.mirror_fp:
+                self.mirror_fp.close()
         finally:
             super().close()

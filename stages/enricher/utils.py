@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import random
+import re
 import subprocess
 import threading
 import time
@@ -573,6 +574,17 @@ def classify_url_for_enrichment(url: Any) -> Tuple[bool, str]:
     if not netloc:
         return False, "missing_host"
 
+    path = p.path or ""
+    path_l = path.lower()
+
+    if netloc == "github.com":
+        if path_l.startswith("/orgs/") and "/projects/" in path_l:
+            return False, "github_project_board"
+        if re.match(r"^/[^/]+/[^/]+/projects(?:/|$)", path_l):
+            return False, "github_project_board"
+        if path_l in {"/notifications", "/pulls", "/issues", "/settings"}:
+            return False, "github_dashboard_page"
+
     # Reject obviously broken hosts like "www.google" (no TLD)
     # Heuristic: must contain at least one dot and end segment length >= 2
     if "." not in netloc:
@@ -582,7 +594,6 @@ def classify_url_for_enrichment(url: Any) -> Tuple[bool, str]:
         return False, "host_bad_tld"
 
     # Homepage / bare domain: no real path (or "/") AND no query params
-    path = p.path or ""
     has_query = bool(p.query and p.query.strip())
     if (path == "" or path == "/") and not has_query:
         return False, "homepage_or_bare_domain"

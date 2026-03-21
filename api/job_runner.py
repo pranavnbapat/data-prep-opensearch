@@ -7,7 +7,7 @@ from datetime import datetime
 
 from common.cancellation import JobCancelled
 from api.job_store import (JOBS, JOB_LOCK, PerJobLogHandler, clear_job_cancel, get_cancel_event,
-                           log_file_path, write_job_to_disk)
+                           log_file_path, run_log_path, write_job_to_disk)
 from api.models import EnvMode, JobStatus
 from pipeline.orchestrator import run_pipeline
 
@@ -17,6 +17,13 @@ def clean_error_message(e: Exception) -> str:
     if "Traceback (most recent call last):" in txt:
         txt = txt.split("Traceback (most recent call last):", 1)[0].rstrip()
     return txt
+
+
+def _run_marker(kind: str, job_id: str, env_mode: EnvMode, page_size: int) -> str:
+    return (
+        f"================ {kind} job_id={job_id} env={env_mode.value} "
+        f"page_size={page_size} at={datetime.utcnow().isoformat()}Z ================"
+    )
 
 
 def run_pipeline_job(job_id: str, page_size: int, env_mode: EnvMode) -> None:
@@ -34,13 +41,20 @@ def run_pipeline_job(job_id: str, page_size: int, env_mode: EnvMode) -> None:
     write_job_to_disk(job)
 
     log_dir = log_file_path(job).parent
-    handler = PerJobLogHandler(job_id, persist_dir=str(log_dir))
+    monthly_log_path = run_log_path(job)
+    handler = PerJobLogHandler(
+        job_id,
+        persist_dir=str(log_dir),
+        mirror_path=monthly_log_path,
+        mirror_mode="w",
+    )
     handler.setLevel(logging.INFO)
     handler.setFormatter(logging.Formatter("%(message)s"))
     root_logger = logging.getLogger()
     root_logger.addHandler(handler)
 
     try:
+        logging.info(_run_marker("RUN_START", job_id, env_mode, page_size))
         dl_workers = int(os.getenv("DL_MAX_WORKERS", "10"))
         sort_criteria = int(os.getenv("DL_SORT_CRITERIA", "1"))
         extractor_workers = int(os.getenv("EXTRACTOR_MAX_WORKERS", "4"))
@@ -76,6 +90,7 @@ def run_pipeline_job(job_id: str, page_size: int, env_mode: EnvMode) -> None:
 
         write_job_to_disk(job)
         logging.info("Pipeline finished (final=%r report=%r latest=%r)", res.final_path, res.report_path, res.latest_path)
+        logging.info(_run_marker("RUN_END_SUCCESS", job_id, env_mode, page_size))
 
     except JobCancelled as e:
         with JOB_LOCK:
@@ -84,6 +99,7 @@ def run_pipeline_job(job_id: str, page_size: int, env_mode: EnvMode) -> None:
             job.finished_at = datetime.utcnow()
         write_job_to_disk(job)
         logging.warning("Pipeline canceled: %s", e)
+        logging.info(_run_marker("RUN_END_CANCELED", job_id, env_mode, page_size))
 
     except Exception as e:
         clean = f"{e.__class__.__name__}: {clean_error_message(e)}"
@@ -96,6 +112,7 @@ def run_pipeline_job(job_id: str, page_size: int, env_mode: EnvMode) -> None:
         write_job_to_disk(job)
         logging.error("Pipeline failed: %s", clean)
         logging.debug("Pipeline traceback:\n%s", tb)
+        logging.info(_run_marker("RUN_END_ERROR", job_id, env_mode, page_size))
 
     finally:
         root_logger.removeHandler(handler)

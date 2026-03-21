@@ -28,6 +28,8 @@ def compute_improver_fp(doc: Dict[str, Any]) -> str:
     obj = {
         "_orig_id": _stable_value(doc.get("_orig_id") or doc.get("_id")),
         "ko_content_flat": _stable_value(doc.get("ko_content_flat")),
+        "ko_content_flat_vision": _stable_value(doc.get("ko_content_flat_vision")),
+        "ko_content_is_summary": _stable_value(doc.get("ko_content_is_summary")),
         "ko_is_hosted": _stable_value(doc.get("ko_is_hosted")),
         "ko_object_mimetype": _stable_value(doc.get("ko_object_mimetype")),
         "ko_file_id": _stable_value(doc.get("ko_file_id")),
@@ -153,7 +155,7 @@ def carry_forward_previous_improvements(doc: Dict[str, Any], prev: Optional[Dict
     if int(prev.get("improved") or 0) != 1:
         return False
 
-    keys = ("ko_content_flat_summarised", "title_llm", "subtitle_llm", "description_llm", "keywords_llm")
+    keys = ("ko_content_flat_summarised", "ko_content_flat_summarised_stats", "title_llm", "subtitle_llm", "description_llm", "keywords_llm")
 
     # --- No-op short-circuit: if doc already matches prev, don't count it ---
     # We treat "already identical" as NOT a meaningful change.
