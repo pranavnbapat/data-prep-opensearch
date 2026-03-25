@@ -3,11 +3,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from api.job_store import JOBS, JOB_LOCK, clear_job_cancel, get_cancel_event, write_job_to_disk
+from api.job_store import (JOBS, JOB_LOCK, PerJobLogHandler, clear_job_cancel, get_cancel_event,
+                           log_file_path, run_log_path, write_job_to_disk)
 from api.models import EnvMode, JobStatus
 from api.mysql_store import (ensure_schema, export_docs, fetch_record, fetch_source_docs,
                              summarize_status, upsert_current_docs, upsert_processed_docs, upsert_source_docs)
@@ -60,6 +62,29 @@ def _set_job_running(job_id: str) -> None:
     write_job_to_disk(job)
 
 
+@contextmanager
+def _job_logging(job_id: str):
+    with JOB_LOCK:
+        job = JOBS[job_id]
+    log_dir = log_file_path(job).parent
+    monthly_log_path = run_log_path(job)
+    handler = PerJobLogHandler(
+        job_id,
+        persist_dir=str(log_dir),
+        mirror_path=monthly_log_path,
+        mirror_mode="a",
+    )
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    root_logger = logging.getLogger()
+    root_logger.addHandler(handler)
+    try:
+        yield
+    finally:
+        root_logger.removeHandler(handler)
+        handler.close()
+
+
 def _set_job_done(job_id: str, *, details: Dict[str, Any], latest_path: Optional[str] = None) -> None:
     with JOB_LOCK:
         job = JOBS[job_id]
@@ -90,45 +115,53 @@ def _set_job_canceled(job_id: str, exc: Exception) -> None:
 
 def run_backend_sync_job(job_id: str, *, env_mode: EnvMode, page_size: int, sort_criteria: int, dl_workers: int) -> None:
     _set_job_running(job_id)
-    try:
-        ensure_schema()
-        sync_acc = {"synced": 0, "deferred": 0, "changed": 0, "unchanged": 0, "pages_written": 0}
+    with _job_logging(job_id):
+        try:
+            logger.info("Starting backend sync (env=%s, page_size=%s, sort_criteria=%s, dl_workers=%s)",
+                        env_mode.value, page_size, sort_criteria, dl_workers)
+            ensure_schema()
+            sync_acc = {"synced": 0, "deferred": 0, "changed": 0, "unchanged": 0, "pages_written": 0}
 
-        def on_page(docs_page: List[Dict[str, Any]], page_stats: Dict[str, Any]) -> None:
-            if not docs_page:
-                return
-            page_res = upsert_source_docs(env_mode=env_mode.value, docs=docs_page)
-            sync_acc["synced"] += int(page_res.get("synced") or 0)
-            sync_acc["deferred"] += int(page_res.get("deferred") or 0)
-            sync_acc["changed"] += int(page_res.get("changed") or 0)
-            sync_acc["unchanged"] += int(page_res.get("unchanged") or 0)
-            sync_acc["pages_written"] += 1
-            with JOB_LOCK:
-                job = JOBS[job_id]
-                job.pipeline_stats = {
-                    "downloader_page": page_stats,
-                    "mysql_sync": dict(sync_acc),
-                    "mysql_status": summarize_status(env_mode=env_mode.value),
-                }
-            write_job_to_disk(JOBS[job_id])
+            def on_page(docs_page: List[Dict[str, Any]], page_stats: Dict[str, Any]) -> None:
+                if not docs_page:
+                    return
+                page_res = upsert_source_docs(env_mode=env_mode.value, docs=docs_page)
+                sync_acc["synced"] += int(page_res.get("synced") or 0)
+                sync_acc["deferred"] += int(page_res.get("deferred") or 0)
+                sync_acc["changed"] += int(page_res.get("changed") or 0)
+                sync_acc["unchanged"] += int(page_res.get("unchanged") or 0)
+                sync_acc["pages_written"] += 1
+                logger.info("Sync page written: page=%s synced=%s changed=%s unchanged=%s deferred=%s",
+                            page_stats.get("page"), sync_acc["synced"], sync_acc["changed"],
+                            sync_acc["unchanged"], sync_acc["deferred"])
+                with JOB_LOCK:
+                    job = JOBS[job_id]
+                    job.pipeline_stats = {
+                        "downloader_page": page_stats,
+                        "mysql_sync": dict(sync_acc),
+                        "mysql_status": summarize_status(env_mode=env_mode.value),
+                    }
+                write_job_to_disk(JOBS[job_id])
 
-        dl = download_and_prepare(
-            env_mode=env_mode.value,
-            page_size=page_size,
-            sort_criteria=sort_criteria,
-            max_workers=dl_workers,
-            prev_index={},
-            page_callback=on_page,
-            use_lock=False,
-        )
-        details = {
-            "downloader": dl.stats,
-            "mysql_sync": dict(sync_acc),
-            "mysql_status": summarize_status(env_mode=env_mode.value),
-        }
-        _set_job_done(job_id, details=details)
-    except Exception as e:
-        _set_job_error(job_id, e)
+            dl = download_and_prepare(
+                env_mode=env_mode.value,
+                page_size=page_size,
+                sort_criteria=sort_criteria,
+                max_workers=dl_workers,
+                prev_index={},
+                page_callback=on_page,
+                use_lock=False,
+            )
+            details = {
+                "downloader": dl.stats,
+                "mysql_sync": dict(sync_acc),
+                "mysql_status": summarize_status(env_mode=env_mode.value),
+            }
+            logger.info("Backend sync finished: %s", details)
+            _set_job_done(job_id, details=details)
+        except Exception as e:
+            logger.exception("Backend sync failed")
+            _set_job_error(job_id, e)
 
 
 def _load_docs_from_stage_output(out_path: Optional[str], fallback: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -152,130 +185,138 @@ def run_mysql_pipeline_job(
 ) -> None:
     cancel_event = get_cancel_event(job_id)
     _set_job_running(job_id)
-    try:
-        ensure_schema()
-        mysql_progress = {"updated": 0, "unchanged": 0}
-        docs = fetch_source_docs(
-            env_mode=env_mode.value,
-            deferred_only=deferred_only,
-            llids=llids,
-            max_docs=max_docs,
-        )
-        if not docs:
-            _set_job_done(job_id, details={"selected_docs": 0, "notes": "no matching mysql records"})
-            return
-
-        output_root = os.getenv("OUTPUT_ROOT", "output")
-        exw = int(os.getenv("EXTRACTOR_MAX_WORKERS", "4"))
-        trw = int(os.getenv("TRANSCRIBE_MAX_WORKERS", "3"))
-        max_chars = int(os.getenv("ENRICH_MAX_CHARS", "0")) or None
-        total = len(docs)
-        enrich_progress = {"patched": 0, "failed": 0, "skipped_prev_done": 0, "carry_forward_copied": 0}
-        improve_progress = {
-            "attempted": 0,
-            "improved": 0,
-            "failed": 0,
-            "skipped_prev_done": 0,
-            "carry_forward_copied": 0,
-            "skipped_complete_current": 0,
-            "failure_reasons": {},
-        }
-
-        def update_progress(*, current_index: int) -> None:
-            with JOB_LOCK:
-                job = JOBS[job_id]
-                job.pipeline_stats = {
-                    "selected_docs": total,
-                    "processed_records": current_index,
-                    "enricher": dict(enrich_progress),
-                    "improver": dict(improve_progress),
-                    "mysql_update": dict(mysql_progress),
-                    "mysql_status": summarize_status(env_mode=env_mode.value),
-                }
-            write_job_to_disk(JOBS[job_id])
-
-        for idx, source_doc in enumerate(docs, start=1):
-            if cancel_event.is_set():
-                raise JobCancelled("Job canceled during mysql pipeline execution")
-
-            llid = source_doc.get("_orig_id") or source_doc.get("_id")
-            if not isinstance(llid, str) or not llid:
-                continue
-
-            row = fetch_record(env_mode=env_mode.value, llid=llid) or {}
-            prev_current = row.get("current_doc") if isinstance(row.get("current_doc"), dict) else None
-
-            if _should_skip_mysql_record(source_doc, prev_current):
-                enrich_progress["skipped_prev_done"] += 1
-                improve_progress["skipped_prev_done"] += 1
-                improve_progress["skipped_complete_current"] += 1
-                update_progress(current_index=idx)
-                continue
-
-            doc = dict(source_doc)
-            enrich_stats = enrich_docs_via_routes(
-                [doc],
-                prev_enriched_index={llid: prev_current} if prev_current else {},
-                extractor_workers=exw,
-                transcribe_workers=trw,
-                max_chars=max_chars,
-                checkpoint_cb=None,
-                should_cancel=cancel_event.is_set,
+    with _job_logging(job_id):
+        try:
+            logger.info("Starting mysql pipeline (env=%s, scope=%s, max_docs=%s, llids=%s)",
+                        env_mode.value, "deferred" if deferred_only else "fast", max_docs, llids)
+            ensure_schema()
+            mysql_progress = {"updated": 0, "unchanged": 0}
+            docs = fetch_source_docs(
+                env_mode=env_mode.value,
+                deferred_only=deferred_only,
+                llids=llids,
+                max_docs=max_docs,
             )
-            enrich_progress["patched"] += int(enrich_stats.get("patched") or 0)
-            enrich_progress["failed"] += int(enrich_stats.get("failed") or 0)
-            enrich_progress["skipped_prev_done"] += int(enrich_stats.get("skipped_prev_done") or 0)
-            enrich_progress["carry_forward_copied"] += int(enrich_stats.get("carry_forward_copied") or 0)
+            if not docs:
+                logger.info("No matching mysql records found")
+                _set_job_done(job_id, details={"selected_docs": 0, "notes": "no matching mysql records"})
+                return
 
-            res = upsert_current_docs(env_mode=env_mode.value, docs=[doc], background=deferred_only, stage="enriched")
-            mysql_progress["updated"] += int(res.get("updated") or 0)
-            mysql_progress["unchanged"] += int(res.get("unchanged") or 0)
-            update_progress(current_index=idx)
+            output_root = os.getenv("OUTPUT_ROOT", "output")
+            exw = int(os.getenv("EXTRACTOR_MAX_WORKERS", "4"))
+            trw = int(os.getenv("TRANSCRIBE_MAX_WORKERS", "3"))
+            max_chars = int(os.getenv("ENRICH_MAX_CHARS", "0")) or None
+            total = len(docs)
+            enrich_progress = {"patched": 0, "failed": 0, "skipped_prev_done": 0, "carry_forward_copied": 0}
+            improve_progress = {
+                "attempted": 0,
+                "improved": 0,
+                "failed": 0,
+                "skipped_prev_done": 0,
+                "carry_forward_copied": 0,
+                "skipped_complete_current": 0,
+                "failure_reasons": {},
+            }
 
-            prev_for_improver = prev_current if isinstance(prev_current, dict) else None
-            doc["_improver_fp"] = compute_improver_fp(doc)
-            if isinstance(prev_for_improver, dict) and not isinstance(prev_for_improver.get("_improver_fp"), str):
-                prev_for_improver["_improver_fp"] = compute_improver_fp(prev_for_improver)
+            def update_progress(*, current_index: int) -> None:
+                with JOB_LOCK:
+                    job = JOBS[job_id]
+                    job.pipeline_stats = {
+                        "selected_docs": total,
+                        "processed_records": current_index,
+                        "enricher": dict(enrich_progress),
+                        "improver": dict(improve_progress),
+                        "mysql_update": dict(mysql_progress),
+                        "mysql_status": summarize_status(env_mode=env_mode.value),
+                    }
+                write_job_to_disk(JOBS[job_id])
 
-            if carry_forward_previous_improvements(doc, prev_for_improver):
-                improve_progress["carry_forward_copied"] += 1
+            for idx, source_doc in enumerate(docs, start=1):
+                if cancel_event.is_set():
+                    raise JobCancelled("Job canceled during mysql pipeline execution")
 
-            if should_skip_improve(doc, prev_for_improver):
-                improve_progress["skipped_prev_done"] += 1
-                res = upsert_current_docs(env_mode=env_mode.value, docs=[doc], background=deferred_only, stage="improved")
+                llid = source_doc.get("_orig_id") or source_doc.get("_id")
+                if not isinstance(llid, str) or not llid:
+                    continue
+                logger.info("Processing mysql record %s/%s llid=%s", idx, total, llid)
+
+                row = fetch_record(env_mode=env_mode.value, llid=llid) or {}
+                prev_current = row.get("current_doc") if isinstance(row.get("current_doc"), dict) else None
+
+                if _should_skip_mysql_record(source_doc, prev_current):
+                    enrich_progress["skipped_prev_done"] += 1
+                    improve_progress["skipped_prev_done"] += 1
+                    improve_progress["skipped_complete_current"] += 1
+                    update_progress(current_index=idx)
+                    continue
+
+                doc = dict(source_doc)
+                enrich_stats = enrich_docs_via_routes(
+                    [doc],
+                    prev_enriched_index={llid: prev_current} if prev_current else {},
+                    extractor_workers=exw,
+                    transcribe_workers=trw,
+                    max_chars=max_chars,
+                    checkpoint_cb=None,
+                    should_cancel=cancel_event.is_set,
+                )
+                enrich_progress["patched"] += int(enrich_stats.get("patched") or 0)
+                enrich_progress["failed"] += int(enrich_stats.get("failed") or 0)
+                enrich_progress["skipped_prev_done"] += int(enrich_stats.get("skipped_prev_done") or 0)
+                enrich_progress["carry_forward_copied"] += int(enrich_stats.get("carry_forward_copied") or 0)
+
+                res = upsert_current_docs(env_mode=env_mode.value, docs=[doc], background=deferred_only, stage="enriched")
                 mysql_progress["updated"] += int(res.get("updated") or 0)
                 mysql_progress["unchanged"] += int(res.get("unchanged") or 0)
                 update_progress(current_index=idx)
-                continue
 
-            improve_progress["attempted"] += 1
-            ok, reason = improve_doc_in_place(doc)
-            if ok:
-                improve_progress["improved"] += 1
-                res = upsert_current_docs(env_mode=env_mode.value, docs=[doc], background=deferred_only, stage="improved")
-                mysql_progress["updated"] += int(res.get("updated") or 0)
-                mysql_progress["unchanged"] += int(res.get("unchanged") or 0)
-            else:
-                improve_progress["failed"] += 1
-                tag = "other_error" if not reason else reason
-                improve_progress["failure_reasons"][tag] = improve_progress["failure_reasons"].get(tag, 0) + 1
-            update_progress(current_index=idx)
+                prev_for_improver = prev_current if isinstance(prev_current, dict) else None
+                doc["_improver_fp"] = compute_improver_fp(doc)
+                if isinstance(prev_for_improver, dict) and not isinstance(prev_for_improver.get("_improver_fp"), str):
+                    prev_for_improver["_improver_fp"] = compute_improver_fp(prev_for_improver)
 
-        details = {
-            "selected_docs": total,
-            "processed_records": total,
-            "enricher": dict(enrich_progress),
-            "improver": dict(improve_progress),
-            "mysql_update": dict(mysql_progress),
-            "mysql_status": summarize_status(env_mode=env_mode.value),
-        }
-        _set_job_done(job_id, details=details, latest_path=None)
-    except JobCancelled as e:
-        _set_job_canceled(job_id, e)
-    except Exception as e:
-        _set_job_error(job_id, e)
-    finally:
-        clear_job_cancel(job_id)
+                if carry_forward_previous_improvements(doc, prev_for_improver):
+                    improve_progress["carry_forward_copied"] += 1
+
+                if should_skip_improve(doc, prev_for_improver):
+                    improve_progress["skipped_prev_done"] += 1
+                    res = upsert_current_docs(env_mode=env_mode.value, docs=[doc], background=deferred_only, stage="improved")
+                    mysql_progress["updated"] += int(res.get("updated") or 0)
+                    mysql_progress["unchanged"] += int(res.get("unchanged") or 0)
+                    update_progress(current_index=idx)
+                    continue
+
+                improve_progress["attempted"] += 1
+                ok, reason = improve_doc_in_place(doc)
+                if ok:
+                    improve_progress["improved"] += 1
+                    res = upsert_current_docs(env_mode=env_mode.value, docs=[doc], background=deferred_only, stage="improved")
+                    mysql_progress["updated"] += int(res.get("updated") or 0)
+                    mysql_progress["unchanged"] += int(res.get("unchanged") or 0)
+                else:
+                    improve_progress["failed"] += 1
+                    tag = "other_error" if not reason else reason
+                    improve_progress["failure_reasons"][tag] = improve_progress["failure_reasons"].get(tag, 0) + 1
+                update_progress(current_index=idx)
+
+            details = {
+                "selected_docs": total,
+                "processed_records": total,
+                "enricher": dict(enrich_progress),
+                "improver": dict(improve_progress),
+                "mysql_update": dict(mysql_progress),
+                "mysql_status": summarize_status(env_mode=env_mode.value),
+            }
+            logger.info("Mysql pipeline finished: %s", details)
+            _set_job_done(job_id, details=details, latest_path=None)
+        except JobCancelled as e:
+            logger.warning("Mysql pipeline canceled: %s", e)
+            _set_job_canceled(job_id, e)
+        except Exception as e:
+            logger.exception("Mysql pipeline failed")
+            _set_job_error(job_id, e)
+        finally:
+            clear_job_cancel(job_id)
 
 
 def run_mysql_improver_fallback_job(
@@ -288,123 +329,134 @@ def run_mysql_improver_fallback_job(
 ) -> None:
     cancel_event = get_cancel_event(job_id)
     _set_job_running(job_id)
-    try:
-        ensure_schema()
-        docs = fetch_source_docs(
-            env_mode=env_mode.value,
-            deferred_only=deferred_only,
-            llids=llids,
-            max_docs=max_docs,
-        )
-        if not docs:
-            _set_job_done(job_id, details={"selected_docs": 0, "notes": "no matching mysql records"})
-            return
+    with _job_logging(job_id):
+        try:
+            logger.info("Starting improver fallback (env=%s, deferred_only=%s, max_docs=%s, llids=%s)",
+                        env_mode.value, deferred_only, max_docs, llids)
+            ensure_schema()
+            docs = fetch_source_docs(
+                env_mode=env_mode.value,
+                deferred_only=deferred_only,
+                llids=llids,
+                max_docs=max_docs,
+            )
+            if not docs:
+                logger.info("No matching mysql records found")
+                _set_job_done(job_id, details={"selected_docs": 0, "notes": "no matching mysql records"})
+                return
 
-        total = len(docs)
-        progress = {
-            "selected_docs": total,
-            "processed_records": 0,
-            "skipped_has_summary": 0,
-            "attempted": 0,
-            "improved": 0,
-            "failed": 0,
-            "mysql_update": {"updated": 0, "unchanged": 0},
-            "failure_reasons": {},
-        }
+            total = len(docs)
+            progress = {
+                "selected_docs": total,
+                "processed_records": 0,
+                "skipped_has_summary": 0,
+                "attempted": 0,
+                "improved": 0,
+                "failed": 0,
+                "mysql_update": {"updated": 0, "unchanged": 0},
+                "failure_reasons": {},
+            }
 
-        def update_progress() -> None:
-            with JOB_LOCK:
-                job = JOBS[job_id]
-                job.pipeline_stats = {
-                    **progress,
-                    "mysql_status": summarize_status(env_mode=env_mode.value),
-                }
-            write_job_to_disk(JOBS[job_id])
+            def update_progress() -> None:
+                with JOB_LOCK:
+                    job = JOBS[job_id]
+                    job.pipeline_stats = {
+                        **progress,
+                        "mysql_status": summarize_status(env_mode=env_mode.value),
+                    }
+                write_job_to_disk(JOBS[job_id])
 
-        for idx, source_doc in enumerate(docs, start=1):
-            if cancel_event.is_set():
-                raise JobCancelled("Job canceled during improver fallback execution")
+            for idx, source_doc in enumerate(docs, start=1):
+                if cancel_event.is_set():
+                    raise JobCancelled("Job canceled during improver fallback execution")
 
-            llid = source_doc.get("_orig_id") or source_doc.get("_id")
-            if not isinstance(llid, str) or not llid:
-                continue
+                llid = source_doc.get("_orig_id") or source_doc.get("_id")
+                if not isinstance(llid, str) or not llid:
+                    continue
 
-            row = fetch_record(env_mode=env_mode.value, llid=llid) or {}
-            prev_current = row.get("current_doc") if isinstance(row.get("current_doc"), dict) else None
+                row = fetch_record(env_mode=env_mode.value, llid=llid) or {}
+                prev_current = row.get("current_doc") if isinstance(row.get("current_doc"), dict) else None
 
-            current_summary = prev_current.get("ko_content_flat_summarised") if prev_current else None
-            if isinstance(current_summary, str) and current_summary.strip():
-                progress["skipped_has_summary"] += 1
+                current_summary = prev_current.get("ko_content_flat_summarised") if prev_current else None
+                if isinstance(current_summary, str) and current_summary.strip():
+                    progress["skipped_has_summary"] += 1
+                    progress["processed_records"] = idx
+                    update_progress()
+                    continue
+
+                doc = dict(source_doc)
+                if prev_current:
+                    doc.update(prev_current)
+                    if not (isinstance(doc.get("ko_content_flat"), str) and doc.get("ko_content_flat").strip()):
+                        source_flat = source_doc.get("ko_content_flat")
+                        if isinstance(source_flat, str) and source_flat.strip():
+                            doc["ko_content_flat"] = source_flat
+
+                doc["_improver_fp"] = compute_improver_fp(doc)
+                progress["attempted"] += 1
+                ok, reason = improve_doc_in_place(doc)
+                if ok:
+                    progress["improved"] += 1
+                    res = upsert_current_docs(env_mode=env_mode.value, docs=[doc], background=deferred_only, stage="improved")
+                    progress["mysql_update"]["updated"] += int(res.get("updated") or 0)
+                    progress["mysql_update"]["unchanged"] += int(res.get("unchanged") or 0)
+                else:
+                    progress["failed"] += 1
+                    tag = "other_error" if not reason else reason
+                    progress["failure_reasons"][tag] = progress["failure_reasons"].get(tag, 0) + 1
                 progress["processed_records"] = idx
                 update_progress()
-                continue
 
-            doc = dict(source_doc)
-            if prev_current:
-                doc.update(prev_current)
-                if not (isinstance(doc.get("ko_content_flat"), str) and doc.get("ko_content_flat").strip()):
-                    source_flat = source_doc.get("ko_content_flat")
-                    if isinstance(source_flat, str) and source_flat.strip():
-                        doc["ko_content_flat"] = source_flat
-
-            doc["_improver_fp"] = compute_improver_fp(doc)
-            progress["attempted"] += 1
-            ok, reason = improve_doc_in_place(doc)
-            if ok:
-                progress["improved"] += 1
-                res = upsert_current_docs(env_mode=env_mode.value, docs=[doc], background=deferred_only, stage="improved")
-                progress["mysql_update"]["updated"] += int(res.get("updated") or 0)
-                progress["mysql_update"]["unchanged"] += int(res.get("unchanged") or 0)
-            else:
-                progress["failed"] += 1
-                tag = "other_error" if not reason else reason
-                progress["failure_reasons"][tag] = progress["failure_reasons"].get(tag, 0) + 1
-            progress["processed_records"] = idx
-            update_progress()
-
-        _set_job_done(
-            job_id,
-            details={
-                **progress,
-                "mysql_status": summarize_status(env_mode=env_mode.value),
-            },
-            latest_path=None,
-        )
-    except JobCancelled as e:
-        _set_job_canceled(job_id, e)
-    except Exception as e:
-        _set_job_error(job_id, e)
-    finally:
-        clear_job_cancel(job_id)
+            logger.info("Improver fallback finished: %s", progress)
+            _set_job_done(
+                job_id,
+                details={
+                    **progress,
+                    "mysql_status": summarize_status(env_mode=env_mode.value),
+                },
+                latest_path=None,
+            )
+        except JobCancelled as e:
+            logger.warning("Improver fallback canceled: %s", e)
+            _set_job_canceled(job_id, e)
+        except Exception as e:
+            logger.exception("Improver fallback failed")
+            _set_job_error(job_id, e)
+        finally:
+            clear_job_cancel(job_id)
 
 
 def run_mysql_export_job(job_id: str, *, env_mode: EnvMode, processed_only: bool) -> None:
     _set_job_running(job_id)
-    try:
-        ensure_schema()
-        docs = export_docs(env_mode=env_mode.value, processed_only=processed_only)
-        run_id = run_stamp()
-        out_dir = output_dir(env_mode.value, root=os.getenv("OUTPUT_ROOT", "output"))
-        out_path = out_dir / f"final_improved_mysql_export_{run_id}.json"
-        payload = {
-            "meta": {
-                "env_mode": env_mode.value,
-                "run_id": run_id,
-                "created_at": datetime.utcnow().isoformat(timespec="seconds"),
-                "stage": "mysql_export",
-                "processed_only": processed_only,
-            },
-            "counts": {"docs": len(docs)},
-            "docs": docs,
-        }
-        atomic_write_json(out_path, payload)
-        _set_job_done(
-            job_id,
-            details={"exported_docs": len(docs), "mysql_status": summarize_status(env_mode=env_mode.value)},
-            latest_path=str(out_path),
-        )
-    except Exception as e:
-        _set_job_error(job_id, e)
+    with _job_logging(job_id):
+        try:
+            logger.info("Starting mysql export (env=%s, processed_only=%s)", env_mode.value, processed_only)
+            ensure_schema()
+            docs = export_docs(env_mode=env_mode.value, processed_only=processed_only)
+            run_id = run_stamp()
+            out_dir = output_dir(env_mode.value, root=os.getenv("OUTPUT_ROOT", "output"))
+            out_path = out_dir / f"final_improved_mysql_export_{run_id}.json"
+            payload = {
+                "meta": {
+                    "env_mode": env_mode.value,
+                    "run_id": run_id,
+                    "created_at": datetime.utcnow().isoformat(timespec="seconds"),
+                    "stage": "mysql_export",
+                    "processed_only": processed_only,
+                },
+                "counts": {"docs": len(docs)},
+                "docs": docs,
+            }
+            atomic_write_json(out_path, payload)
+            logger.info("Mysql export finished: exported_docs=%s path=%s", len(docs), out_path)
+            _set_job_done(
+                job_id,
+                details={"exported_docs": len(docs), "mysql_status": summarize_status(env_mode=env_mode.value)},
+                latest_path=str(out_path),
+            )
+        except Exception as e:
+            logger.exception("Mysql export failed")
+            _set_job_error(job_id, e)
 
 
 def get_mysql_record(env_mode: EnvMode, llid: str) -> Optional[Dict[str, Any]]:

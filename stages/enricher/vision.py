@@ -135,13 +135,26 @@ def _render_pdf_first_page_data_url(pdf_url: str, *, timeout: int) -> Optional[s
 
 def _download_pdf_bytes(pdf_url: str, *, timeout: int) -> Optional[bytes]:
     sess = get_public_session(timeout=timeout)
-    try:
-        resp = sess.get(pdf_url, allow_redirects=True)
-        resp.raise_for_status()
-        return resp.content
-    except Exception as e:
-        logger.error("[VisionPdfFetchFail] target=%s err=%r", pdf_url, e)
-        return None
+    retries = max(1, int(os.getenv("EUF_VISION_PDF_FETCH_RETRIES", "3")))
+    base_sleep = float(os.getenv("EUF_VISION_PDF_FETCH_BACKOFF_SEC", "1.0"))
+    last_err: Optional[Exception] = None
+    for attempt in range(1, retries + 1):
+        try:
+            resp = sess.get(pdf_url, allow_redirects=True)
+            resp.raise_for_status()
+            return resp.content
+        except Exception as e:
+            last_err = e
+            logger.error(
+                "[VisionPdfFetchFail] target=%s attempt=%s/%s err=%r",
+                pdf_url,
+                attempt,
+                retries,
+                e,
+            )
+            if attempt < retries:
+                time.sleep(base_sleep * attempt)
+    return None
 
 
 def _render_pdf_page_data_url(pdf_bytes: bytes, *, page_num: int, timeout: int) -> Optional[str]:
