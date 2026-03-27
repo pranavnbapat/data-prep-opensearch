@@ -20,6 +20,233 @@ It adds four operational capabilities:
 3. `POST /pipeline/deferred`
 4. `POST /exports/final-improved`
 
+## Full Workflow
+
+```text
+                                   MYSQL CONTROL PLANE
+                                   ===================
+
+  ┌──────────────────────────────┐
+  │ POST /sync/backend-core      │
+  └──────────────┬───────────────┘
+                 │
+                 v
+      ┌──────────────────────────────┐
+      │ Downloader reads backend-core│
+      │ page by page                 │
+      └──────────────┬───────────────┘
+                     │
+                     v
+      ┌──────────────────────────────────────────────────────────────┐
+      │ For each record                                              │
+      │ - normalize metadata                                         │
+      │ - keep backend-provided fields like license/title/etc        │
+      │ - fetch ko_content_flat from backend content API             │
+      │ - set enrich_via route family based on KO type               │
+      │ - compute source_fp / content_fp / field hashes              │
+      └──────────────┬───────────────────────────────────────────────┘
+                     │
+                     v
+      ┌──────────────────────────────────────────────────────────────┐
+      │ If hosted PDF                                                │
+      │ - try to fetch PDF bytes                                     │
+      │ - try to compute pdf_page_count                              │
+      │ - if page_count > FAST_PIPELINE_PDF_MAX_PAGES                │
+      │     => is_deferred = 1                                       │
+      │ - else                                                       │
+      │     => is_deferred = 0                                       │
+      │ If pdf probe fails                                           │
+      │ - record is still stored                                     │
+      │ - pdf_page_count = NULL                                      │
+      │ - is_deferred = 0                                            │
+      └──────────────┬───────────────────────────────────────────────┘
+                     │
+                     v
+      ┌──────────────────────────────────────────────────────────────┐
+      │ Upsert into ko_records                                       │
+      │ - source_doc_json written incrementally page by page         │
+      │ - current_doc_json preserved if already present              │
+      │ - source changes archived into ko_records_history            │
+      └──────────────────────────────────────────────────────────────┘
+
+
+  ┌──────────────────────────────┐
+  │ POST /pipeline/fast          │
+  └──────────────┬───────────────┘
+                 │
+                 v
+      ┌──────────────────────────────────────────────────────────────┐
+      │ Select rows from ko_records where                            │
+      │ - env_mode matches                                           │
+      │ - is_deferred = 0                                            │
+      │ - optional llids/max_docs filter                             │
+      └──────────────┬───────────────────────────────────────────────┘
+                     │
+                     v
+      ┌──────────────────────────────────────────────────────────────┐
+      │ For each selected row                                        │
+      │ - load source_doc_json                                       │
+      │ - load current_doc_json as previous state                    │
+      │ - if current_doc_json already has                            │
+      │     improved = 1 and non-empty ko_content_flat_summarised    │
+      │     and source/enrichment fingerprint unchanged              │
+      │     => skip whole record                                     │
+      └──────────────┬───────────────────────────────────────────────┘
+                     │
+                     v
+      ┌──────────────────────────────────────────────────────────────┐
+      │ Enricher phase (per record)                                  │
+      │                                                              │
+      │ URL/page KO                                                  │
+      │ - pagesense                                                  │
+      │ - writes ko_content_flat                                     │
+      │ - enrich_via / ko_content_source = pagesense                 │
+      │                                                              │
+      │ Hosted PDF/document KO                                       │
+      │ - starts in pagesense route family                           │
+      │ - may prefer vision path                                     │
+      │ - if vision succeeds                                         │
+      │     writes ko_content_flat_vision                            │
+      │     ko_content_is_summary = 1                                │
+      │     enrich_via / ko_content_source = vision_model            │
+      │ - if pagesense wins                                          │
+      │     writes ko_content_flat                                   │
+      │     enrich_via / ko_content_source = pagesense               │
+      │ - if upstream text is kept                                   │
+      │     enrich_via / ko_content_source = upstream_preserved      │
+      │                                                              │
+      │ Image KO                                                     │
+      │ - vision model path                                          │
+      │ - enrich_via / ko_content_source = vision_model              │
+      │                                                              │
+      │ Audio/video KO                                               │
+      │ - api_transcribe or custom_transcribe                        │
+      │ - writes ko_content_flat                                     │
+      │ - enrich_via / ko_content_source = api_transcribe            │
+      │   or custom_transcribe                                       │
+      └──────────────┬───────────────────────────────────────────────┘
+                     │
+                     v
+      ┌──────────────────────────────────────────────────────────────┐
+      │ Write enriched state immediately to ko_records.current_doc_json│
+      │ - stage = enriched                                           │
+      │ - enriched_at updated                                        │
+      │ - history row created if current state changed               │
+      └──────────────┬───────────────────────────────────────────────┘
+                     │
+                     v
+      ┌──────────────────────────────────────────────────────────────┐
+      │ Improver phase (per record)                                  │
+      │ - if ko_content_is_summary = 1 and ko_content_flat_vision    │
+      │     => light polish from vision summary                      │
+      │ - else if ko_content_flat exists                             │
+      │     => summarise ko_content_flat                             │
+      │ - then generate title_llm / subtitle_llm /                   │
+      │   description_llm / keywords_llm when summary is substantive │
+      └──────────────┬───────────────────────────────────────────────┘
+                     │
+                     v
+      ┌──────────────────────────────────────────────────────────────┐
+      │ Write improved state immediately to ko_records.current_doc_json│
+      │ - ko_content_flat_summarised                                 │
+      │ - ko_content_flat_summarised_stats                           │
+      │ - *_llm metadata fields                                      │
+      │ - improved = 1                                               │
+      │ - improved_at updated                                        │
+      │ - fast_pipeline_status = success                             │
+      └──────────────────────────────────────────────────────────────┘
+
+
+  ┌──────────────────────────────┐
+  │ POST /pipeline/deferred      │
+  └──────────────┬───────────────┘
+                 │
+                 v
+      ┌──────────────────────────────────────────────────────────────┐
+      │ Same per-record logic as /pipeline/fast, but selection is:   │
+      │ - is_deferred = 1                                            │
+      │ Typically these are hosted PDFs above                        │
+      │ FAST_PIPELINE_PDF_MAX_PAGES                                  │
+      └──────────────┬───────────────────────────────────────────────┘
+                     │
+                     v
+      ┌──────────────────────────────────────────────────────────────┐
+      │ Deferred rows usually take the expensive PDF vision path     │
+      │ When improved write succeeds:                                │
+      │ - deferred_pipeline_status = success                         │
+      │ - background_completed_at updated                            │
+      └──────────────────────────────────────────────────────────────┘
+
+
+  ┌──────────────────────────────┐
+  │ POST /pipeline/improver-fallback │
+  └──────────────┬──────────────────┘
+                 │
+                 v
+      ┌──────────────────────────────────────────────────────────────┐
+      │ Select rows (intended for deferred rows) where               │
+      │ current_doc_json lacks ko_content_flat_summarised            │
+      │                                                              │
+      │ For each row                                                 │
+      │ - start from source_doc_json                                 │
+      │ - overlay current_doc_json if present                        │
+      │ - if ko_content_flat missing in current state                │
+      │     fall back to source_doc_json.ko_content_flat             │
+      │ - run improver only                                          │
+      │ - write improved result to current_doc_json                  │
+      └──────────────────────────────────────────────────────────────┘
+
+
+  ┌──────────────────────────────┐
+  │ POST /exports/final-improved │
+  └──────────────┬───────────────┘
+                 │
+                 v
+      ┌──────────────────────────────────────────────────────────────┐
+      │ Export builder reads ko_records                              │
+      │ - if current_doc_json exists => export that                  │
+      │ - else => fall back to source_doc_json                       │
+      │ - write final_improved_mysql_export_<run_id>.json            │
+      └──────────────────────────────────────────────────────────────┘
+
+
+  ┌──────────────────────────────────────────────────────────────────┐
+  │ Resulting operational model                                      │
+  │ - sync stores all rows                                           │
+  │ - fast processes non-deferred rows                               │
+  │ - deferred processes expensive PDF rows later                    │
+  │ - improver-fallback can create interim summaries from source text│
+  │ - export always produces one full snapshot of the corpus         │
+  └──────────────────────────────────────────────────────────────────┘
+```
+
+## Step-by-Step Notes
+
+### Fast Pipeline
+
+1. Select only `is_deferred = 0` rows.
+2. Skip rows that already have a completed unchanged summary.
+3. Enrich each remaining row.
+4. Write enriched `current_doc_json` immediately.
+5. Improve the same row.
+6. Write improved `current_doc_json` immediately.
+
+### Deferred Pipeline
+
+1. Select only `is_deferred = 1` rows.
+2. Apply the same skip logic for already completed unchanged rows.
+3. Enrich each remaining row, usually using the heavier PDF vision path.
+4. Write enriched `current_doc_json` immediately.
+5. Improve the same row.
+6. Write improved `current_doc_json` immediately and mark background completion.
+
+### Export
+
+1. Read all rows from `ko_records`, or only processed rows if `processed_only = true`.
+2. Prefer `current_doc_json`.
+3. Fall back to `source_doc_json` if `current_doc_json` is absent.
+4. Write one new export file under `output/<ENV>/<YYYY>/<MM>/`.
+
 ## Endpoints
 
 - `POST /sync/backend-core`

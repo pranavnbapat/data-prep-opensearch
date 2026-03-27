@@ -138,9 +138,23 @@ def _compute_pdf_page_count(doc: Dict[str, Any]) -> Optional[int]:
         pdf_bytes = _download_pdf_bytes(url, timeout=int(os.getenv("MYSQL_SYNC_PDFINFO_TIMEOUT", "30")))
         if pdf_bytes is None:
             return None
+        if not pdf_bytes.startswith(b"%PDF-"):
+            logger.warning(
+                "[MysqlSyncPdfInfoSkip] llid=%s title=%r url=%s reason=not_a_real_pdf_header",
+                _doc_llid(doc),
+                doc.get("title"),
+                url,
+            )
+            return None
         return _pdf_page_count(pdf_bytes, timeout=int(os.getenv("MYSQL_SYNC_PDFINFO_TIMEOUT", "30")))
     except Exception as e:
-        logger.warning("[MysqlSyncPdfInfoFail] llid=%s url=%s err=%r", _doc_llid(doc), url, e)
+        logger.warning(
+            "[MysqlSyncPdfInfoFail] llid=%s title=%r url=%s err=%r",
+            _doc_llid(doc),
+            doc.get("title"),
+            url,
+            e,
+        )
         return None
 
 

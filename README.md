@@ -448,6 +448,20 @@ For a bare RunPod A100 SXM pod, use the dedicated setup guide above. It includes
 - `curl: (23) Failure writing output to destination` during Traefik tag lookup
 - `tar: Cannot change ownership ... Operation not permitted` during Traefik extraction
 
+## MySQL Workflow
+
+For the full ASCII workflow of:
+
+- `POST /sync/backend-core`
+- `POST /pipeline/fast`
+- `POST /pipeline/deferred`
+- `POST /pipeline/improver-fallback`
+- `POST /exports/final-improved`
+
+see:
+
+- [docs/mysql_control_plane.md](/home/pranav/PyCharm/EU-FarmBook/data-prep-opensearch/docs/mysql_control_plane.md)
+
 ## Current Design Notes
 
 - Job execution currently runs in-process through FastAPI background tasks.
