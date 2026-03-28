@@ -11,6 +11,7 @@ logs/
 
 # Editors / IDE
 .vscode/
+.claude
 .idea/
 *.iml
 .pytest_cache/

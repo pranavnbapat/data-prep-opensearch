@@ -96,6 +96,8 @@ For each doc:
 
 - If a previous enriched doc exists and has real enriched content, the enricher may copy forward:
   - `ko_content_flat`
+  - `ko_content_flat_vision`
+  - `ko_content_is_summary`
   - `ko_content_source`
   - `ko_content_url`
   - `enriched = 1`
@@ -159,8 +161,8 @@ After `enrich_via` is set, the enricher filters candidates:
   - homepage / bare domain
   - low-value GitHub dashboard/project pages
 - optionally probe target URL first:
-  - `custom_transcribe` probes by default
-  - `pagesense` probing is optional and off by default
+  - `custom_transcribe` probes by default (`ENRICH_PROBE_MEDIA_URLS`, default `1`)
+  - `pagesense` probing is optional and off by default (`ENRICH_PROBE_PAGE_URLS`, default `0`)
 
 ### 6. Target URL resolution
 
@@ -335,4 +337,7 @@ Examples currently used in logs and stats:
 - `custom_transcribe:http_404`
 - `custom_transcribe:http_403`
 - `custom_transcribe:too_long`
+- `custom_transcribe:failed`
+- `custom_transcribe:http_429` (non-terminal, retried)
+- `custom_transcribe:http_<status>` (other HTTP errors)
 - probe / URL validation skip reasons

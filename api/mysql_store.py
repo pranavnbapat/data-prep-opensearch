@@ -4,10 +4,13 @@ import json
 import logging
 import os
 import hashlib
+import subprocess
+import tempfile
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from stages.downloader.fingerprints import compute_source_fp
+from stages.enricher.utils import get_public_session
 from stages.enricher.vision import _download_pdf_bytes, _pdf_page_count
 logger = logging.getLogger(__name__)
 
@@ -63,6 +66,8 @@ def ensure_schema() -> None:
                   is_deferred TINYINT(1) NOT NULL DEFAULT 0,
                   pdf_page_count INT NULL,
                   deferred_reason VARCHAR(64) NULL,
+                  processing_eligible TINYINT(1) NOT NULL DEFAULT 1,
+                  processing_ineligible_reason VARCHAR(64) NULL,
                   sync_status VARCHAR(32) NOT NULL DEFAULT 'pending',
                   fast_pipeline_status VARCHAR(32) NOT NULL DEFAULT 'pending',
                   deferred_pipeline_status VARCHAR(32) NOT NULL DEFAULT 'pending',
@@ -94,6 +99,8 @@ def ensure_schema() -> None:
                   is_deferred TINYINT(1) NOT NULL DEFAULT 0,
                   pdf_page_count INT NULL,
                   deferred_reason VARCHAR(64) NULL,
+                  processing_eligible TINYINT(1) NOT NULL DEFAULT 1,
+                  processing_ineligible_reason VARCHAR(64) NULL,
                   sync_status VARCHAR(32) NULL,
                   fast_pipeline_status VARCHAR(32) NULL,
                   deferred_pipeline_status VARCHAR(32) NULL,
@@ -108,6 +115,30 @@ def ensure_schema() -> None:
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
                 """
             )
+            cur.execute(
+                """
+                ALTER TABLE ko_records
+                  ADD COLUMN IF NOT EXISTS processing_eligible TINYINT(1) NOT NULL DEFAULT 1
+                """
+            )
+            cur.execute(
+                """
+                ALTER TABLE ko_records
+                  ADD COLUMN IF NOT EXISTS processing_ineligible_reason VARCHAR(64) NULL
+                """
+            )
+            cur.execute(
+                """
+                ALTER TABLE ko_records_history
+                  ADD COLUMN IF NOT EXISTS processing_eligible TINYINT(1) NOT NULL DEFAULT 1
+                """
+            )
+            cur.execute(
+                """
+                ALTER TABLE ko_records_history
+                  ADD COLUMN IF NOT EXISTS processing_ineligible_reason VARCHAR(64) NULL
+                """
+            )
         conn.commit()
 
 
@@ -120,9 +151,141 @@ def _fast_pdf_max_pages() -> int:
     return max(1, int(os.getenv("FAST_PIPELINE_PDF_MAX_PAGES", "10")))
 
 
+def _processing_max_file_size_bytes() -> int:
+    return max(1, int(os.getenv("PROCESSING_MAX_FILE_SIZE_BYTES", str(1024 ** 3))))
+
+
+def _processing_max_pdf_pages() -> int:
+    return max(1, int(os.getenv("PROCESSING_MAX_PDF_PAGES", "100")))
+
+
+def _processing_max_office_pages() -> int:
+    return max(1, int(os.getenv("PROCESSING_MAX_OFFICE_PAGES", "100")))
+
+
+def _processing_max_text_bytes() -> int:
+    return max(1, int(os.getenv("PROCESSING_MAX_TEXT_FILE_BYTES", str(5 * 1024 * 1024))))
+
+
+def _processing_max_text_chars() -> int:
+    return max(1, int(os.getenv("PROCESSING_MAX_TEXT_CHARS", "500000")))
+
+
+def _processing_max_image_dim() -> int:
+    return max(1, int(os.getenv("PROCESSING_MAX_IMAGE_DIM_PX", "10000")))
+
+
+def _processing_max_media_duration_sec() -> float:
+    return max(1.0, float(os.getenv("PROCESSING_MAX_MEDIA_DURATION_SEC", "3000")))
+
+
 def _compute_current_doc_fp(doc: Dict[str, Any]) -> str:
     payload = json.dumps(doc, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _download_remote_bytes(url: str, *, timeout: int) -> Optional[bytes]:
+    sess = get_public_session(timeout=timeout)
+    retries = max(1, int(os.getenv("PROCESSING_PROBE_RETRIES", "3")))
+    base_sleep = float(os.getenv("PROCESSING_PROBE_BACKOFF_SEC", "1.0"))
+    for attempt in range(1, retries + 1):
+        try:
+            resp = sess.get(url, allow_redirects=True)
+            resp.raise_for_status()
+            return resp.content
+        except Exception as e:
+            logger.warning("[ProcessingProbeFetchFail] target=%s attempt=%s/%s err=%r", url, attempt, retries, e)
+            if attempt < retries:
+                import time
+                time.sleep(base_sleep * attempt)
+    return None
+
+
+def _looks_like_office_doc(doc: Dict[str, Any]) -> bool:
+    ext = ((doc.get("ko_object_extension") or "") if isinstance(doc.get("ko_object_extension"), str) else "").strip().lower()
+    mimetype = ((doc.get("ko_object_mimetype") or "") if isinstance(doc.get("ko_object_mimetype"), str) else "").strip().lower()
+    office_exts = {".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx"}
+    if ext in office_exts:
+        return True
+    office_mimes = (
+        "application/msword",
+        "application/vnd.ms-powerpoint",
+        "application/vnd.ms-excel",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+    return mimetype in office_mimes
+
+
+def _looks_like_text_doc(doc: Dict[str, Any]) -> bool:
+    ext = ((doc.get("ko_object_extension") or "") if isinstance(doc.get("ko_object_extension"), str) else "").strip().lower()
+    mimetype = ((doc.get("ko_object_mimetype") or "") if isinstance(doc.get("ko_object_mimetype"), str) else "").strip().lower()
+    return ext in {".txt", ".csv", ".tsv"} or mimetype in {"text/plain", "text/csv", "text/tab-separated-values"}
+
+
+def _is_image_doc(doc: Dict[str, Any]) -> bool:
+    mimetype = ((doc.get("ko_object_mimetype") or "") if isinstance(doc.get("ko_object_mimetype"), str) else "").strip().lower()
+    ext = ((doc.get("ko_object_extension") or "") if isinstance(doc.get("ko_object_extension"), str) else "").strip().lower()
+    return mimetype in {"image/jpeg", "image/png"} or ext in {".jpg", ".jpeg", ".png"}
+
+
+def _is_media_doc(doc: Dict[str, Any]) -> bool:
+    mimetype = ((doc.get("ko_object_mimetype") or "") if isinstance(doc.get("ko_object_mimetype"), str) else "").strip().lower()
+    return mimetype.startswith("audio/") or mimetype.startswith("video/")
+
+
+def _probe_image_dimensions(raw: bytes, *, timeout: int) -> Optional[tuple[int, int]]:
+    try:
+        with tempfile.TemporaryDirectory(prefix="processing_image_") as tmpdir:
+            img_path = os.path.join(tmpdir, "input.bin")
+            with open(img_path, "wb") as f:
+                f.write(raw)
+            cmd = ["/usr/bin/identify", "-format", "%w %h", img_path]
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=max(timeout, 10))
+            if proc.returncode != 0:
+                logger.warning("[ProcessingImageProbeFail] rc=%s stderr=%s", proc.returncode, (proc.stderr or "")[:300])
+                return None
+            parts = (proc.stdout or "").strip().split()
+            if len(parts) != 2:
+                return None
+            return int(parts[0]), int(parts[1])
+    except Exception as e:
+        logger.warning("[ProcessingImageProbeFail] err=%r", e)
+        return None
+
+
+def _probe_office_pdf_pages(raw: bytes, *, extension: str, timeout: int) -> Optional[int]:
+    ext = extension if extension.startswith(".") else f".{extension}"
+    try:
+        with tempfile.TemporaryDirectory(prefix="processing_office_") as tmpdir:
+            src_path = os.path.join(tmpdir, f"input{ext}")
+            out_dir = os.path.join(tmpdir, "out")
+            os.makedirs(out_dir, exist_ok=True)
+            with open(src_path, "wb") as f:
+                f.write(raw)
+            cmd = [
+                "/usr/bin/libreoffice",
+                "--headless",
+                "--convert-to",
+                "pdf",
+                "--outdir",
+                out_dir,
+                src_path,
+            ]
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=max(timeout, 60))
+            if proc.returncode != 0:
+                logger.warning("[ProcessingOfficeProbeFail] rc=%s stderr=%s", proc.returncode, (proc.stderr or "")[:500])
+                return None
+            pdf_candidates = [os.path.join(out_dir, name) for name in os.listdir(out_dir) if name.lower().endswith(".pdf")]
+            if not pdf_candidates:
+                return None
+            with open(pdf_candidates[0], "rb") as f:
+                pdf_bytes = f.read()
+            return _pdf_page_count(pdf_bytes, timeout=timeout)
+    except Exception as e:
+        logger.warning("[ProcessingOfficeProbeFail] err=%r", e)
+        return None
 
 
 def _compute_pdf_page_count(doc: Dict[str, Any]) -> Optional[int]:
@@ -158,14 +321,62 @@ def _compute_pdf_page_count(doc: Dict[str, Any]) -> Optional[int]:
         return None
 
 
-def _classify_deferred(doc: Dict[str, Any]) -> tuple[int, Optional[int], Optional[str]]:
+def _classify_processing_eligibility(doc: Dict[str, Any], *, pdf_page_count: Optional[int]) -> tuple[int, Optional[str]]:
+    size_raw = doc.get("ko_object_size")
+    try:
+        size_val = int(size_raw) if size_raw is not None else None
+    except Exception:
+        size_val = None
+    if isinstance(size_val, int) and size_val > _processing_max_file_size_bytes():
+        return 0, "file_too_large"
+
+    if pdf_page_count is not None and pdf_page_count > _processing_max_pdf_pages():
+        return 0, "pdf_page_limit"
+
+    if _looks_like_text_doc(doc):
+        if isinstance(size_val, int) and size_val > _processing_max_text_bytes():
+            return 0, "text_file_too_large"
+        content = doc.get("ko_content_flat")
+        if isinstance(content, str) and len(content) > _processing_max_text_chars():
+            return 0, "text_content_too_long"
+
+    probe_url = (doc.get("ko_file_id") or "").strip() if isinstance(doc.get("ko_file_id"), str) else ""
+    probe_timeout = int(os.getenv("PROCESSING_PROBE_TIMEOUT", "30"))
+
+    if _looks_like_office_doc(doc) and probe_url:
+        raw = _download_remote_bytes(probe_url, timeout=probe_timeout)
+        if raw is not None:
+            office_pages = _probe_office_pdf_pages(raw, extension=str(doc.get("ko_object_extension") or ""), timeout=probe_timeout)
+            if office_pages is not None and office_pages > _processing_max_office_pages():
+                return 0, "office_page_limit"
+
+    if _is_image_doc(doc) and probe_url:
+        raw = _download_remote_bytes(probe_url, timeout=probe_timeout)
+        if raw is not None:
+            dims = _probe_image_dimensions(raw, timeout=probe_timeout)
+            if dims is not None:
+                width, height = dims
+                if max(width, height) > _processing_max_image_dim():
+                    return 0, "image_dimension_limit"
+
+    if _is_media_doc(doc) and probe_url:
+        from stages.enricher.utils import probe_media_duration_seconds
+        duration = probe_media_duration_seconds(probe_url, timeout=probe_timeout)
+        if duration is not None and duration > _processing_max_media_duration_sec():
+            return 0, "media_duration_limit"
+
+    return 1, None
+
+
+def _classify_deferred(doc: Dict[str, Any]) -> tuple[int, Optional[int], Optional[str], int, Optional[str]]:
     page_count = _compute_pdf_page_count(doc)
+    processing_eligible, processing_ineligible_reason = _classify_processing_eligibility(doc, pdf_page_count=page_count)
     if page_count is None:
-        return 0, None, None
+        return 0, None, None, processing_eligible, processing_ineligible_reason
     max_pages = _fast_pdf_max_pages()
     if page_count > max_pages:
-        return 1, page_count, "pdf_over_fast_limit"
-    return 0, page_count, None
+        return 1, page_count, "pdf_over_fast_limit", processing_eligible, processing_ineligible_reason
+    return 0, page_count, None, processing_eligible, processing_ineligible_reason
 
 
 def _archive_current_row(cur, row: Dict[str, Any], *, history_kind: str, archived_at: datetime) -> None:
@@ -174,13 +385,13 @@ def _archive_current_row(cur, row: Dict[str, Any], *, history_kind: str, archive
         INSERT INTO ko_records_history (
           llid, env_mode, history_kind, source_doc_json, current_doc_json,
           source_fp, current_fp, source_url, source_mimetype, is_deferred,
-          pdf_page_count, deferred_reason, sync_status, fast_pipeline_status,
+          pdf_page_count, deferred_reason, processing_eligible, processing_ineligible_reason, sync_status, fast_pipeline_status,
           deferred_pipeline_status, synced_at, enriched_at, improved_at,
           background_completed_at, updated_at, archived_at
         ) VALUES (
           %s, %s, %s, %s, %s,
           %s, %s, %s, %s, %s,
-          %s, %s, %s, %s,
+          %s, %s, %s, %s, %s, %s,
           %s, %s, %s, %s,
           %s, %s, %s
         )
@@ -198,6 +409,8 @@ def _archive_current_row(cur, row: Dict[str, Any], *, history_kind: str, archive
             int(bool(row.get("is_deferred"))),
             row.get("pdf_page_count"),
             row.get("deferred_reason"),
+            int(bool(row.get("processing_eligible", 1))),
+            row.get("processing_ineligible_reason"),
             row.get("sync_status"),
             row.get("fast_pipeline_status"),
             row.get("deferred_pipeline_status"),
@@ -226,7 +439,7 @@ def upsert_source_docs(*, env_mode: str, docs: List[Dict[str, Any]]) -> Dict[str
                 if not llid:
                     continue
                 source_fp = compute_source_fp(doc)
-                is_deferred, pdf_page_count, deferred_reason = _classify_deferred(doc)
+                is_deferred, pdf_page_count, deferred_reason, processing_eligible, processing_ineligible_reason = _classify_deferred(doc)
                 deferred += int(bool(is_deferred))
                 cur.execute(
                     """
@@ -244,7 +457,9 @@ def upsert_source_docs(*, env_mode: str, docs: List[Dict[str, Any]]) -> Dict[str
                             synced_at = %s,
                             is_deferred = %s,
                             pdf_page_count = %s,
-                            deferred_reason = %s
+                            deferred_reason = %s,
+                            processing_eligible = %s,
+                            processing_ineligible_reason = %s
                         WHERE llid = %s AND env_mode = %s
                         """,
                         (
@@ -252,6 +467,8 @@ def upsert_source_docs(*, env_mode: str, docs: List[Dict[str, Any]]) -> Dict[str
                             int(bool(is_deferred)),
                             pdf_page_count,
                             deferred_reason,
+                            int(bool(processing_eligible)),
+                            processing_ineligible_reason,
                             llid,
                             env_mode.upper(),
                         ),
@@ -268,11 +485,11 @@ def upsert_source_docs(*, env_mode: str, docs: List[Dict[str, Any]]) -> Dict[str
                     """
                     INSERT INTO ko_records (
                       llid, env_mode, source_doc_json, current_doc_json, source_fp, source_url, source_mimetype,
-                      is_deferred, pdf_page_count, deferred_reason,
+                      is_deferred, pdf_page_count, deferred_reason, processing_eligible, processing_ineligible_reason,
                       sync_status, updated_at, synced_at
                     ) VALUES (
                       %s, %s, %s, %s, %s, %s, %s,
-                      %s, %s, %s,
+                      %s, %s, %s, %s, %s,
                       'synced', %s, %s
                     )
                     ON DUPLICATE KEY UPDATE
@@ -283,6 +500,8 @@ def upsert_source_docs(*, env_mode: str, docs: List[Dict[str, Any]]) -> Dict[str
                       is_deferred = VALUES(is_deferred),
                       pdf_page_count = VALUES(pdf_page_count),
                       deferred_reason = VALUES(deferred_reason),
+                      processing_eligible = VALUES(processing_eligible),
+                      processing_ineligible_reason = VALUES(processing_ineligible_reason),
                       sync_status = 'synced',
                       updated_at = VALUES(updated_at),
                       synced_at = VALUES(synced_at)
@@ -298,6 +517,8 @@ def upsert_source_docs(*, env_mode: str, docs: List[Dict[str, Any]]) -> Dict[str
                         int(bool(is_deferred)),
                         pdf_page_count,
                         deferred_reason,
+                        int(bool(processing_eligible)),
+                        processing_ineligible_reason,
                         now,
                         now,
                     ),
@@ -323,6 +544,7 @@ def fetch_source_docs(
         where.append("is_deferred = 1")
     elif deferred_only is False:
         where.append("is_deferred = 0")
+    where.append("processing_eligible = 1")
 
     if llids:
         placeholders = ", ".join(["%s"] * len(llids))
@@ -448,7 +670,7 @@ def fetch_record(*, env_mode: str, llid: str) -> Optional[Dict[str, Any]]:
             cur.execute(
                 """
                 SELECT llid, env_mode, source_doc_json, current_doc_json, is_deferred,
-                       pdf_page_count, deferred_reason, sync_status, fast_pipeline_status,
+                       pdf_page_count, deferred_reason, processing_eligible, processing_ineligible_reason, sync_status, fast_pipeline_status,
                        deferred_pipeline_status, synced_at, enriched_at, improved_at,
                        background_completed_at, updated_at
                 FROM ko_records
@@ -508,6 +730,7 @@ def summarize_status(*, env_mode: str) -> Dict[str, Any]:
                 SELECT
                   COUNT(*) AS total_records,
                   SUM(CASE WHEN is_deferred = 1 THEN 1 ELSE 0 END) AS deferred_records,
+                  SUM(CASE WHEN processing_eligible = 0 THEN 1 ELSE 0 END) AS ineligible_records,
                   SUM(CASE WHEN fast_pipeline_status = 'success' THEN 1 ELSE 0 END) AS fast_completed,
                   SUM(CASE WHEN deferred_pipeline_status = 'success' THEN 1 ELSE 0 END) AS deferred_completed
                 FROM ko_records

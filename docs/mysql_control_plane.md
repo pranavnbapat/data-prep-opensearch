@@ -2,16 +2,17 @@
 
 Related reference:
 
-- [mysql_queries.md](/home/pranav/PyCharm/EU-FarmBook/data-prep-opensearch/docs/mysql_queries.md)
+- [mysql_queries.md](mysql_queries.md)
 
 This is an optional layer on top of the existing file-based pipeline.
 
-It adds four operational capabilities:
+It adds five operational capabilities:
 
 1. sync backend-core records into local MySQL
 2. run a fast pipeline from MySQL-backed source records
 3. defer expensive PDFs above a configured page threshold
 4. export a fresh final-improved snapshot from MySQL
+5. keep ingest-ineligible resources in MySQL while excluding them from processing
 
 ## Intended Flow
 
@@ -51,10 +52,20 @@ It adds four operational capabilities:
       │ If hosted PDF                                                │
       │ - try to fetch PDF bytes                                     │
       │ - try to compute pdf_page_count                              │
+      │ - apply processing eligibility checks                        │
+      │   * all files <= 1 GiB                                       │
+      │   * PDFs <= 100 pages                                        │
+      │   * Office docs <= 100 converted pages/slides                │
+      │   * text files <= 5 MB and <= 500000 chars extracted         │
+      │   * images <= 10000 px on either side                        │
+      │   * audio/video <= 3000 s                                    │
       │ - if page_count > FAST_PIPELINE_PDF_MAX_PAGES                │
       │     => is_deferred = 1                                       │
       │ - else                                                       │
       │     => is_deferred = 0                                       │
+      │ - if any eligibility check fails                             │
+      │     => processing_eligible = 0                               │
+      │        processing_ineligible_reason = <reason>               │
       │ If pdf probe fails                                           │
       │ - record is still stored                                     │
       │ - pdf_page_count = NULL                                      │
@@ -79,6 +90,7 @@ It adds four operational capabilities:
       │ Select rows from ko_records where                            │
       │ - env_mode matches                                           │
       │ - is_deferred = 0                                            │
+      │ - processing_eligible = 1                                    │
       │ - optional llids/max_docs filter                             │
       └──────────────┬───────────────────────────────────────────────┘
                      │
@@ -165,6 +177,7 @@ It adds four operational capabilities:
       ┌──────────────────────────────────────────────────────────────┐
       │ Same per-record logic as /pipeline/fast, but selection is:   │
       │ - is_deferred = 1                                            │
+      │ - processing_eligible = 1                                    │
       │ Typically these are hosted PDFs above                        │
       │ FAST_PIPELINE_PDF_MAX_PAGES                                  │
       └──────────────┬───────────────────────────────────────────────┘
@@ -225,20 +238,22 @@ It adds four operational capabilities:
 ### Fast Pipeline
 
 1. Select only `is_deferred = 0` rows.
-2. Skip rows that already have a completed unchanged summary.
-3. Enrich each remaining row.
-4. Write enriched `current_doc_json` immediately.
-5. Improve the same row.
-6. Write improved `current_doc_json` immediately.
+2. Select only `processing_eligible = 1` rows.
+3. Skip rows that already have a completed unchanged summary.
+4. Enrich each remaining row.
+5. Write enriched `current_doc_json` immediately.
+6. Improve the same row.
+7. Write improved `current_doc_json` immediately.
 
 ### Deferred Pipeline
 
 1. Select only `is_deferred = 1` rows.
-2. Apply the same skip logic for already completed unchanged rows.
-3. Enrich each remaining row, usually using the heavier PDF vision path.
-4. Write enriched `current_doc_json` immediately.
-5. Improve the same row.
-6. Write improved `current_doc_json` immediately and mark background completion.
+2. Select only `processing_eligible = 1` rows.
+3. Apply the same skip logic for already completed unchanged rows.
+4. Enrich each remaining row, usually using the heavier PDF vision path.
+5. Write enriched `current_doc_json` immediately.
+6. Improve the same row.
+7. Write improved `current_doc_json` immediately and mark background completion.
 
 ### Export
 
@@ -253,6 +268,7 @@ It adds four operational capabilities:
   - runs downloader against backend-core
   - stores normalized source docs in MySQL
   - marks hosted PDFs with page count above `FAST_PIPELINE_PDF_MAX_PAGES` as deferred
+  - computes `processing_eligible` and `processing_ineligible_reason` using ingestion-aligned limits
   - request fields:
     - `page_size`: downloader page size for backend-core metadata paging; `0` or omitted uses the default effective page size
     - `env_mode`: target environment bucket, usually `DEV` or `PRD`
@@ -278,6 +294,15 @@ It adds four operational capabilities:
 - `GET /pipeline/deferred/status`
   - returns recent deferred jobs
 
+- `POST /pipeline/improver-fallback`
+  - processes records through improver only, without running enricher first
+  - if `current_doc_json` already has `ko_content_flat_summarised`, the record is skipped
+  - falls back to `source_doc_json.ko_content_flat` when needed
+  - intended for deferred records
+
+- `GET /pipeline/improver-fallback/status`
+  - returns recent improver-fallback jobs
+
 - `POST /records/{id}/reprocess`
   - forces a single record through the fast path
 
@@ -299,6 +324,17 @@ It adds four operational capabilities:
 - `MYSQL_DATABASE`
 - `FAST_PIPELINE_PDF_MAX_PAGES`
 - `MYSQL_SYNC_PDFINFO_TIMEOUT`
+- `MYSQL_CONNECT_TIMEOUT`
+- `PROCESSING_MAX_FILE_SIZE_BYTES`
+- `PROCESSING_MAX_PDF_PAGES`
+- `PROCESSING_MAX_OFFICE_PAGES`
+- `PROCESSING_MAX_TEXT_FILE_BYTES`
+- `PROCESSING_MAX_TEXT_CHARS`
+- `PROCESSING_MAX_IMAGE_DIM_PX`
+- `PROCESSING_MAX_MEDIA_DURATION_SEC`
+- `PROCESSING_PROBE_TIMEOUT`
+- `PROCESSING_PROBE_RETRIES`
+- `PROCESSING_PROBE_BACKOFF_SEC`
 
 ## Notes
 
@@ -311,7 +347,11 @@ It adds four operational capabilities:
 - The current design uses:
   - `ko_records` as the current-state table
   - `ko_records_history` as the history table
+- The MySQL current-state table also stores:
+  - `processing_eligible`
+  - `processing_ineligible_reason`
 - Duplicate rows are prevented by the `(llid, env_mode)` primary key.
+- Ingest-ineligible rows are still synced into MySQL, but are excluded from fast/deferred/improver-fallback processing.
 - If the incoming source fingerprint is unchanged, sync updates status/timestamps only and does not create a duplicate history entry.
 - If the incoming processed fingerprint is unchanged, processed state updates status/timestamps only and does not create a duplicate history entry.
 - When source or processed state changes, the previous row state is archived into `ko_records_history` before the current row is updated.

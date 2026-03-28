@@ -84,6 +84,8 @@ Main endpoints:
 - `GET /pipeline/fast/status`
 - `POST /pipeline/deferred`
 - `GET /pipeline/deferred/status`
+- `POST /pipeline/improver-fallback`
+- `GET /pipeline/improver-fallback/status`
 - `POST /records/{id}/reprocess`
 - `GET /records/{id}`
 - `POST /exports/final-improved`
@@ -131,6 +133,10 @@ curl -X POST http://127.0.0.1:8000/pipeline/fast \
   -d '{"env_mode":"DEV","max_docs":500}'
 
 curl -X POST http://127.0.0.1:8000/pipeline/deferred \
+  -H "Content-Type: application/json" \
+  -d '{"env_mode":"DEV","max_docs":50}'
+
+curl -X POST http://127.0.0.1:8000/pipeline/improver-fallback \
   -H "Content-Type: application/json" \
   -d '{"env_mode":"DEV","max_docs":50}'
 
@@ -205,27 +211,39 @@ Downloader:
 
 - `BACKEND_CORE_HOST_DEV`
 - `BACKEND_CORE_HOST_PRD`
-- `BACKEND_CORE_USERNAME_DEV`
-- `BACKEND_CORE_PASSWORD_DEV`
-- `BACKEND_CORE_USERNAME_PRD`
-- `BACKEND_CORE_PASSWORD_PRD`
+- `BACKEND_CORE_DEV_API_USERNAME`
+- `BACKEND_CORE_DEV_API_PASSWORD`
+- `BACKEND_CORE_PRD_API_USERNAME`
+- `BACKEND_CORE_PRD_API_PASSWORD`
 - `DL_PAGE_SIZE`
 - `DL_HTTP_TIMEOUT`
 - `DL_MAX_WORKERS`
+- `DL_SORT_CRITERIA`
 
 Enricher:
 
-- `ENRICH_ENABLE_PAGESENSE`
+- `ENRICH_ENABLE_URL_EXTRACT`
 - `ENRICH_ENABLE_API_TRANSCRIBE`
 - `ENRICH_ENABLE_CUSTOM_TRANSCRIBE`
 - `ENRICH_ENABLE_VISION_FALLBACK`
-- `PAGESENSE_URL`
-- `PAGESENSE_API_KEY`
-- `DEAPI_URL`
+- `URL_CONTENT_EXTRACTOR_BASE`
+- `EXTRACTOR_TIMEOUT`
+- `EXTRACTOR_RETRIES`
+- `EXTRACTOR_BACKOFF`
+- `EXTRACTOR_MIN_CHARS`
+- `EXTRACTOR_HTTP_TIMEOUT`
 - `DEAPI_API_KEY`
-- `CUSTOM_TRANSCRIBE_URL`
-- `CUSTOM_TRANSCRIBE_API_KEY`
+- `DEAPI_TRANSCRIBE_MODEL`
+- `DEAPI_HTTP_TIMEOUT`
+- `DEAPI_POLL_INTERVAL_SEC`
+- `DEAPI_MAX_WAIT_SEC`
+- `CUSTOM_TRANSCRIBE_ENDPOINT`
+- `CUSTOM_TRANSCRIBE_USER`
+- `CUSTOM_TRANSCRIBE_PASSWORD`
+- `CUSTOM_TRANSCRIBE_MODEL`
+- `CUSTOM_TRANSCRIBE_HTTP_TIMEOUT`
 - `CUSTOM_TRANSCRIBE_MAX_DURATION_SEC`
+- `CUSTOM_TRANSCRIBE_DURATION_PROBE_TIMEOUT`
 - `EUF_VISION_URL`
   - Vision endpoint base URL. Both forms are accepted:
   - `https://host:8000`
@@ -235,20 +253,41 @@ Enricher:
 - `EUF_VISION_RETRIES`
 - `EUF_VISION_RETRY_BASE_SEC`
 - `EUF_VISION_MIN_INTERVAL_SEC`
+- `EUF_VISION_TIMEOUT`
+- `EUF_VISION_MAX_TOKENS`
 - `EUF_VISION_PDF_MAP_REDUCE_THRESHOLD`
 - `EUF_VISION_PDF_CHUNK_PAGES`
 - `EUF_VISION_PDF_MAX_PAGES`
+- `EUF_VISION_PDF_FETCH_RETRIES`
+- `EUF_VISION_PDF_FETCH_BACKOFF_SEC`
 - `EUF_VISION_REDUCE_PARTS_PER_PASS`
 
 Improver:
 
-- `VLLM_HOST`
+- `RUNPOD_VLLM_HOST`
 - `VLLM_MODEL`
 - `VLLM_API_KEY`
+- `VLLM_MAX_MODEL_LEN`
 - `IMPROVER_MAX_ATTEMPTS`
 - `IMPROVER_METADATA_MAX_ATTEMPTS`
-- `IMPROVER_HTTP_TIMEOUT`
-- `IMPROVER_MAX_INPUT_CHARS`
+- `IMPROVER_PER_REQUEST_TIMEOUT`
+- `IMPROVER_MAX_DOCS`
+- `IMPROVER_DOC_DELAY_SEC`
+- `IMPROVER_CHUNK_TARGET_TOK`
+- `IMPROVER_CHUNK_OVERLAP_TOK`
+- `IMPROVER_DEFAULT_NUM_PREDICT`
+- `IMPROVER_COMBINE_NUM_PREDICT`
+
+Pipeline stage flags (used by the original `/run-pipeline` endpoint):
+
+- `ENABLE_DOWNLOADER`
+- `ENABLE_ENRICHER`
+- `ENABLE_IMPROVER`
+- `ENV_MODE`
+- `OUTPUT_ROOT`
+- `PIPELINE_MAX_CHARS`
+- `EXTRACTOR_MAX_WORKERS`
+- `TRANSCRIBE_MAX_WORKERS`
 
 Notes:
 
@@ -270,7 +309,8 @@ Recommended flow:
 1. `POST /sync/backend-core`
 2. `POST /pipeline/fast`
 3. `POST /pipeline/deferred`
-4. `POST /exports/final-improved`
+4. `POST /pipeline/improver-fallback` (optional, for deferred rows lacking summaries)
+5. `POST /exports/final-improved`
 
 Current behavior:
 
@@ -291,7 +331,7 @@ Current limitations:
 
 See also:
 
-- [docs/mysql_control_plane.md](/home/pranav/PyCharm/EU-FarmBook/data-prep-opensearch/docs/mysql_control_plane.md)
+- [docs/mysql_control_plane.md](docs/mysql_control_plane.md)
 
 ## Docker
 
@@ -428,13 +468,13 @@ The app image also includes runtime tools used by the enricher:
 
 Recommended RunPod config files for the shared InternVL vision pod are stored in:
 
-- [runpod_vllm_config/internvl/README.md](/home/pranav/PyCharm/EU-FarmBook/data-prep-opensearch/runpod_vllm_config/internvl/README.md)
-- [runpod_vllm_config/internvl/SETUP.md](/home/pranav/PyCharm/EU-FarmBook/data-prep-opensearch/runpod_vllm_config/internvl/SETUP.md)
-- [runpod_vllm_config/internvl/TUNING.md](/home/pranav/PyCharm/EU-FarmBook/data-prep-opensearch/runpod_vllm_config/internvl/TUNING.md)
-- [runpod_vllm_config/internvl/supervisord.conf](/home/pranav/PyCharm/EU-FarmBook/data-prep-opensearch/runpod_vllm_config/internvl/supervisord.conf)
-- [runpod_vllm_config/internvl/traefik.yml](/home/pranav/PyCharm/EU-FarmBook/data-prep-opensearch/runpod_vllm_config/internvl/traefik.yml)
-- [runpod_vllm_config/internvl/dynamic/vllm_vlm.yml](/home/pranav/PyCharm/EU-FarmBook/data-prep-opensearch/runpod_vllm_config/internvl/dynamic/vllm_vlm.yml)
-- [docs/runpod_a100_sxm_setup.md](/home/pranav/PyCharm/EU-FarmBook/data-prep-opensearch/docs/runpod_a100_sxm_setup.md)
+- [runpod_vllm_config/internvl/README.md](runpod_vllm_config/internvl/README.md)
+- [runpod_vllm_config/internvl/SETUP.md](runpod_vllm_config/internvl/SETUP.md)
+- [runpod_vllm_config/internvl/TUNING.md](runpod_vllm_config/internvl/TUNING.md)
+- [runpod_vllm_config/internvl/supervisord.conf](runpod_vllm_config/internvl/supervisord.conf)
+- [runpod_vllm_config/internvl/traefik.yml](runpod_vllm_config/internvl/traefik.yml)
+- [runpod_vllm_config/internvl/dynamic/vllm_vlm.yml](runpod_vllm_config/internvl/dynamic/vllm_vlm.yml)
+- [docs/runpod_vision_model_setup.md](docs/runpod_vision_model_setup.md)
 
 These are tuned for:
 
@@ -460,7 +500,7 @@ For the full ASCII workflow of:
 
 see:
 
-- [docs/mysql_control_plane.md](/home/pranav/PyCharm/EU-FarmBook/data-prep-opensearch/docs/mysql_control_plane.md)
+- [docs/mysql_control_plane.md](docs/mysql_control_plane.md)
 
 ## Current Design Notes
 

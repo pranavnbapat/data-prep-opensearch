@@ -134,6 +134,7 @@ Overall counts:
 SELECT
   COUNT(*) AS total_records,
   SUM(CASE WHEN is_deferred = 1 THEN 1 ELSE 0 END) AS deferred_records,
+  SUM(CASE WHEN processing_eligible = 0 THEN 1 ELSE 0 END) AS ineligible_records,
   SUM(CASE WHEN current_doc_json IS NOT NULL THEN 1 ELSE 0 END) AS current_docs_present,
   SUM(CASE WHEN improved_at IS NOT NULL THEN 1 ELSE 0 END) AS improved_records
 FROM ko_records;
@@ -162,6 +163,21 @@ GROUP BY is_deferred;
 ```
 
 ## Incomplete Records
+
+Rows excluded from processing by eligibility gates:
+
+```sql
+SELECT
+  llid,
+  env_mode,
+  processing_ineligible_reason,
+  pdf_page_count,
+  source_mimetype,
+  synced_at
+FROM ko_records
+WHERE processing_eligible = 0
+ORDER BY synced_at DESC;
+```
 
 Rows with no processed state yet:
 
