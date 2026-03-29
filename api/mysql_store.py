@@ -4,14 +4,13 @@ import json
 import logging
 import os
 import hashlib
-import socket
 import subprocess
 import tempfile
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from stages.downloader.fingerprints import compute_source_fp
-from stages.enricher.utils import get_public_session, probe_remote_content_type, validate_url_safety
+from stages.enricher.utils import get_public_session, probe_remote_content_type
 from stages.enricher.vision import _download_pdf_bytes, _pdf_page_count
 logger = logging.getLogger(__name__)
 
@@ -229,31 +228,35 @@ def _processing_max_media_duration_sec() -> float:
 
 
 def _url_scan_strict() -> bool:
-    return (os.getenv("EUF_URL_SCAN_STRICT", "false").strip().lower() in {"1", "true", "yes", "y", "on"})
+    return (os.getenv("AGRI_GATE_URL_STRICT", os.getenv("EUF_URL_SCAN_STRICT", "false")).strip().lower() in {"1", "true", "yes", "y", "on"})
 
 
 def _file_scan_enabled() -> bool:
-    return (os.getenv("EUF_FILE_SCAN_ENABLED", "false").strip().lower() in {"1", "true", "yes", "y", "on"})
+    return (os.getenv("AGRI_GATE_ENABLED", "true").strip().lower() in {"1", "true", "yes", "y", "on"})
 
 
 def _file_scan_strict() -> bool:
-    return (os.getenv("EUF_FILE_SCAN_STRICT", "false").strip().lower() in {"1", "true", "yes", "y", "on"})
+    return (os.getenv("AGRI_GATE_FILE_STRICT", os.getenv("EUF_FILE_SCAN_STRICT", "false")).strip().lower() in {"1", "true", "yes", "y", "on"})
 
 
 def _security_probe_timeout() -> int:
     return max(5, int(os.getenv("PROCESSING_PROBE_TIMEOUT", "30")))
 
 
-def _clamd_host() -> str:
-    return (os.getenv("EUF_CLAMD_HOST") or "").strip()
+def _agri_gate_enabled() -> bool:
+    return (os.getenv("AGRI_GATE_ENABLED", "true").strip().lower() in {"1", "true", "yes", "y", "on"})
 
 
-def _clamd_port() -> int:
-    return max(1, int(os.getenv("EUF_CLAMD_PORT", "3310")))
+def _agri_gate_base_url() -> str:
+    return (os.getenv("AGRI_GATE_BASE_URL") or "https://agrigate.nexavion.com").strip().rstrip("/")
 
 
-def _clamd_timeout() -> int:
-    return max(5, int(os.getenv("EUF_CLAMD_TIMEOUT", "30")))
+def _agri_gate_api_token() -> str:
+    return (os.getenv("AGRI_GATE_API_TOKEN") or "").strip()
+
+
+def _agri_gate_timeout() -> int:
+    return max(5, int(os.getenv("AGRI_GATE_TIMEOUT", "60")))
 
 
 def _source_url_from_doc(doc: Dict[str, Any]) -> Optional[str]:
@@ -313,116 +316,138 @@ def _security_decision(*, status: str, scope: str, engine: str, reason: str, che
     }
 
 
-def _run_webrisk_lookup(url: str) -> tuple[Optional[bool], str]:
-    api_key = (os.getenv("EUF_WEBRISK_API_KEY") or "").strip()
-    if not api_key:
-        return None, "webrisk_not_configured"
-    sess = get_public_session(timeout=_security_probe_timeout())
-    endpoint = "https://webrisk.googleapis.com/v1/uris:search"
-    threat_types = ["MALWARE", "SOCIAL_ENGINEERING", "UNWANTED_SOFTWARE"]
+def _parse_checked_at(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        return value
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
     try:
-        resp = sess.get(
-            endpoint,
-            params={
-                "key": api_key,
-                "uri": url,
-                "threatTypes": threat_types,
-            },
-            headers={"accept": "application/json"},
-        )
-        resp.raise_for_status()
-        data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
-        threats = ((data or {}).get("threat") or {}).get("threatTypes") or []
-        return bool(threats), ("webrisk_flagged" if threats else "webrisk_clean")
-    except Exception as e:
-        logger.warning("[SecurityWebRiskFail] url=%s err=%r", url, e)
-        return None, "webrisk_error"
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        return datetime.fromisoformat(text)
+    except Exception:
+        return None
 
 
-def _scan_url_security(url: str) -> Dict[str, Any]:
-    ok, reason, resolved = validate_url_safety(url, follow_redirects=True, timeout=_security_probe_timeout(), check_reputation=False)
-    if not ok:
-        return _security_decision(status="malicious", scope="url", engine="structural_url_validation", reason=reason)
-    flagged, lookup_reason = _run_webrisk_lookup(resolved or url)
-    if flagged is None:
-        return _security_decision(
-            status="error" if _url_scan_strict() else "skipped",
-            scope="url",
-            engine="webrisk" if (os.getenv("EUF_WEBRISK_API_KEY") or "").strip() else "structural_url_validation",
-            reason=lookup_reason,
-            escalated=_url_scan_strict() and lookup_reason == "webrisk_error",
-        )
-    if flagged:
-        return _security_decision(status="malicious", scope="url", engine="webrisk", reason=lookup_reason)
+def _agri_gate_headers() -> Dict[str, str]:
+    token = _agri_gate_api_token()
+    headers = {"accept": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def _decision_from_agri_gate(data: Dict[str, Any], *, fallback_scope: str, strict_error: bool) -> Dict[str, Any]:
+    status = str((data or {}).get("status") or "error").strip().lower() or "error"
+    scope = str((data or {}).get("scope") or fallback_scope).strip() or fallback_scope
+    engine = str((data or {}).get("primary_engine") or "agri_gate").strip() or "agri_gate"
+    reason = str((data or {}).get("reason_code") or "agri_gate_unknown").strip() or "agri_gate_unknown"
+    checked_at = _parse_checked_at((data or {}).get("checked_at"))
+    quarantined = bool((data or {}).get("quarantined"))
+    escalated = bool((data or {}).get("escalation"))
+    if status == "error" and strict_error:
+        escalated = True
     return _security_decision(
-        status="clean" if (os.getenv("EUF_WEBRISK_API_KEY") or "").strip() else "skipped",
-        scope="url",
-        engine="webrisk" if (os.getenv("EUF_WEBRISK_API_KEY") or "").strip() else "structural_url_validation",
-        reason=lookup_reason if (os.getenv("EUF_WEBRISK_API_KEY") or "").strip() else "structural_url_validation_ok",
+        status=status,
+        scope=scope,
+        engine=engine,
+        reason=reason,
+        checked_at=checked_at,
+        quarantined=quarantined,
+        escalated=escalated,
     )
 
 
+def _scan_url_security(url: str) -> Dict[str, Any]:
+    if not _agri_gate_enabled():
+        return _security_decision(status="skipped", scope="url", engine="agri_gate", reason="agri_gate_disabled")
+    sess = get_public_session(timeout=_agri_gate_timeout())
+    endpoint = _agri_gate_base_url() + "/v1/scan/url"
+    try:
+        resp = sess.post(
+            endpoint,
+            headers={**_agri_gate_headers(), "content-type": "application/json"},
+            json={"url": url},
+            timeout=_agri_gate_timeout(),
+        )
+        resp.raise_for_status()
+        data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+        return _decision_from_agri_gate(data if isinstance(data, dict) else {}, fallback_scope="url", strict_error=_url_scan_strict())
+    except Exception as e:
+        logger.warning("[SecurityAgriGateUrlFail] url=%s err=%r", url, e)
+        return _security_decision(
+            status="error" if _url_scan_strict() else "skipped",
+            scope="url",
+            engine="agri_gate",
+            reason="agri_gate_url_error",
+            escalated=_url_scan_strict(),
+        )
+
+
+def _source_filename_for_scan(doc: Dict[str, Any], url: Optional[str], mimetype: Optional[str]) -> str:
+    name = (doc.get("ko_object_name") or "").strip() if isinstance(doc.get("ko_object_name"), str) else ""
+    if name:
+        return name
+    ext = (doc.get("ko_object_extension") or "").strip() if isinstance(doc.get("ko_object_extension"), str) else ""
+    if ext and not ext.startswith("."):
+        ext = "." + ext
+    if isinstance(url, str) and url.strip():
+        base = os.path.basename(url.split("?", 1)[0].rstrip("/"))
+        if base:
+            return base
+    if ext:
+        return "scan" + ext
+    if mimetype == "application/pdf":
+        return "scan.pdf"
+    return "scan.bin"
+
+
 def _scan_file_security(doc: Dict[str, Any]) -> Dict[str, Any]:
-    file_url = (doc.get("ko_file_id") or "").strip() if isinstance(doc.get("ko_file_id"), str) else ""
+    if not _agri_gate_enabled():
+        return _security_decision(status="skipped", scope="file", engine="agri_gate", reason="agri_gate_disabled")
+    file_url = _source_url_from_doc(doc)
+    source_kind = (doc.get("source_kind") or "").strip().lower() if isinstance(doc.get("source_kind"), str) else ""
     if not file_url:
         return _security_decision(status="skipped", scope="file", engine="none", reason="no_file_url")
-    if not _file_scan_enabled():
-        return _security_decision(status="skipped", scope="file", engine="clamav", reason="file_scan_disabled")
-    raw = _download_remote_bytes(file_url, timeout=_security_probe_timeout())
+    if source_kind not in {"hosted_file", "external_file"} and not bool(doc.get("ko_is_hosted")):
+        return _security_decision(status="skipped", scope="file", engine="agri_gate", reason="not_file_resource")
+    raw = _download_remote_bytes(file_url, timeout=max(_agri_gate_timeout(), _security_probe_timeout()))
     if raw is None:
         return _security_decision(
             status="error",
             scope="file",
-            engine="clamav",
+            engine="agri_gate",
             reason="file_download_failed",
             escalated=_file_scan_strict(),
         )
-    clamd_host = _clamd_host()
-    if clamd_host:
-        try:
-            with socket.create_connection((clamd_host, _clamd_port()), timeout=_clamd_timeout()) as sock:
-                sock.sendall(b"zINSTREAM\0")
-                view = memoryview(raw)
-                chunk_size = 1024 * 64
-                for start in range(0, len(raw), chunk_size):
-                    chunk = view[start : start + chunk_size]
-                    sock.sendall(len(chunk).to_bytes(4, "big"))
-                    sock.sendall(chunk)
-                sock.sendall((0).to_bytes(4, "big"))
-                response = sock.recv(4096).decode("utf-8", "ignore").strip()
-            low = response.lower()
-            if "ok" in low:
-                return _security_decision(status="clean", scope="file", engine="clamav", reason="clamd_clean")
-            if "found" in low:
-                return _security_decision(status="malicious", scope="file", engine="clamav", reason="clamd_infected", quarantined=True)
-            logger.warning("[SecurityFileScanFail] llid=%s clamd_response=%r", _doc_llid(doc), response)
-        except Exception as e:
-            logger.warning("[SecurityFileScanFail] llid=%s clamd=%s:%s err=%r", _doc_llid(doc), clamd_host, _clamd_port(), e)
-    clamdscan_bin = (os.getenv("EUF_CLAMDSCAN_BIN") or "").strip() or "clamdscan"
-    clamscan_bin = (os.getenv("EUF_CLAMSCAN_BIN") or "").strip() or "clamscan"
-    with tempfile.TemporaryDirectory(prefix="security_scan_") as tmpdir:
-        path = os.path.join(tmpdir, "scan.bin")
-        with open(path, "wb") as fh:
-            fh.write(raw)
-        for cmd in ((clamdscan_bin, "--no-summary", path), (clamscan_bin, "--no-summary", path)):
-            try:
-                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=max(_security_probe_timeout(), 30))
-            except FileNotFoundError:
-                continue
-            except Exception as e:
-                logger.warning("[SecurityFileScanFail] llid=%s cmd=%s err=%r", _doc_llid(doc), cmd[0], e)
-                continue
-            output = f"{proc.stdout or ''}\n{proc.stderr or ''}".strip().lower()
-            if proc.returncode == 0:
-                return _security_decision(status="clean", scope="file", engine="clamav", reason="clamav_clean")
-            if proc.returncode == 1:
-                return _security_decision(status="malicious", scope="file", engine="clamav", reason="clamav_infected", quarantined=True)
-            logger.warning("[SecurityFileScanFail] llid=%s cmd=%s rc=%s out=%s", _doc_llid(doc), cmd[0], proc.returncode, output[:300])
+    filename = _source_filename_for_scan(
+        doc,
+        file_url,
+        (doc.get("ko_object_mimetype") or "").strip().lower() if isinstance(doc.get("ko_object_mimetype"), str) else None,
+    )
+    mimetype = (doc.get("ko_object_mimetype") or "application/octet-stream").strip() if isinstance(doc.get("ko_object_mimetype"), str) else "application/octet-stream"
+    sess = get_public_session(timeout=_agri_gate_timeout())
+    endpoint = _agri_gate_base_url() + "/v1/scan/file"
+    try:
+        resp = sess.post(
+            endpoint,
+            headers=_agri_gate_headers(),
+            files={"file": (filename, raw, mimetype)},
+            timeout=max(_agri_gate_timeout(), 300),
+        )
+        resp.raise_for_status()
+        data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+        return _decision_from_agri_gate(data if isinstance(data, dict) else {}, fallback_scope="file", strict_error=_file_scan_strict())
+    except Exception as e:
+        logger.warning("[SecurityAgriGateFileFail] llid=%s url=%s err=%r", _doc_llid(doc), file_url, e)
         return _security_decision(
-            status="error",
+            status="error" if _file_scan_strict() else "skipped",
             scope="file",
-            engine="clamav",
-            reason="clamav_unavailable_or_failed",
+            engine="agri_gate",
+            reason="agri_gate_file_error",
             escalated=_file_scan_strict(),
         )
 
