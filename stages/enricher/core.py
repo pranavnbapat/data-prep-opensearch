@@ -13,6 +13,7 @@ from stages.enricher.utils import (pagesense_one, classify_url_for_enrichment,
                                    target_url_for_enrichment, has_enrich_via, should_skip,
                                    is_placeholder_content, is_deapi_platform_url,
                                    env_bool, compute_enrich_inputs_fp, probe_target_url,
+                                   extract_office_text_from_url,
                                    transcribe_with_custom_api_detailed)
 
 
@@ -22,6 +23,8 @@ logger = logging.getLogger(__name__)
 def _normalized_content_source(source: str) -> str:
     if source in {"vision_fallback", "vision_pdf_map_reduce"}:
         return "vision_model"
+    if source.startswith("office_url:"):
+        return "office_url_extract"
     return source
 
 
@@ -120,6 +123,13 @@ def enrich_docs_via_routes(
             "meta_image",
             "single_img",
         }
+        office_text, office_tag = extract_office_text_from_url(
+            url,
+            timeout=int(os.getenv("EXTRACTOR_TIMEOUT", "150")),
+            min_chars=int(os.getenv("EXTRACTOR_MIN_CHARS", "100")),
+        )
+        if office_text and not is_placeholder_content(office_text):
+            return office_text, office_tag
 
         if env_bool("ENRICH_ENABLE_VISION_FALLBACK", True) and vision_enabled():
             visual_target, visual_reason = extract_visual_target_url(url, timeout=vision_probe_timeout)
@@ -394,7 +404,7 @@ def enrich_docs_via_routes(
                 if checkpoint_cb:
                     checkpoint_cb(current_stats())
                 continue
-            source = tag if tag in {"vision_fallback", "upstream_preserved", "vision_pdf_map_reduce"} else "pagesense"
+            source = tag if tag in {"vision_fallback", "upstream_preserved", "vision_pdf_map_reduce"} or tag.startswith("office_url:") else "pagesense"
             apply_success(doc, text=text, source=source, url=target)
             patched_pagesense += 1
             logger.info("[EnrichOK] %d/%d id=%s route=%s chars=%d dt=%.2fs", n, total, llid, route, len(text), time.perf_counter() - t0)

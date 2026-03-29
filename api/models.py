@@ -109,6 +109,53 @@ class MysqlExportParams(BaseModel):
     model_config = {"extra": "ignore"}
 
 
+class MysqlSourceMetadataRepairParams(BaseModel):
+    env_mode: Optional[EnvMode] = Field(default=None, description="Target environment bucket, usually DEV or PRD.")
+    max_docs: Optional[int] = Field(
+        default=None,
+        description="Optional cap on how many MySQL-backed records to repair in this run.",
+    )
+    llids: Optional[list[str]] = Field(
+        default=None,
+        description="Optional explicit logical-layer IDs to repair instead of scanning all source rows.",
+    )
+
+    model_config = {
+        "extra": "ignore",
+        "json_schema_extra": {
+            "examples": [
+                {"env_mode": "DEV"},
+                {"env_mode": "DEV", "max_docs": 100},
+                {"env_mode": "DEV", "llids": ["65cccdf7af785b8a565266dc"]},
+            ]
+        },
+    }
+
+    @field_validator("max_docs")
+    @classmethod
+    def normalize_max_docs(cls, v: Optional[int]) -> Optional[int]:
+        if v is None:
+            return None
+        if v <= 0:
+            return None
+        return v
+
+    @field_validator("llids")
+    @classmethod
+    def normalize_llids(cls, v: Optional[list[str]]) -> Optional[list[str]]:
+        if not v:
+            return None
+        cleaned = []
+        for item in v:
+            if not isinstance(item, str):
+                continue
+            s = item.strip()
+            if not s or s.lower() == "string":
+                continue
+            cleaned.append(s)
+        return cleaned or None
+
+
 def effective_page_size(raw_page_size: int | None, *, default: int = 100, max_size: int = 100) -> int:
     try:
         ps = int(raw_page_size) if raw_page_size is not None else 0

@@ -12,6 +12,10 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends \
     ffmpeg \
     imagemagick \
+    libreoffice-core \
+    libreoffice-writer \
+    libreoffice-calc \
+    libreoffice-impress \
     poppler-utils \
  && rm -rf /var/lib/apt/lists/*
 

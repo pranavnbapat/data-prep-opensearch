@@ -1,17 +1,22 @@
 # enricher_utils.py
 
 import json
+import ipaddress
 import logging
 import os
 import random
 import re
+import socket
 import subprocess
 import threading
 import time
 
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
+from xml.etree import ElementTree as ET
+from zipfile import ZipFile
 
 import requests
 
@@ -24,6 +29,23 @@ _tls = threading.local()
 logger = logging.getLogger(__name__)
 _RESOLVE_CACHE: Dict[str, str] = {}
 _RESOLVE_LOCK = threading.Lock()
+_OOXML_NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+_SAFE_BROWSING_CACHE: Dict[str, bool] = {}
+_SAFE_BROWSING_LOCK = threading.Lock()
+_DANGEROUS_EXTENSIONS = {
+    ".exe", ".msi", ".bat", ".cmd", ".ps1", ".vbs", ".dll",
+    ".pkg", ".dmg", ".app",
+    ".deb", ".rpm", ".appimage", ".sh", ".run",
+    ".jar", ".py", ".pyz", ".pyc",
+    ".scr", ".com", ".pif", ".msix", ".msixbundle", ".reg",
+    ".iso", ".img", ".bin", ".apk", ".ipa",
+    ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz", ".tgz", ".tbz2", ".txz",
+}
+_LEGACY_WEBPAGE_EXTENSIONS = {".php", ".cgi", ".jsp", ".asp", ".aspx", ".cfm"}
+_SHORTENER_HOSTS = {
+    "bit.ly", "tinyurl.com", "t.co", "goo.gl", "ow.ly", "buff.ly", "rb.gy",
+    "rebrand.ly", "lnkd.in", "is.gd", "cutt.ly", "s.id", "shorturl.at",
+}
 
 
 # ---------------- Small utilities ----------------
@@ -168,6 +190,154 @@ def env_bool(name: str, default: bool = True) -> bool:
         return default
     return v.strip().lower() in {"1", "true", "yes", "y", "on"}
 
+
+def _looks_like_binary_payload_text(text: Any) -> bool:
+    if not isinstance(text, str):
+        return False
+    if not text:
+        return False
+    sample = text[:4096]
+    markers = (
+        "[Content_Types].xml",
+        "ppt/",
+        "word/",
+        "xl/",
+        "docProps/",
+        "_rels/",
+        "PK\x03\x04",
+    )
+    if sample.startswith("PK\x03\x04") and any(marker in sample for marker in markers[:-1]):
+        return True
+    if any(ch in sample for ch in ("\x00", "\ufffd")):
+        return True
+    nonprintable = sum(1 for ch in sample if ord(ch) < 32 and ch not in "\n\r\t")
+    if sample and (nonprintable / max(1, len(sample))) > 0.05:
+        return True
+    return False
+
+
+def _looks_like_zip_bytes(raw: bytes) -> bool:
+    return isinstance(raw, (bytes, bytearray)) and raw[:4] == b"PK\x03\x04"
+
+
+def _office_kind_from_response(*, url: str, content_type: str, raw: bytes) -> Optional[str]:
+    url_l = (url or "").lower()
+    ct = (content_type or "").lower()
+    if url_l.endswith(".pptx") or "presentationml.presentation" in ct:
+        return "pptx"
+    if url_l.endswith(".docx") or "wordprocessingml.document" in ct:
+        return "docx"
+    if url_l.endswith(".xlsx") or "spreadsheetml.sheet" in ct:
+        return "xlsx"
+    if _looks_like_zip_bytes(raw):
+        try:
+            with ZipFile(BytesIO(raw)) as zf:
+                names = set(zf.namelist())
+        except Exception:
+            return None
+        if any(name.startswith("ppt/") for name in names):
+            return "pptx"
+        if any(name.startswith("word/") for name in names):
+            return "docx"
+        if any(name.startswith("xl/") for name in names):
+            return "xlsx"
+    return None
+
+
+def _extract_pptx_text(raw: bytes) -> Optional[str]:
+    try:
+        from pptx import Presentation  # type: ignore
+        prs = Presentation(BytesIO(raw))
+    except Exception:
+        return None
+    parts: List[str] = []
+    for idx, slide in enumerate(prs.slides, start=1):
+        slide_parts: List[str] = []
+        for shape in slide.shapes:
+            text = getattr(shape, "text", None)
+            if isinstance(text, str):
+                text = text.strip()
+                if text:
+                    slide_parts.append(text)
+        if slide_parts:
+            parts.append(f"Slide {idx}\n" + "\n".join(slide_parts))
+    text = "\n\n".join(parts).strip()
+    return text or None
+
+
+def _extract_docx_text(raw: bytes) -> Optional[str]:
+    try:
+        with ZipFile(BytesIO(raw)) as zf:
+            xml = zf.read("word/document.xml")
+    except Exception:
+        return None
+    try:
+        root = ET.fromstring(xml)
+    except Exception:
+        return None
+    texts = [node.text.strip() for node in root.findall(".//w:t", _OOXML_NS) if isinstance(node.text, str) and node.text.strip()]
+    text = "\n".join(texts).strip()
+    return text or None
+
+
+def _extract_xlsx_text(raw: bytes) -> Optional[str]:
+    try:
+        from openpyxl import load_workbook  # type: ignore
+        wb = load_workbook(filename=BytesIO(raw), read_only=True, data_only=True)
+    except Exception:
+        return None
+    parts: List[str] = []
+    for ws in wb.worksheets:
+        rows: List[str] = []
+        for row in ws.iter_rows(values_only=True):
+            vals = [str(v).strip() for v in row if v is not None and str(v).strip()]
+            if vals:
+                rows.append(" | ".join(vals))
+        if rows:
+            parts.append(f"Sheet {ws.title}\n" + "\n".join(rows))
+    text = "\n\n".join(parts).strip()
+    return text or None
+
+
+def extract_office_text_from_bytes(raw: bytes, *, kind: str) -> Optional[str]:
+    if kind == "pptx":
+        return _extract_pptx_text(raw)
+    if kind == "docx":
+        return _extract_docx_text(raw)
+    if kind == "xlsx":
+        return _extract_xlsx_text(raw)
+    return None
+
+
+def extract_office_text_from_url(url: str, *, timeout: int = 60, min_chars: int = 100) -> Tuple[Optional[str], str]:
+    sess = get_public_session(timeout=timeout)
+    try:
+        resp = sess.get(url, allow_redirects=True, timeout=timeout)
+        resp.raise_for_status()
+    except Exception as e:
+        logger.warning("[OfficeUrlExtractFail] host=%s url=%s reason=download err=%r", safe_host(url), url, e)
+        return None, "office_url:download_failed"
+    raw = resp.content or b""
+    if not raw:
+        return None, "office_url:empty"
+    final_url = getattr(resp, "url", url) or url
+    kind = _office_kind_from_response(
+        url=final_url,
+        content_type=resp.headers.get("content-type", ""),
+        raw=raw,
+    )
+    if not kind:
+        return None, "office_url:not_office"
+    text = extract_office_text_from_bytes(raw, kind=kind)
+    if not isinstance(text, str):
+        logger.warning("[OfficeUrlExtractFail] host=%s url=%s reason=parse_failed kind=%s", safe_host(url), final_url, kind)
+        return None, f"office_url:{kind}:parse_failed"
+    text = text.strip()
+    if len(text) < min_chars:
+        return None, f"office_url:{kind}:too_short"
+    logger.info("[OfficeUrlExtractOK] host=%s url=%s kind=%s chars=%s", safe_host(url), final_url, kind, len(text))
+    return text, f"office_url:{kind}"
+
 # ------------------------ HTTP session helpers ------------------------
 def get_public_session(timeout: int = 30) -> requests.Session:
     """
@@ -245,6 +415,14 @@ def fetch_url_text_with_extractor(
 
             text = (body.get("text") or "").strip()
             if len(text) < min_chars:
+                return None
+            if _looks_like_binary_payload_text(text):
+                logger.warning(
+                    "[ExtractorBinaryPayload] host=%s url=%s len=%s",
+                    safe_host(url),
+                    url,
+                    len(text),
+                )
                 return None
             return text
 
@@ -358,13 +536,17 @@ def probe_target_url(url: Any, *, timeout: int = 8) -> Tuple[bool, str]:
         return False, "empty"
 
     u = url.strip()
+    ok, reason, resolved = validate_url_safety(u, follow_redirects=True, timeout=timeout, check_reputation=True)
+    if not ok:
+        return False, reason
+    target = resolved or u
     sess = get_public_session(timeout=timeout)
 
     try:
-        r = sess.head(u, allow_redirects=True)
+        r = sess.head(target, allow_redirects=True)
         status = r.status_code
         if status == 405:
-            r = sess.get(u, allow_redirects=True, stream=True)
+            r = sess.get(target, allow_redirects=True, stream=True)
             status = r.status_code
         try:
             r.close()
@@ -395,13 +577,17 @@ def probe_remote_content_type(url: Any, *, timeout: int = 8) -> Optional[str]:
         return None
 
     u = url.strip()
+    ok, _, resolved = validate_url_safety(u, follow_redirects=True, timeout=timeout, check_reputation=False)
+    if not ok:
+        return None
+    target = resolved or u
     sess = get_public_session(timeout=timeout)
 
     try:
-        r = sess.head(u, allow_redirects=True)
+        r = sess.head(target, allow_redirects=True)
         status = r.status_code
         if status == 405 or status >= 400:
-            r = sess.get(u, allow_redirects=True, stream=True)
+            r = sess.get(target, allow_redirects=True, stream=True)
         content_type = (r.headers.get("content-type") or "").split(";", 1)[0].strip().lower() or None
         try:
             r.close()
@@ -545,6 +731,192 @@ def _normalise_netloc(netloc: str) -> str:
         n = n[4:]
     return n
 
+
+def _url_safety_enabled() -> bool:
+    return env_bool("URL_SAFETY_ENABLE", True)
+
+
+def _safe_browsing_enabled() -> bool:
+    return env_bool("URL_SAFETY_ENABLE_SAFE_BROWSING", False) and bool((os.getenv("GOOGLE_SAFE_BROWSING_API_KEY") or "").strip())
+
+
+def _is_shortener_host(host: str) -> bool:
+    return _normalise_netloc(host) in _SHORTENER_HOSTS
+
+
+def _host_is_obviously_internal(host: str) -> bool:
+    h = _normalise_netloc(host)
+    if not h:
+        return True
+    if h in {"localhost", "localhost.localdomain"}:
+        return True
+    if h.endswith(".local") or h.endswith(".localdomain") or h.endswith(".internal") or h.endswith(".home") or h.endswith(".lan"):
+        return True
+    try:
+        ip = ipaddress.ip_address(h)
+    except Exception:
+        return False
+    return (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+    )
+
+
+def _host_resolves_internal(host: str) -> bool:
+    h = _normalise_netloc(host)
+    if _host_is_obviously_internal(h):
+        return True
+    try:
+        infos = socket.getaddrinfo(h, None, type=socket.SOCK_STREAM)
+    except Exception as e:
+        logger.info("[UrlSafetyResolveSkip] host=%s err=%r", h, e)
+        return False
+    seen = False
+    for info in infos:
+        sockaddr = info[4]
+        if not sockaddr:
+            continue
+        addr = sockaddr[0]
+        try:
+            ip = ipaddress.ip_address(addr)
+        except Exception:
+            continue
+        seen = True
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            return True
+    return False if not seen else False
+
+
+def _path_has_dangerous_extension(path: str) -> bool:
+    p = (path or "").strip().lower()
+    if not p:
+        return False
+    for ext in _LEGACY_WEBPAGE_EXTENSIONS:
+        if p.endswith(ext):
+            return False
+    return any(p.endswith(ext) for ext in _DANGEROUS_EXTENSIONS)
+
+
+def _safe_browsing_matches(url: str) -> bool:
+    api_key = (os.getenv("GOOGLE_SAFE_BROWSING_API_KEY") or "").strip()
+    if not api_key:
+        return False
+    with _SAFE_BROWSING_LOCK:
+        cached = _SAFE_BROWSING_CACHE.get(url)
+    if cached is not None:
+        return cached
+    endpoint = f"https://safebrowsing.googleapis.com/v4/threatMatches:find?key={api_key}"
+    payload = {
+        "client": {"clientId": "data-prep-opensearch", "clientVersion": "1.0"},
+        "threatInfo": {
+            "threatTypes": [
+                "MALWARE",
+                "SOCIAL_ENGINEERING",
+                "UNWANTED_SOFTWARE",
+                "POTENTIALLY_HARMFUL_APPLICATION",
+            ],
+            "platformTypes": ["ANY_PLATFORM"],
+            "threatEntryTypes": ["URL"],
+            "threatEntries": [{"url": url}],
+        },
+    }
+    try:
+        sess = get_public_session(timeout=int(os.getenv("URL_SAFETY_SAFE_BROWSING_TIMEOUT", "10")))
+        r = sess.post(endpoint, json=payload, headers={"accept": "application/json", "content-type": "application/json"})
+        r.raise_for_status()
+        data = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+        flagged = bool((data or {}).get("matches"))
+    except Exception as e:
+        logger.warning("[UrlSafetySafeBrowsingFail] url=%s err=%r", url, e)
+        flagged = False
+    with _SAFE_BROWSING_LOCK:
+        _SAFE_BROWSING_CACHE[url] = flagged
+    return flagged
+
+
+def _check_single_url_safety(url: str, *, check_reputation: bool) -> Tuple[bool, str]:
+    if not isinstance(url, str) or not url.strip():
+        return False, "empty"
+    u = url.strip()
+    try:
+        p = urlparse(u)
+    except Exception:
+        return False, "parse_error"
+    scheme = (p.scheme or "").lower()
+    if scheme != "https":
+        return False, "https_required"
+    if p.username or p.password:
+        return False, "embedded_credentials"
+    host = _normalise_netloc(p.hostname or p.netloc)
+    if not host:
+        return False, "missing_host"
+    if _host_is_obviously_internal(host):
+        return False, "internal_host"
+    if "." not in host:
+        return False, "host_missing_tld"
+    tld = host.rsplit(".", 1)[-1]
+    if len(tld) < 2:
+        return False, "host_bad_tld"
+    if _path_has_dangerous_extension(p.path or ""):
+        return False, "dangerous_payload_extension"
+    if check_reputation and _safe_browsing_enabled() and _safe_browsing_matches(u):
+        return False, "safe_browsing_flagged"
+    return True, "ok"
+
+
+def validate_url_safety(url: Any, *, follow_redirects: bool, timeout: int, check_reputation: bool) -> Tuple[bool, str, Optional[str]]:
+    if isinstance(url, (bytes, bytearray)):
+        url = url.decode("utf-8", "ignore")
+    if not isinstance(url, str):
+        return False, "not_a_string", None
+    original = url.strip()
+    if not original:
+        return False, "empty", None
+    if not _url_safety_enabled():
+        return True, "ok", original
+    ok, reason = _check_single_url_safety(original, check_reputation=check_reputation)
+    if not ok:
+        return False, reason, None
+    try:
+        p = urlparse(original)
+        host = _normalise_netloc(p.hostname or p.netloc)
+        if _host_resolves_internal(host):
+            return False, "internal_resolution", None
+    except Exception:
+        return False, "parse_error", None
+    if not follow_redirects:
+        return True, "ok", original
+    final = resolve_final_url_http_only(original, timeout=timeout)
+    if not final:
+        return False, "unreachable_or_unresolved", None
+    ok, reason = _check_single_url_safety(final, check_reputation=check_reputation)
+    if not ok:
+        return False, f"final_{reason}", None
+    try:
+        p = urlparse(final)
+        host = _normalise_netloc(p.hostname or p.netloc)
+        if _host_resolves_internal(host):
+            return False, "final_internal_resolution", None
+    except Exception:
+        return False, "final_parse_error", None
+    if _is_shortener_host(urlparse(original).hostname or "") and check_reputation and _safe_browsing_enabled():
+        if _safe_browsing_matches(original):
+            return False, "shortener_safe_browsing_flagged", None
+        if _safe_browsing_matches(final):
+            return False, "final_safe_browsing_flagged", None
+    return True, "ok", final
+
 def classify_url_for_enrichment(url: Any) -> Tuple[bool, str]:
     """
     Returns (ok, reason).
@@ -567,12 +939,17 @@ def classify_url_for_enrichment(url: Any) -> Tuple[bool, str]:
         return False, "parse_error"
 
     scheme = (p.scheme or "").lower()
-    if scheme not in {"http", "https"}:
-        return False, f"unsupported_scheme:{scheme or 'none'}"
+    if scheme != "https":
+        return False, "https_required"
+
+    if p.username or p.password:
+        return False, "embedded_credentials"
 
     netloc = _normalise_netloc(p.netloc)
     if not netloc:
         return False, "missing_host"
+    if _host_is_obviously_internal(p.hostname or netloc):
+        return False, "internal_host"
 
     path = p.path or ""
     path_l = path.lower()
@@ -593,10 +970,22 @@ def classify_url_for_enrichment(url: Any) -> Tuple[bool, str]:
     if len(tld) < 2:
         return False, "host_bad_tld"
 
+    if _path_has_dangerous_extension(path):
+        return False, "dangerous_payload_extension"
+
     # Homepage / bare domain: no real path (or "/") AND no query params
     has_query = bool(p.query and p.query.strip())
     if (path == "" or path == "/") and not has_query:
         return False, "homepage_or_bare_domain"
+
+    ok, reason, _ = validate_url_safety(
+        u,
+        follow_redirects=True,
+        timeout=int(os.getenv("URL_RESOLVE_TIMEOUT", "8")),
+        check_reputation=True,
+    )
+    if not ok:
+        return False, reason
 
     return True, "ok"
 
@@ -744,6 +1133,8 @@ def has_enrich_via(doc: Dict[str, Any]) -> bool:
 
 def is_placeholder_content(val: Any) -> bool:
     if not isinstance(val, str):
+        return True
+    if _looks_like_binary_payload_text(val):
         return True
     return val.strip().lower() in ("", "no content present")
 

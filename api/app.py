@@ -12,13 +12,15 @@ from uuid import uuid4
 load_dotenv()
 
 from api.control_plane import (get_mysql_record, run_backend_sync_job, run_mysql_export_job,
-                               run_mysql_improver_fallback_job, run_mysql_pipeline_job)
+                               run_mysql_improver_fallback_job, run_mysql_pipeline_job,
+                               run_mysql_source_metadata_repair_job)
 from api.job_runner import run_pipeline_job
 from api.job_store import (JOBS, JOB_LOGS, JOB_LOCK, bucket_parts_now, load_job_from_disk,
                            load_jobs_from_disk, log_file_path, recover_job_tmp_files, write_job_to_disk)
 from api.mysql_store import ensure_schema, mysql_enabled
 from api.job_store import request_job_cancel
 from api.models import (BackendSyncParams, EnvMode, Job, JobStatus, MysqlExportParams,
+                        MysqlSourceMetadataRepairParams,
                         MysqlPipelineParams, PipelineRunParams, effective_page_size)
 
 @asynccontextmanager
@@ -241,6 +243,36 @@ def trigger_improver_fallback(params: MysqlPipelineParams, bg: BackgroundTasks):
 def improver_fallback_status():
     with JOB_LOCK:
         jobs = [j for j in JOBS.values() if j.job_kind == "mysql_pipeline" and j.scope == "improver_fallback"]
+        jobs.sort(key=lambda x: x.created_at, reverse=True)
+        return [j.model_dump(mode="json") for j in jobs[:10]]
+
+
+@app.post(
+    "/source/repair-metadata",
+    summary="Repair source MIME type and source kind in MySQL",
+    description=(
+        "Recomputes source-side metadata for existing MySQL rows without touching current_doc_json. "
+        "This updates source_doc_json, source_fp, source_url, source_mimetype, and source_kind."
+    ),
+)
+def trigger_source_metadata_repair(params: MysqlSourceMetadataRepairParams, bg: BackgroundTasks):
+    env_mode_val = (params.env_mode.value if params.env_mode else (os.getenv("ENV_MODE") or "DEV")).upper()
+    resolved_env_mode = EnvMode(env_mode_val)
+    job = _create_job(env_mode=resolved_env_mode, page_size=100, job_kind="mysql_source_metadata_repair", scope="source_metadata")
+    bg.add_task(
+        run_mysql_source_metadata_repair_job,
+        job.id,
+        env_mode=job.env_mode,
+        max_docs=params.max_docs,
+        llids=params.llids,
+    )
+    return {"status": "scheduled", "job_id": job.id}
+
+
+@app.get("/source/repair-metadata/status")
+def source_metadata_repair_status():
+    with JOB_LOCK:
+        jobs = [j for j in JOBS.values() if j.job_kind == "mysql_source_metadata_repair"]
         jobs.sort(key=lambda x: x.created_at, reverse=True)
         return [j.model_dump(mode="json") for j in jobs[:10]]
 

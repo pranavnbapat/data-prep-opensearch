@@ -4,13 +4,14 @@ import json
 import logging
 import os
 import hashlib
+import socket
 import subprocess
 import tempfile
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from stages.downloader.fingerprints import compute_source_fp
-from stages.enricher.utils import get_public_session
+from stages.enricher.utils import get_public_session, probe_remote_content_type, validate_url_safety
 from stages.enricher.vision import _download_pdf_bytes, _pdf_page_count
 logger = logging.getLogger(__name__)
 
@@ -63,11 +64,19 @@ def ensure_schema() -> None:
                   current_fp VARCHAR(64) NULL,
                   source_url TEXT NULL,
                   source_mimetype VARCHAR(255) NULL,
+                  source_kind VARCHAR(32) NULL,
                   is_deferred TINYINT(1) NOT NULL DEFAULT 0,
                   pdf_page_count INT NULL,
                   deferred_reason VARCHAR(64) NULL,
                   processing_eligible TINYINT(1) NOT NULL DEFAULT 1,
                   processing_ineligible_reason VARCHAR(64) NULL,
+                  security_status VARCHAR(16) NULL,
+                  security_scope VARCHAR(16) NULL,
+                  security_engine VARCHAR(32) NULL,
+                  security_checked_at DATETIME NULL,
+                  security_quarantined TINYINT(1) NOT NULL DEFAULT 0,
+                  security_escalated TINYINT(1) NOT NULL DEFAULT 0,
+                  security_reason VARCHAR(64) NULL,
                   sync_status VARCHAR(32) NOT NULL DEFAULT 'pending',
                   fast_pipeline_status VARCHAR(32) NOT NULL DEFAULT 'pending',
                   deferred_pipeline_status VARCHAR(32) NOT NULL DEFAULT 'pending',
@@ -96,11 +105,19 @@ def ensure_schema() -> None:
                   current_fp VARCHAR(64) NULL,
                   source_url TEXT NULL,
                   source_mimetype VARCHAR(255) NULL,
+                  source_kind VARCHAR(32) NULL,
                   is_deferred TINYINT(1) NOT NULL DEFAULT 0,
                   pdf_page_count INT NULL,
                   deferred_reason VARCHAR(64) NULL,
                   processing_eligible TINYINT(1) NOT NULL DEFAULT 1,
                   processing_ineligible_reason VARCHAR(64) NULL,
+                  security_status VARCHAR(16) NULL,
+                  security_scope VARCHAR(16) NULL,
+                  security_engine VARCHAR(32) NULL,
+                  security_checked_at DATETIME NULL,
+                  security_quarantined TINYINT(1) NOT NULL DEFAULT 0,
+                  security_escalated TINYINT(1) NOT NULL DEFAULT 0,
+                  security_reason VARCHAR(64) NULL,
                   sync_status VARCHAR(32) NULL,
                   fast_pipeline_status VARCHAR(32) NULL,
                   deferred_pipeline_status VARCHAR(32) NULL,
@@ -115,31 +132,63 @@ def ensure_schema() -> None:
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
                 """
             )
-            cur.execute(
-                """
-                ALTER TABLE ko_records
-                  ADD COLUMN IF NOT EXISTS processing_eligible TINYINT(1) NOT NULL DEFAULT 1
-                """
+            _ensure_column(
+                cur,
+                table_name="ko_records",
+                column_name="processing_eligible",
+                ddl="ALTER TABLE ko_records ADD COLUMN processing_eligible TINYINT(1) NOT NULL DEFAULT 1",
             )
-            cur.execute(
-                """
-                ALTER TABLE ko_records
-                  ADD COLUMN IF NOT EXISTS processing_ineligible_reason VARCHAR(64) NULL
-                """
+            _ensure_column(
+                cur,
+                table_name="ko_records",
+                column_name="processing_ineligible_reason",
+                ddl="ALTER TABLE ko_records ADD COLUMN processing_ineligible_reason VARCHAR(64) NULL",
             )
-            cur.execute(
-                """
-                ALTER TABLE ko_records_history
-                  ADD COLUMN IF NOT EXISTS processing_eligible TINYINT(1) NOT NULL DEFAULT 1
-                """
+            _ensure_column(
+                cur,
+                table_name="ko_records_history",
+                column_name="processing_eligible",
+                ddl="ALTER TABLE ko_records_history ADD COLUMN processing_eligible TINYINT(1) NOT NULL DEFAULT 1",
             )
-            cur.execute(
-                """
-                ALTER TABLE ko_records_history
-                  ADD COLUMN IF NOT EXISTS processing_ineligible_reason VARCHAR(64) NULL
-                """
+            _ensure_column(
+                cur,
+                table_name="ko_records_history",
+                column_name="processing_ineligible_reason",
+                ddl="ALTER TABLE ko_records_history ADD COLUMN processing_ineligible_reason VARCHAR(64) NULL",
             )
+            for table_name in ("ko_records", "ko_records_history"):
+                _ensure_column(
+                    cur,
+                    table_name=table_name,
+                    column_name="source_kind",
+                    ddl=f"ALTER TABLE {table_name} ADD COLUMN source_kind VARCHAR(32) NULL",
+                )
+            for table_name in ("ko_records", "ko_records_history"):
+                prefix = f"ALTER TABLE {table_name} ADD COLUMN"
+                _ensure_column(cur, table_name=table_name, column_name="security_status", ddl=f"{prefix} security_status VARCHAR(16) NULL")
+                _ensure_column(cur, table_name=table_name, column_name="security_scope", ddl=f"{prefix} security_scope VARCHAR(16) NULL")
+                _ensure_column(cur, table_name=table_name, column_name="security_engine", ddl=f"{prefix} security_engine VARCHAR(32) NULL")
+                _ensure_column(cur, table_name=table_name, column_name="security_checked_at", ddl=f"{prefix} security_checked_at DATETIME NULL")
+                _ensure_column(cur, table_name=table_name, column_name="security_quarantined", ddl=f"{prefix} security_quarantined TINYINT(1) NOT NULL DEFAULT 0")
+                _ensure_column(cur, table_name=table_name, column_name="security_escalated", ddl=f"{prefix} security_escalated TINYINT(1) NOT NULL DEFAULT 0")
+                _ensure_column(cur, table_name=table_name, column_name="security_reason", ddl=f"{prefix} security_reason VARCHAR(64) NULL")
         conn.commit()
+
+
+def _ensure_column(cur, *, table_name: str, column_name: str, ddl: str) -> None:
+    cur.execute(
+        """
+        SELECT COUNT(*) AS c
+        FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = %s
+          AND COLUMN_NAME = %s
+        """,
+        (table_name, column_name),
+    )
+    row = cur.fetchone() or {}
+    if int(row.get("c") or 0) == 0:
+        cur.execute(ddl)
 
 
 def _doc_llid(doc: Dict[str, Any]) -> Optional[str]:
@@ -179,9 +228,313 @@ def _processing_max_media_duration_sec() -> float:
     return max(1.0, float(os.getenv("PROCESSING_MAX_MEDIA_DURATION_SEC", "3000")))
 
 
+def _url_scan_strict() -> bool:
+    return (os.getenv("EUF_URL_SCAN_STRICT", "false").strip().lower() in {"1", "true", "yes", "y", "on"})
+
+
+def _file_scan_enabled() -> bool:
+    return (os.getenv("EUF_FILE_SCAN_ENABLED", "false").strip().lower() in {"1", "true", "yes", "y", "on"})
+
+
+def _file_scan_strict() -> bool:
+    return (os.getenv("EUF_FILE_SCAN_STRICT", "false").strip().lower() in {"1", "true", "yes", "y", "on"})
+
+
+def _security_probe_timeout() -> int:
+    return max(5, int(os.getenv("PROCESSING_PROBE_TIMEOUT", "30")))
+
+
+def _clamd_host() -> str:
+    return (os.getenv("EUF_CLAMD_HOST") or "").strip()
+
+
+def _clamd_port() -> int:
+    return max(1, int(os.getenv("EUF_CLAMD_PORT", "3310")))
+
+
+def _clamd_timeout() -> int:
+    return max(5, int(os.getenv("EUF_CLAMD_TIMEOUT", "30")))
+
+
+def _source_url_from_doc(doc: Dict[str, Any]) -> Optional[str]:
+    for key in ("@id", "ko_file_id"):
+        value = doc.get(key)
+        if isinstance(value, str):
+            v = value.strip()
+            if v:
+                return v
+    return None
+
+
+def _is_generic_mimetype(value: Optional[str]) -> bool:
+    v = (value or "").strip().lower()
+    return v in {"", "application/octet-stream", "binary/octet-stream"}
+
+
+def _normalize_source_metadata(doc: Dict[str, Any]) -> tuple[Dict[str, Any], Optional[str], Optional[str], str]:
+    out = dict(doc)
+    source_url = _source_url_from_doc(out)
+    ko_is_hosted = bool(out.get("ko_is_hosted"))
+    existing_mimetype = (out.get("ko_object_mimetype") or "").strip().lower() if isinstance(out.get("ko_object_mimetype"), str) else ""
+    final_mimetype = existing_mimetype or None
+
+    if source_url:
+        probed = probe_remote_content_type(source_url, timeout=_security_probe_timeout())
+        if isinstance(probed, str):
+            probed = probed.strip().lower()
+            if probed and (not final_mimetype or _is_generic_mimetype(final_mimetype) or probed != "application/octet-stream"):
+                final_mimetype = probed
+
+    if ko_is_hosted:
+        source_kind = "hosted_file"
+    else:
+        if final_mimetype in {"text/html", "application/xhtml+xml"}:
+            source_kind = "webpage"
+        elif isinstance(final_mimetype, str) and final_mimetype.strip():
+            source_kind = "external_file"
+        else:
+            source_kind = "external_url"
+
+    if final_mimetype:
+        out["ko_object_mimetype"] = final_mimetype
+    out["source_kind"] = source_kind
+    return out, source_url, final_mimetype, source_kind
+
+
+def _security_decision(*, status: str, scope: str, engine: str, reason: str, checked_at: Optional[datetime] = None, quarantined: bool = False, escalated: bool = False) -> Dict[str, Any]:
+    return {
+        "status": status,
+        "scope": scope,
+        "engine": engine,
+        "checked_at": checked_at or datetime.utcnow(),
+        "quarantined": quarantined,
+        "escalated": escalated,
+        "reason": reason,
+    }
+
+
+def _run_webrisk_lookup(url: str) -> tuple[Optional[bool], str]:
+    api_key = (os.getenv("EUF_WEBRISK_API_KEY") or "").strip()
+    if not api_key:
+        return None, "webrisk_not_configured"
+    sess = get_public_session(timeout=_security_probe_timeout())
+    endpoint = "https://webrisk.googleapis.com/v1/uris:search"
+    threat_types = ["MALWARE", "SOCIAL_ENGINEERING", "UNWANTED_SOFTWARE"]
+    try:
+        resp = sess.get(
+            endpoint,
+            params={
+                "key": api_key,
+                "uri": url,
+                "threatTypes": threat_types,
+            },
+            headers={"accept": "application/json"},
+        )
+        resp.raise_for_status()
+        data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+        threats = ((data or {}).get("threat") or {}).get("threatTypes") or []
+        return bool(threats), ("webrisk_flagged" if threats else "webrisk_clean")
+    except Exception as e:
+        logger.warning("[SecurityWebRiskFail] url=%s err=%r", url, e)
+        return None, "webrisk_error"
+
+
+def _scan_url_security(url: str) -> Dict[str, Any]:
+    ok, reason, resolved = validate_url_safety(url, follow_redirects=True, timeout=_security_probe_timeout(), check_reputation=False)
+    if not ok:
+        return _security_decision(status="malicious", scope="url", engine="structural_url_validation", reason=reason)
+    flagged, lookup_reason = _run_webrisk_lookup(resolved or url)
+    if flagged is None:
+        return _security_decision(
+            status="error" if _url_scan_strict() else "skipped",
+            scope="url",
+            engine="webrisk" if (os.getenv("EUF_WEBRISK_API_KEY") or "").strip() else "structural_url_validation",
+            reason=lookup_reason,
+            escalated=_url_scan_strict() and lookup_reason == "webrisk_error",
+        )
+    if flagged:
+        return _security_decision(status="malicious", scope="url", engine="webrisk", reason=lookup_reason)
+    return _security_decision(
+        status="clean" if (os.getenv("EUF_WEBRISK_API_KEY") or "").strip() else "skipped",
+        scope="url",
+        engine="webrisk" if (os.getenv("EUF_WEBRISK_API_KEY") or "").strip() else "structural_url_validation",
+        reason=lookup_reason if (os.getenv("EUF_WEBRISK_API_KEY") or "").strip() else "structural_url_validation_ok",
+    )
+
+
+def _scan_file_security(doc: Dict[str, Any]) -> Dict[str, Any]:
+    file_url = (doc.get("ko_file_id") or "").strip() if isinstance(doc.get("ko_file_id"), str) else ""
+    if not file_url:
+        return _security_decision(status="skipped", scope="file", engine="none", reason="no_file_url")
+    if not _file_scan_enabled():
+        return _security_decision(status="skipped", scope="file", engine="clamav", reason="file_scan_disabled")
+    raw = _download_remote_bytes(file_url, timeout=_security_probe_timeout())
+    if raw is None:
+        return _security_decision(
+            status="error",
+            scope="file",
+            engine="clamav",
+            reason="file_download_failed",
+            escalated=_file_scan_strict(),
+        )
+    clamd_host = _clamd_host()
+    if clamd_host:
+        try:
+            with socket.create_connection((clamd_host, _clamd_port()), timeout=_clamd_timeout()) as sock:
+                sock.sendall(b"zINSTREAM\0")
+                view = memoryview(raw)
+                chunk_size = 1024 * 64
+                for start in range(0, len(raw), chunk_size):
+                    chunk = view[start : start + chunk_size]
+                    sock.sendall(len(chunk).to_bytes(4, "big"))
+                    sock.sendall(chunk)
+                sock.sendall((0).to_bytes(4, "big"))
+                response = sock.recv(4096).decode("utf-8", "ignore").strip()
+            low = response.lower()
+            if "ok" in low:
+                return _security_decision(status="clean", scope="file", engine="clamav", reason="clamd_clean")
+            if "found" in low:
+                return _security_decision(status="malicious", scope="file", engine="clamav", reason="clamd_infected", quarantined=True)
+            logger.warning("[SecurityFileScanFail] llid=%s clamd_response=%r", _doc_llid(doc), response)
+        except Exception as e:
+            logger.warning("[SecurityFileScanFail] llid=%s clamd=%s:%s err=%r", _doc_llid(doc), clamd_host, _clamd_port(), e)
+    clamdscan_bin = (os.getenv("EUF_CLAMDSCAN_BIN") or "").strip() or "clamdscan"
+    clamscan_bin = (os.getenv("EUF_CLAMSCAN_BIN") or "").strip() or "clamscan"
+    with tempfile.TemporaryDirectory(prefix="security_scan_") as tmpdir:
+        path = os.path.join(tmpdir, "scan.bin")
+        with open(path, "wb") as fh:
+            fh.write(raw)
+        for cmd in ((clamdscan_bin, "--no-summary", path), (clamscan_bin, "--no-summary", path)):
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=max(_security_probe_timeout(), 30))
+            except FileNotFoundError:
+                continue
+            except Exception as e:
+                logger.warning("[SecurityFileScanFail] llid=%s cmd=%s err=%r", _doc_llid(doc), cmd[0], e)
+                continue
+            output = f"{proc.stdout or ''}\n{proc.stderr or ''}".strip().lower()
+            if proc.returncode == 0:
+                return _security_decision(status="clean", scope="file", engine="clamav", reason="clamav_clean")
+            if proc.returncode == 1:
+                return _security_decision(status="malicious", scope="file", engine="clamav", reason="clamav_infected", quarantined=True)
+            logger.warning("[SecurityFileScanFail] llid=%s cmd=%s rc=%s out=%s", _doc_llid(doc), cmd[0], proc.returncode, output[:300])
+        return _security_decision(
+            status="error",
+            scope="file",
+            engine="clamav",
+            reason="clamav_unavailable_or_failed",
+            escalated=_file_scan_strict(),
+        )
+
+
+def _classify_security(doc: Dict[str, Any]) -> Dict[str, Any]:
+    decisions: List[Dict[str, Any]] = []
+    url_decision: Optional[Dict[str, Any]] = None
+    file_decision: Optional[Dict[str, Any]] = None
+    source_url = (doc.get("@id") or doc.get("ko_file_id") or "").strip() if isinstance(doc.get("@id") or doc.get("ko_file_id"), str) else ""
+    if source_url:
+        url_decision = _scan_url_security(source_url)
+        decisions.append(url_decision)
+    if bool(doc.get("ko_is_hosted")) and isinstance(doc.get("ko_file_id"), str) and doc.get("ko_file_id").strip():
+        file_decision = _scan_file_security(doc)
+        decisions.append(file_decision)
+    if not decisions:
+        return _security_decision(status="skipped", scope="none", engine="none", reason="no_security_target")
+    if any(d["status"] == "malicious" for d in decisions):
+        chosen = next(d for d in decisions if d["status"] == "malicious")
+    elif any(d["status"] == "error" and d.get("escalated") for d in decisions):
+        chosen = next(d for d in decisions if d["status"] == "error" and d.get("escalated"))
+    elif any(d["status"] == "error" for d in decisions):
+        chosen = next(d for d in decisions if d["status"] == "error")
+    elif file_decision and file_decision["status"] == "clean":
+        chosen = file_decision
+    elif url_decision and url_decision["status"] == "clean":
+        chosen = url_decision
+    elif any(d["status"] == "clean" for d in decisions):
+        chosen = next(d for d in decisions if d["status"] == "clean")
+    else:
+        chosen = decisions[0]
+    scope_parts = []
+    for d in decisions:
+        scope = d.get("scope")
+        if scope and scope not in scope_parts and scope != "none":
+            scope_parts.append(scope)
+    chosen["scope"] = ",".join(scope_parts) if scope_parts else chosen.get("scope") or "none"
+    return chosen
+
+
 def _compute_current_doc_fp(doc: Dict[str, Any]) -> str:
     payload = json.dumps(doc, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _storage_max_ko_content_flat_chars() -> int:
+    return max(1, int(os.getenv("STORAGE_MAX_KO_CONTENT_FLAT_CHARS", os.getenv("PROCESSING_MAX_TEXT_CHARS", "500000"))))
+
+
+def _storage_max_ko_content_flat_vision_chars() -> int:
+    return max(1, int(os.getenv("STORAGE_MAX_KO_CONTENT_FLAT_VISION_CHARS", "200000")))
+
+
+def _storage_max_ko_content_flat_summarised_chars() -> int:
+    return max(1, int(os.getenv("STORAGE_MAX_KO_CONTENT_FLAT_SUMMARISED_CHARS", "120000")))
+
+
+def _storage_max_description_llm_chars() -> int:
+    return max(1, int(os.getenv("STORAGE_MAX_DESCRIPTION_LLM_CHARS", "16000")))
+
+
+def _truncate_for_storage(value: Any, max_chars: int) -> Any:
+    if not isinstance(value, str):
+        return value
+    if len(value) <= max_chars:
+        return value
+    suffix = "\n\n[TRUNCATED_FOR_MYSQL_STORAGE]"
+    keep = max(0, max_chars - len(suffix))
+    return value[:keep].rstrip() + suffix
+
+
+def _sanitize_doc_for_storage(doc: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(doc)
+    llid = _doc_llid(out) or "unknown"
+    limits = {
+        "ko_content_flat": _storage_max_ko_content_flat_chars(),
+        "ko_content_flat_vision": _storage_max_ko_content_flat_vision_chars(),
+        "ko_content_flat_summarised": _storage_max_ko_content_flat_summarised_chars(),
+        "description_llm": _storage_max_description_llm_chars(),
+    }
+    for field, max_chars in limits.items():
+        before = out.get(field)
+        after = _truncate_for_storage(before, max_chars)
+        if isinstance(before, str) and isinstance(after, str) and len(after) < len(before):
+            logger.warning(
+                "[MysqlStorageTruncate] id=%s field=%s chars=%s->%s",
+                llid,
+                field,
+                len(before),
+                len(after),
+            )
+        out[field] = after
+
+    stats = out.get("ko_content_flat_summarised_stats")
+    if isinstance(stats, dict):
+        stats_out = dict(stats)
+        before = stats_out.get("summary")
+        after = _truncate_for_storage(before, _storage_max_ko_content_flat_summarised_chars())
+        if isinstance(before, str) and isinstance(after, str) and len(after) < len(before):
+            logger.warning(
+                "[MysqlStorageTruncate] id=%s field=%s chars=%s->%s",
+                llid,
+                "ko_content_flat_summarised_stats.summary",
+                len(before),
+                len(after),
+            )
+            stats_out["summary"] = after
+            stats_out["summary_char_count"] = len(after)
+            stats_out["summary_word_count"] = len(after.split())
+        out["ko_content_flat_summarised_stats"] = stats_out
+
+    return out
 
 
 def _download_remote_bytes(url: str, *, timeout: int) -> Optional[bytes]:
@@ -368,15 +721,20 @@ def _classify_processing_eligibility(doc: Dict[str, Any], *, pdf_page_count: Opt
     return 1, None
 
 
-def _classify_deferred(doc: Dict[str, Any]) -> tuple[int, Optional[int], Optional[str], int, Optional[str]]:
+def _classify_deferred(doc: Dict[str, Any]) -> tuple[int, Optional[int], Optional[str], int, Optional[str], Dict[str, Any]]:
     page_count = _compute_pdf_page_count(doc)
+    security = _classify_security(doc)
     processing_eligible, processing_ineligible_reason = _classify_processing_eligibility(doc, pdf_page_count=page_count)
+    if security["status"] == "malicious":
+        processing_eligible, processing_ineligible_reason = 0, f"security_{security['reason']}"
+    elif security["status"] == "error" and bool(security.get("escalated")):
+        processing_eligible, processing_ineligible_reason = 0, f"security_{security['reason']}"
     if page_count is None:
-        return 0, None, None, processing_eligible, processing_ineligible_reason
+        return 0, None, None, processing_eligible, processing_ineligible_reason, security
     max_pages = _fast_pdf_max_pages()
     if page_count > max_pages:
-        return 1, page_count, "pdf_over_fast_limit", processing_eligible, processing_ineligible_reason
-    return 0, page_count, None, processing_eligible, processing_ineligible_reason
+        return 1, page_count, "pdf_over_fast_limit", processing_eligible, processing_ineligible_reason, security
+    return 0, page_count, None, processing_eligible, processing_ineligible_reason, security
 
 
 def _archive_current_row(cur, row: Dict[str, Any], *, history_kind: str, archived_at: datetime) -> None:
@@ -384,14 +742,17 @@ def _archive_current_row(cur, row: Dict[str, Any], *, history_kind: str, archive
         """
         INSERT INTO ko_records_history (
           llid, env_mode, history_kind, source_doc_json, current_doc_json,
-          source_fp, current_fp, source_url, source_mimetype, is_deferred,
-          pdf_page_count, deferred_reason, processing_eligible, processing_ineligible_reason, sync_status, fast_pipeline_status,
+          source_fp, current_fp, source_url, source_mimetype, source_kind, is_deferred,
+          pdf_page_count, deferred_reason, processing_eligible, processing_ineligible_reason,
+          security_status, security_scope, security_engine, security_checked_at, security_quarantined, security_escalated, security_reason,
+          sync_status, fast_pipeline_status,
           deferred_pipeline_status, synced_at, enriched_at, improved_at,
           background_completed_at, updated_at, archived_at
         ) VALUES (
           %s, %s, %s, %s, %s,
-          %s, %s, %s, %s, %s,
           %s, %s, %s, %s, %s, %s,
+          %s, %s, %s, %s,
+          %s, %s, %s, %s, %s, %s, %s, %s, %s,
           %s, %s, %s, %s,
           %s, %s, %s
         )
@@ -406,11 +767,19 @@ def _archive_current_row(cur, row: Dict[str, Any], *, history_kind: str, archive
             row.get("current_fp"),
             row.get("source_url"),
             row.get("source_mimetype"),
+            row.get("source_kind"),
             int(bool(row.get("is_deferred"))),
             row.get("pdf_page_count"),
             row.get("deferred_reason"),
             int(bool(row.get("processing_eligible", 1))),
             row.get("processing_ineligible_reason"),
+            row.get("security_status"),
+            row.get("security_scope"),
+            row.get("security_engine"),
+            row.get("security_checked_at"),
+            int(bool(row.get("security_quarantined", 0))),
+            int(bool(row.get("security_escalated", 0))),
+            row.get("security_reason"),
             row.get("sync_status"),
             row.get("fast_pipeline_status"),
             row.get("deferred_pipeline_status"),
@@ -435,11 +804,12 @@ def upsert_source_docs(*, env_mode: str, docs: List[Dict[str, Any]]) -> Dict[str
     with _connect() as conn:
         with conn.cursor() as cur:
             for doc in docs:
-                llid = _doc_llid(doc)
+                normalized_doc, source_url, source_mimetype, source_kind = _normalize_source_metadata(doc)
+                llid = _doc_llid(normalized_doc)
                 if not llid:
                     continue
-                source_fp = compute_source_fp(doc)
-                is_deferred, pdf_page_count, deferred_reason, processing_eligible, processing_ineligible_reason = _classify_deferred(doc)
+                source_fp = compute_source_fp(normalized_doc)
+                is_deferred, pdf_page_count, deferred_reason, processing_eligible, processing_ineligible_reason, security = _classify_deferred(normalized_doc)
                 deferred += int(bool(is_deferred))
                 cur.execute(
                     """
@@ -458,8 +828,18 @@ def upsert_source_docs(*, env_mode: str, docs: List[Dict[str, Any]]) -> Dict[str
                             is_deferred = %s,
                             pdf_page_count = %s,
                             deferred_reason = %s,
+                            source_url = %s,
+                            source_mimetype = %s,
+                            source_kind = %s,
                             processing_eligible = %s,
-                            processing_ineligible_reason = %s
+                            processing_ineligible_reason = %s,
+                            security_status = %s,
+                            security_scope = %s,
+                            security_engine = %s,
+                            security_checked_at = %s,
+                            security_quarantined = %s,
+                            security_escalated = %s,
+                            security_reason = %s
                         WHERE llid = %s AND env_mode = %s
                         """,
                         (
@@ -467,8 +847,18 @@ def upsert_source_docs(*, env_mode: str, docs: List[Dict[str, Any]]) -> Dict[str
                             int(bool(is_deferred)),
                             pdf_page_count,
                             deferred_reason,
+                            source_url,
+                            source_mimetype,
+                            source_kind,
                             int(bool(processing_eligible)),
                             processing_ineligible_reason,
+                            security["status"],
+                            security["scope"],
+                            security["engine"],
+                            security["checked_at"],
+                            int(bool(security["quarantined"])),
+                            int(bool(security["escalated"])),
+                            security["reason"],
                             llid,
                             env_mode.upper(),
                         ),
@@ -485,11 +875,14 @@ def upsert_source_docs(*, env_mode: str, docs: List[Dict[str, Any]]) -> Dict[str
                     """
                     INSERT INTO ko_records (
                       llid, env_mode, source_doc_json, current_doc_json, source_fp, source_url, source_mimetype,
+                      source_kind,
                       is_deferred, pdf_page_count, deferred_reason, processing_eligible, processing_ineligible_reason,
+                      security_status, security_scope, security_engine, security_checked_at, security_quarantined, security_escalated, security_reason,
                       sync_status, updated_at, synced_at
                     ) VALUES (
-                      %s, %s, %s, %s, %s, %s, %s,
+                      %s, %s, %s, %s, %s, %s, %s, %s,
                       %s, %s, %s, %s, %s,
+                      %s, %s, %s, %s, %s, %s, %s,
                       'synced', %s, %s
                     )
                     ON DUPLICATE KEY UPDATE
@@ -497,11 +890,19 @@ def upsert_source_docs(*, env_mode: str, docs: List[Dict[str, Any]]) -> Dict[str
                       source_fp = VALUES(source_fp),
                       source_url = VALUES(source_url),
                       source_mimetype = VALUES(source_mimetype),
+                      source_kind = VALUES(source_kind),
                       is_deferred = VALUES(is_deferred),
                       pdf_page_count = VALUES(pdf_page_count),
                       deferred_reason = VALUES(deferred_reason),
                       processing_eligible = VALUES(processing_eligible),
                       processing_ineligible_reason = VALUES(processing_ineligible_reason),
+                      security_status = VALUES(security_status),
+                      security_scope = VALUES(security_scope),
+                      security_engine = VALUES(security_engine),
+                      security_checked_at = VALUES(security_checked_at),
+                      security_quarantined = VALUES(security_quarantined),
+                      security_escalated = VALUES(security_escalated),
+                      security_reason = VALUES(security_reason),
                       sync_status = 'synced',
                       updated_at = VALUES(updated_at),
                       synced_at = VALUES(synced_at)
@@ -509,16 +910,24 @@ def upsert_source_docs(*, env_mode: str, docs: List[Dict[str, Any]]) -> Dict[str
                     (
                         llid,
                         env_mode.upper(),
-                        json.dumps(doc, ensure_ascii=False),
+                        json.dumps(normalized_doc, ensure_ascii=False),
                         existing.get("current_doc_json") if existing else None,
                         source_fp,
-                        doc.get("@id") or doc.get("ko_file_id"),
-                        doc.get("ko_object_mimetype"),
+                        source_url,
+                        source_mimetype,
+                        source_kind,
                         int(bool(is_deferred)),
                         pdf_page_count,
                         deferred_reason,
                         int(bool(processing_eligible)),
                         processing_ineligible_reason,
+                        security["status"],
+                        security["scope"],
+                        security["engine"],
+                        security["checked_at"],
+                        int(bool(security["quarantined"])),
+                        int(bool(security["escalated"])),
+                        security["reason"],
                         now,
                         now,
                     ),
@@ -588,10 +997,12 @@ def upsert_current_docs(*, env_mode: str, docs: List[Dict[str, Any]], background
     with _connect() as conn:
         with conn.cursor() as cur:
             for doc in docs:
-                llid = _doc_llid(doc)
+                safe_doc = _sanitize_doc_for_storage(doc)
+                llid = _doc_llid(safe_doc)
                 if not llid:
                     continue
-                current_fp = _compute_current_doc_fp(doc)
+                current_fp = _compute_current_doc_fp(safe_doc)
+                current_doc_json = json.dumps(safe_doc, ensure_ascii=False)
                 cur.execute(
                     """
                     SELECT * FROM ko_records
@@ -615,10 +1026,10 @@ def upsert_current_docs(*, env_mode: str, docs: List[Dict[str, Any]], background
                         WHERE llid = %s AND env_mode = %s
                         """,
                         (
-                            json.dumps(doc, ensure_ascii=False),
+                            current_doc_json,
                             status_value,
-                            now if int(doc.get("enriched") or 0) == 1 else existing.get("enriched_at"),
-                            now if stage == "improved" and int(doc.get("improved") or 0) == 1 else existing.get("improved_at"),
+                            now if int(safe_doc.get("enriched") or 0) == 1 else existing.get("enriched_at"),
+                            now if stage == "improved" and int(safe_doc.get("improved") or 0) == 1 else existing.get("improved_at"),
                             now if background and stage == "improved" else existing.get("background_completed_at"),
                             now,
                             llid,
@@ -642,11 +1053,11 @@ def upsert_current_docs(*, env_mode: str, docs: List[Dict[str, Any]], background
                     WHERE llid = %s AND env_mode = %s
                     """,
                     (
-                        json.dumps(doc, ensure_ascii=False),
+                        current_doc_json,
                         current_fp,
                         status_value,
-                        now if int(doc.get("enriched") or 0) == 1 else None,
-                        now if stage == "improved" and int(doc.get("improved") or 0) == 1 else existing.get("improved_at"),
+                        now if int(safe_doc.get("enriched") or 0) == 1 else None,
+                        now if stage == "improved" and int(safe_doc.get("improved") or 0) == 1 else existing.get("improved_at"),
                         now if background and stage == "improved" else existing.get("background_completed_at"),
                         now,
                         llid,
@@ -669,8 +1080,10 @@ def fetch_record(*, env_mode: str, llid: str) -> Optional[Dict[str, Any]]:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT llid, env_mode, source_doc_json, current_doc_json, is_deferred,
-                       pdf_page_count, deferred_reason, processing_eligible, processing_ineligible_reason, sync_status, fast_pipeline_status,
+                SELECT llid, env_mode, source_doc_json, current_doc_json, source_url, source_mimetype, source_kind, is_deferred,
+                       pdf_page_count, deferred_reason, processing_eligible, processing_ineligible_reason,
+                       security_status, security_scope, security_engine, security_checked_at, security_quarantined, security_escalated, security_reason,
+                       sync_status, fast_pipeline_status,
                        deferred_pipeline_status, synced_at, enriched_at, improved_at,
                        background_completed_at, updated_at
                 FROM ko_records
@@ -740,3 +1153,82 @@ def summarize_status(*, env_mode: str) -> Dict[str, Any]:
             )
             row = cur.fetchone() or {}
     return row
+
+
+def repair_source_metadata(*, env_mode: str, max_docs: Optional[int], llids: Optional[List[str]] = None) -> Dict[str, int]:
+    ensure_schema()
+    changed = 0
+    unchanged = 0
+    scanned = 0
+    now = datetime.utcnow()
+
+    where = ["env_mode = %s"]
+    params: List[Any] = [env_mode.upper()]
+    if llids:
+        placeholders = ",".join(["%s"] * len(llids))
+        where.append(f"llid IN ({placeholders})")
+        params.extend(llids)
+
+    sql = (
+        "SELECT * FROM ko_records "
+        f"WHERE {' AND '.join(where)} "
+        "ORDER BY synced_at ASC"
+    )
+    if isinstance(max_docs, int) and max_docs > 0:
+        sql += " LIMIT %s"
+        params.append(max_docs)
+
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall() or []
+            for row in rows:
+                raw = row.get("source_doc_json")
+                if not isinstance(raw, str):
+                    continue
+                try:
+                    source_doc = json.loads(raw)
+                except Exception:
+                    continue
+                if not isinstance(source_doc, dict):
+                    continue
+                scanned += 1
+                normalized_doc, source_url, source_mimetype, source_kind = _normalize_source_metadata(source_doc)
+                new_source_json = json.dumps(normalized_doc, ensure_ascii=False)
+                new_source_fp = compute_source_fp(normalized_doc)
+                if (
+                    row.get("source_doc_json") == new_source_json
+                    and (row.get("source_fp") or "") == new_source_fp
+                    and (row.get("source_url") or None) == source_url
+                    and (row.get("source_mimetype") or None) == source_mimetype
+                    and (row.get("source_kind") or None) == source_kind
+                ):
+                    unchanged += 1
+                    continue
+                _archive_current_row(cur, row, history_kind="source_metadata_repair", archived_at=now)
+                cur.execute(
+                    """
+                    UPDATE ko_records
+                    SET source_doc_json = %s,
+                        source_fp = %s,
+                        source_url = %s,
+                        source_mimetype = %s,
+                        source_kind = %s,
+                        updated_at = %s
+                    WHERE llid = %s AND env_mode = %s
+                    """,
+                    (
+                        new_source_json,
+                        new_source_fp,
+                        source_url,
+                        source_mimetype,
+                        source_kind,
+                        now,
+                        row.get("llid"),
+                        env_mode.upper(),
+                    ),
+                )
+                changed += int(cur.rowcount > 0)
+        conn.commit()
+
+    return {"scanned": scanned, "changed": changed, "unchanged": unchanged}

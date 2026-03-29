@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Tuple, Optional
 from stages.improver.config import (PRIMARY_MODEL, EXTREME_CTX_THRESHOLD_TOK, NEAR_LIMIT_CTX_THRESHOLD_TOK,
                                     CHUNK_TARGET_TOK, CHUNK_OVERLAP_TOK, DEFAULT_NUM_PREDICT,
                                     COMBINE_NUM_PREDICT, SUMMARY_MAX_ATTEMPTS, METADATA_MAX_ATTEMPTS,
+                                    METADATA_INPUT_MAX_CHARS, METADATA_EXISTING_VALUE_MAX_CHARS,
                                     BASE_VLLM_HOST, VLLM_API_KEY)
 from stages.improver.extractors import extract_summary_json, extract_metadata_text, extract_metadata_keywords
 from stages.improver.llm_client import call_vllm_chat, warm_up_model
@@ -15,6 +16,17 @@ from stages.improver.prompts import (UNIVERSAL_SUMMARY_PROMPT, DEFAULT_PROMPT, C
                                      COMBINE_PROMPT, METADATA_PROMPT, POLISH_PROMPT)
 from stages.improver.text_utils import approx_token_count, split_into_tokenish_chunks, should_summarise_text
 logger = logging.getLogger(__name__)
+
+
+def _truncate_for_metadata(text: str, *, limit: int) -> str:
+    if limit <= 0:
+        return text
+    if len(text) <= limit:
+        return text
+    head = max(0, limit // 2)
+    tail = max(0, limit - head - 64)
+    suffix = text[-tail:] if tail > 0 else ""
+    return f"{text[:head]}\n\n[... truncated ...]\n\n{suffix}"
 
 
 def _summary_stats(source_text: str, summary_payload: Dict[str, Any], *, mode: str) -> Dict[str, Any]:
@@ -118,12 +130,28 @@ def _run_metadata_field(
     summary_en: str,
     field: str,
     existing_value: Any | None,
+    llid: Optional[str] = None,
 ) -> Any:
     existing_str = ""
     if isinstance(existing_value, list):
         existing_str = ", ".join(map(str, existing_value))
     elif isinstance(existing_value, str):
         existing_str = existing_value
+
+    original_summary_len = len(summary_en or "")
+    original_existing_len = len(existing_str or "")
+    summary_en = _truncate_for_metadata(summary_en or "", limit=METADATA_INPUT_MAX_CHARS)
+    existing_str = _truncate_for_metadata(existing_str or "", limit=METADATA_EXISTING_VALUE_MAX_CHARS)
+    if len(summary_en) < original_summary_len or len(existing_str) < original_existing_len:
+        logger.warning(
+            "[ImproverMetadataTruncate] id=%s field=%s summary_chars=%s->%s existing_chars=%s->%s",
+            llid,
+            field,
+            original_summary_len,
+            len(summary_en),
+            original_existing_len,
+            len(existing_str),
+        )
 
     meta_context = (
         f"FIELD: {field}\n\n"
@@ -168,6 +196,7 @@ def improve_doc_in_place(doc: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
     """
     try:
         model = _require_model()
+        llid = str(doc.get("_orig_id") or doc.get("_id") or "")
 
         content = doc.get("ko_content_flat")
         if not isinstance(content, str) or not content.strip():
@@ -243,28 +272,28 @@ def improve_doc_in_place(doc: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
         # Generate only if missing (idempotent)
         if not doc.get("title_llm"):
             existing_title = doc.get("title", "")
-            v = _run_metadata_field(model=model, summary_en=summary_text, field="TITLE", existing_value=existing_title)
+            v = _run_metadata_field(model=model, summary_en=summary_text, field="TITLE", existing_value=existing_title, llid=llid)
             if not isinstance(v, str) or not v.strip():
                 v = existing_title
             doc["title_llm"] = v
 
         if not doc.get("subtitle_llm"):
             existing_subtitle = doc.get("subtitle", "")
-            v = _run_metadata_field(model=model, summary_en=summary_text, field="SUBTITLE", existing_value=existing_subtitle)
+            v = _run_metadata_field(model=model, summary_en=summary_text, field="SUBTITLE", existing_value=existing_subtitle, llid=llid)
             if not isinstance(v, str) or not v.strip():
                 v = existing_subtitle
             doc["subtitle_llm"] = v
 
         if not doc.get("description_llm"):
             existing_description = doc.get("description", "")
-            v = _run_metadata_field(model=model, summary_en=summary_text, field="DESCRIPTION", existing_value=existing_description)
+            v = _run_metadata_field(model=model, summary_en=summary_text, field="DESCRIPTION", existing_value=existing_description, llid=llid)
             if not isinstance(v, str) or not v.strip():
                 v = existing_description
             doc["description_llm"] = v
 
         if not doc.get("keywords_llm"):
             existing_keywords = doc.get("keywords", [])
-            v = _run_metadata_field(model=model, summary_en=summary_text, field="KEYWORDS", existing_value=existing_keywords)
+            v = _run_metadata_field(model=model, summary_en=summary_text, field="KEYWORDS", existing_value=existing_keywords, llid=llid)
             doc["keywords_llm"] = v
 
         doc["improved"] = 1
