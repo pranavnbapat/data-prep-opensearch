@@ -178,15 +178,27 @@ def normalize_date_to_yyyy_mm_dd(value: str) -> str:
     # 3) Normalise a common ISO quirk: 'Z' -> '+00:00' for fromisoformat compatibility
     s_iso = s.replace('Z', '+00:00').replace('z', '+00:00')
 
-    # Strategy A: dateutil is very tolerant; prefer it with day-first semantics.
-    try:
-        dt = du_parser.parse(s, dayfirst=True, yearfirst=False, fuzzy=True)
-    except (du_parser.ParserError, ValueError):
-        # Strategy B: try Python's ISO parser for strictly ISO inputs after Z fix.
+    # Strategy A: prefer explicit year-first / ISO-looking inputs before any locale-sensitive parsing.
+    # This avoids flipping values like "2026-02-10T00:00:00" into 2026-10-02 under day-first parsing.
+    iso_like = bool(re.match(r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}(?:$|[Tt\s])", s))
+    if iso_like:
         try:
             dt = datetime.fromisoformat(s_iso)
-        except ValueError as e:
-            raise ValueError(f"Could not parse date: {value!r}") from e
+        except ValueError:
+            try:
+                dt = du_parser.parse(s, dayfirst=False, yearfirst=True, fuzzy=True)
+            except (du_parser.ParserError, ValueError) as e:
+                raise ValueError(f"Could not parse date: {value!r}") from e
+    else:
+        # Strategy B: dateutil is very tolerant; use day-first semantics for ambiguous non-ISO dates.
+        try:
+            dt = du_parser.parse(s, dayfirst=True, yearfirst=False, fuzzy=True)
+        except (du_parser.ParserError, ValueError):
+            # Strategy C: last-chance ISO parser for strictly ISO inputs after Z fix.
+            try:
+                dt = datetime.fromisoformat(s_iso)
+            except ValueError as e:
+                raise ValueError(f"Could not parse date: {value!r}") from e
 
     # If it's a date-only (no time), dateutil gives a datetime at 00:00 with no tzinfo.
     # If it has tzinfo or came from ISO with offset, convert to UTC before taking the date.
@@ -870,5 +882,4 @@ def transcribe_media_url(url: str, session: requests.Session) -> str:
                 return text2.strip()
 
     return ""
-
 

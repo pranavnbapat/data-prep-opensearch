@@ -105,6 +105,10 @@ class MysqlExportParams(BaseModel):
         default=False,
         description="If true, export only records that already have processed MySQL state. Otherwise export current known state for all synced records.",
     )
+    eligible_only: bool = Field(
+        default=True,
+        description="If true, export only records that are processing-eligible. Set false to include blocked or ineligible records too.",
+    )
 
     model_config = {"extra": "ignore"}
 

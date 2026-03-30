@@ -69,6 +69,7 @@ def ensure_schema() -> None:
                   deferred_reason VARCHAR(64) NULL,
                   processing_eligible TINYINT(1) NOT NULL DEFAULT 1,
                   processing_ineligible_reason VARCHAR(64) NULL,
+                  security_fp VARCHAR(64) NULL,
                   security_status VARCHAR(16) NULL,
                   security_scope VARCHAR(16) NULL,
                   security_engine VARCHAR(32) NULL,
@@ -110,6 +111,7 @@ def ensure_schema() -> None:
                   deferred_reason VARCHAR(64) NULL,
                   processing_eligible TINYINT(1) NOT NULL DEFAULT 1,
                   processing_ineligible_reason VARCHAR(64) NULL,
+                  security_fp VARCHAR(64) NULL,
                   security_status VARCHAR(16) NULL,
                   security_scope VARCHAR(16) NULL,
                   security_engine VARCHAR(32) NULL,
@@ -164,6 +166,7 @@ def ensure_schema() -> None:
                 )
             for table_name in ("ko_records", "ko_records_history"):
                 prefix = f"ALTER TABLE {table_name} ADD COLUMN"
+                _ensure_column(cur, table_name=table_name, column_name="security_fp", ddl=f"{prefix} security_fp VARCHAR(64) NULL")
                 _ensure_column(cur, table_name=table_name, column_name="security_status", ddl=f"{prefix} security_status VARCHAR(16) NULL")
                 _ensure_column(cur, table_name=table_name, column_name="security_scope", ddl=f"{prefix} security_scope VARCHAR(16) NULL")
                 _ensure_column(cur, table_name=table_name, column_name="security_engine", ddl=f"{prefix} security_engine VARCHAR(32) NULL")
@@ -259,6 +262,10 @@ def _agri_gate_timeout() -> int:
     return max(5, int(os.getenv("AGRI_GATE_TIMEOUT", "60")))
 
 
+def _security_rescan_max_age_days() -> int:
+    return max(0, int(os.getenv("SECURITY_RESCAN_MAX_AGE_DAYS", "30")))
+
+
 def _source_url_from_doc(doc: Dict[str, Any]) -> Optional[str]:
     for key in ("@id", "ko_file_id"):
         value = doc.get(key)
@@ -316,6 +323,33 @@ def _security_decision(*, status: str, scope: str, engine: str, reason: str, che
     }
 
 
+def _compute_security_fp(doc: Dict[str, Any]) -> str:
+    ko_is_hosted = bool(doc.get("ko_is_hosted"))
+    if ko_is_hosted:
+        size_raw = doc.get("ko_object_size")
+        try:
+            size_val = int(size_raw) if size_raw is not None and str(size_raw).strip() else None
+        except Exception:
+            size_val = None
+        obj = {
+            "mode": "hosted_file",
+            "ko_is_hosted": True,
+            "ko_file_id": (doc.get("ko_file_id") or "").strip() if isinstance(doc.get("ko_file_id"), str) else None,
+            "ko_object_mimetype": (doc.get("ko_object_mimetype") or "").strip().lower() if isinstance(doc.get("ko_object_mimetype"), str) else None,
+            "ko_object_extension": (doc.get("ko_object_extension") or "").strip().lower() if isinstance(doc.get("ko_object_extension"), str) else None,
+            "ko_object_size": size_val,
+        }
+    else:
+        obj = {
+            "mode": "external_url",
+            "ko_is_hosted": False,
+            "@id": (doc.get("@id") or "").strip() if isinstance(doc.get("@id"), str) else None,
+            "resolved_url": (doc.get("resolved_url") or "").strip() if isinstance(doc.get("resolved_url"), str) else None,
+        }
+    payload = json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def _parse_checked_at(value: Any) -> Optional[datetime]:
     if isinstance(value, datetime):
         return value
@@ -359,6 +393,31 @@ def _decision_from_agri_gate(data: Dict[str, Any], *, fallback_scope: str, stric
         quarantined=quarantined,
         escalated=escalated,
     )
+
+
+def _reuse_existing_security(existing: Dict[str, Any]) -> Dict[str, Any]:
+    return _security_decision(
+        status=str(existing.get("security_status") or "skipped"),
+        scope=str(existing.get("security_scope") or "none"),
+        engine=str(existing.get("security_engine") or "none"),
+        reason=str(existing.get("security_reason") or "security_unknown"),
+        checked_at=_parse_checked_at(existing.get("security_checked_at")),
+        quarantined=bool(existing.get("security_quarantined")),
+        escalated=bool(existing.get("security_escalated")),
+    )
+
+
+def _security_scan_stale(existing: Dict[str, Any]) -> bool:
+    max_age_days = _security_rescan_max_age_days()
+    if max_age_days <= 0:
+        return False
+    checked_at = _parse_checked_at(existing.get("security_checked_at"))
+    if checked_at is None:
+        return True
+    if checked_at.tzinfo is not None:
+        checked_at = checked_at.replace(tzinfo=None)
+    age = datetime.utcnow() - checked_at
+    return age.total_seconds() > (max_age_days * 86400)
 
 
 def _scan_url_security(url: str) -> Dict[str, Any]:
@@ -452,7 +511,10 @@ def _scan_file_security(doc: Dict[str, Any]) -> Dict[str, Any]:
         )
 
 
-def _classify_security(doc: Dict[str, Any]) -> Dict[str, Any]:
+def _classify_security(doc: Dict[str, Any], *, existing: Optional[Dict[str, Any]] = None) -> tuple[str, Dict[str, Any]]:
+    security_fp = _compute_security_fp(doc)
+    if existing and (existing.get("security_fp") or "") == security_fp and not _security_scan_stale(existing):
+        return security_fp, _reuse_existing_security(existing)
     decisions: List[Dict[str, Any]] = []
     url_decision: Optional[Dict[str, Any]] = None
     file_decision: Optional[Dict[str, Any]] = None
@@ -464,7 +526,7 @@ def _classify_security(doc: Dict[str, Any]) -> Dict[str, Any]:
         file_decision = _scan_file_security(doc)
         decisions.append(file_decision)
     if not decisions:
-        return _security_decision(status="skipped", scope="none", engine="none", reason="no_security_target")
+        return security_fp, _security_decision(status="skipped", scope="none", engine="none", reason="no_security_target")
     if any(d["status"] == "malicious" for d in decisions):
         chosen = next(d for d in decisions if d["status"] == "malicious")
     elif any(d["status"] == "error" and d.get("escalated") for d in decisions):
@@ -485,7 +547,7 @@ def _classify_security(doc: Dict[str, Any]) -> Dict[str, Any]:
         if scope and scope not in scope_parts and scope != "none":
             scope_parts.append(scope)
     chosen["scope"] = ",".join(scope_parts) if scope_parts else chosen.get("scope") or "none"
-    return chosen
+    return security_fp, chosen
 
 
 def _compute_current_doc_fp(doc: Dict[str, Any]) -> str:
@@ -746,20 +808,20 @@ def _classify_processing_eligibility(doc: Dict[str, Any], *, pdf_page_count: Opt
     return 1, None
 
 
-def _classify_deferred(doc: Dict[str, Any]) -> tuple[int, Optional[int], Optional[str], int, Optional[str], Dict[str, Any]]:
+def _classify_deferred(doc: Dict[str, Any], *, existing: Optional[Dict[str, Any]] = None) -> tuple[int, Optional[int], Optional[str], int, Optional[str], str, Dict[str, Any]]:
     page_count = _compute_pdf_page_count(doc)
-    security = _classify_security(doc)
+    security_fp, security = _classify_security(doc, existing=existing)
     processing_eligible, processing_ineligible_reason = _classify_processing_eligibility(doc, pdf_page_count=page_count)
     if security["status"] == "malicious":
         processing_eligible, processing_ineligible_reason = 0, f"security_{security['reason']}"
     elif security["status"] == "error" and bool(security.get("escalated")):
         processing_eligible, processing_ineligible_reason = 0, f"security_{security['reason']}"
     if page_count is None:
-        return 0, None, None, processing_eligible, processing_ineligible_reason, security
+        return 0, None, None, processing_eligible, processing_ineligible_reason, security_fp, security
     max_pages = _fast_pdf_max_pages()
     if page_count > max_pages:
-        return 1, page_count, "pdf_over_fast_limit", processing_eligible, processing_ineligible_reason, security
-    return 0, page_count, None, processing_eligible, processing_ineligible_reason, security
+        return 1, page_count, "pdf_over_fast_limit", processing_eligible, processing_ineligible_reason, security_fp, security
+    return 0, page_count, None, processing_eligible, processing_ineligible_reason, security_fp, security
 
 
 def _archive_current_row(cur, row: Dict[str, Any], *, history_kind: str, archived_at: datetime) -> None:
@@ -769,7 +831,7 @@ def _archive_current_row(cur, row: Dict[str, Any], *, history_kind: str, archive
           llid, env_mode, history_kind, source_doc_json, current_doc_json,
           source_fp, current_fp, source_url, source_mimetype, source_kind, is_deferred,
           pdf_page_count, deferred_reason, processing_eligible, processing_ineligible_reason,
-          security_status, security_scope, security_engine, security_checked_at, security_quarantined, security_escalated, security_reason,
+          security_fp, security_status, security_scope, security_engine, security_checked_at, security_quarantined, security_escalated, security_reason,
           sync_status, fast_pipeline_status,
           deferred_pipeline_status, synced_at, enriched_at, improved_at,
           background_completed_at, updated_at, archived_at
@@ -777,7 +839,7 @@ def _archive_current_row(cur, row: Dict[str, Any], *, history_kind: str, archive
           %s, %s, %s, %s, %s,
           %s, %s, %s, %s, %s, %s,
           %s, %s, %s, %s,
-          %s, %s, %s, %s, %s, %s, %s, %s, %s,
+          %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
           %s, %s, %s, %s,
           %s, %s, %s
         )
@@ -798,6 +860,7 @@ def _archive_current_row(cur, row: Dict[str, Any], *, history_kind: str, archive
             row.get("deferred_reason"),
             int(bool(row.get("processing_eligible", 1))),
             row.get("processing_ineligible_reason"),
+            row.get("security_fp"),
             row.get("security_status"),
             row.get("security_scope"),
             row.get("security_engine"),
@@ -834,8 +897,6 @@ def upsert_source_docs(*, env_mode: str, docs: List[Dict[str, Any]]) -> Dict[str
                 if not llid:
                     continue
                 source_fp = compute_source_fp(normalized_doc)
-                is_deferred, pdf_page_count, deferred_reason, processing_eligible, processing_ineligible_reason, security = _classify_deferred(normalized_doc)
-                deferred += int(bool(is_deferred))
                 cur.execute(
                     """
                     SELECT * FROM ko_records
@@ -844,6 +905,8 @@ def upsert_source_docs(*, env_mode: str, docs: List[Dict[str, Any]]) -> Dict[str
                     (llid, env_mode.upper()),
                 )
                 existing = cur.fetchone()
+                is_deferred, pdf_page_count, deferred_reason, processing_eligible, processing_ineligible_reason, security_fp, security = _classify_deferred(normalized_doc, existing=existing)
+                deferred += int(bool(is_deferred))
                 if existing and existing.get("source_fp") == source_fp:
                     cur.execute(
                         """
@@ -858,6 +921,7 @@ def upsert_source_docs(*, env_mode: str, docs: List[Dict[str, Any]]) -> Dict[str
                             source_kind = %s,
                             processing_eligible = %s,
                             processing_ineligible_reason = %s,
+                            security_fp = %s,
                             security_status = %s,
                             security_scope = %s,
                             security_engine = %s,
@@ -877,6 +941,7 @@ def upsert_source_docs(*, env_mode: str, docs: List[Dict[str, Any]]) -> Dict[str
                             source_kind,
                             int(bool(processing_eligible)),
                             processing_ineligible_reason,
+                            security_fp,
                             security["status"],
                             security["scope"],
                             security["engine"],
@@ -902,12 +967,12 @@ def upsert_source_docs(*, env_mode: str, docs: List[Dict[str, Any]]) -> Dict[str
                       llid, env_mode, source_doc_json, current_doc_json, source_fp, source_url, source_mimetype,
                       source_kind,
                       is_deferred, pdf_page_count, deferred_reason, processing_eligible, processing_ineligible_reason,
-                      security_status, security_scope, security_engine, security_checked_at, security_quarantined, security_escalated, security_reason,
+                      security_fp, security_status, security_scope, security_engine, security_checked_at, security_quarantined, security_escalated, security_reason,
                       sync_status, updated_at, synced_at
                     ) VALUES (
                       %s, %s, %s, %s, %s, %s, %s, %s,
                       %s, %s, %s, %s, %s,
-                      %s, %s, %s, %s, %s, %s, %s,
+                      %s, %s, %s, %s, %s, %s, %s, %s,
                       'synced', %s, %s
                     )
                     ON DUPLICATE KEY UPDATE
@@ -921,6 +986,7 @@ def upsert_source_docs(*, env_mode: str, docs: List[Dict[str, Any]]) -> Dict[str
                       deferred_reason = VALUES(deferred_reason),
                       processing_eligible = VALUES(processing_eligible),
                       processing_ineligible_reason = VALUES(processing_ineligible_reason),
+                      security_fp = VALUES(security_fp),
                       security_status = VALUES(security_status),
                       security_scope = VALUES(security_scope),
                       security_engine = VALUES(security_engine),
@@ -946,6 +1012,7 @@ def upsert_source_docs(*, env_mode: str, docs: List[Dict[str, Any]]) -> Dict[str
                         deferred_reason,
                         int(bool(processing_eligible)),
                         processing_ineligible_reason,
+                        security_fp,
                         security["status"],
                         security["scope"],
                         security["engine"],
@@ -1130,13 +1197,15 @@ def fetch_record(*, env_mode: str, llid: str) -> Optional[Dict[str, Any]]:
     return row
 
 
-def export_docs(*, env_mode: str, processed_only: bool) -> List[Dict[str, Any]]:
+def export_docs(*, env_mode: str, processed_only: bool, eligible_only: bool) -> List[Dict[str, Any]]:
     ensure_schema()
     out: List[Dict[str, Any]] = []
     where = ["env_mode = %s"]
     params: List[Any] = [env_mode.upper()]
     if processed_only:
         where.append("current_doc_json IS NOT NULL")
+    if eligible_only:
+        where.append("processing_eligible = 1")
     sql = (
         "SELECT source_doc_json, current_doc_json FROM ko_records "
         f"WHERE {' AND '.join(where)} "
@@ -1257,3 +1326,102 @@ def repair_source_metadata(*, env_mode: str, max_docs: Optional[int], llids: Opt
         conn.commit()
 
     return {"scanned": scanned, "changed": changed, "unchanged": unchanged}
+
+
+def repair_current_date_metadata(*, env_mode: str, max_docs: Optional[int], llids: Optional[List[str]] = None) -> Dict[str, int]:
+    ensure_schema()
+    scanned = 0
+    changed = 0
+    unchanged = 0
+    skipped_no_current = 0
+    now = datetime.utcnow()
+
+    where = ["env_mode = %s"]
+    params: List[Any] = [env_mode.upper()]
+    if llids:
+        placeholders = ",".join(["%s"] * len(llids))
+        where.append(f"llid IN ({placeholders})")
+        params.extend(llids)
+
+    sql = (
+        "SELECT * FROM ko_records "
+        f"WHERE {' AND '.join(where)} "
+        "ORDER BY synced_at ASC"
+    )
+    if isinstance(max_docs, int) and max_docs > 0:
+        sql += " LIMIT %s"
+        params.append(max_docs)
+
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall() or []
+            for row in rows:
+                source_raw = row.get("source_doc_json")
+                current_raw = row.get("current_doc_json")
+                if not isinstance(source_raw, str):
+                    continue
+                scanned += 1
+                if not isinstance(current_raw, str) or not current_raw.strip():
+                    skipped_no_current += 1
+                    continue
+                try:
+                    source_doc = json.loads(source_raw)
+                    current_doc = json.loads(current_raw)
+                except Exception:
+                    unchanged += 1
+                    continue
+                if not isinstance(source_doc, dict) or not isinstance(current_doc, dict):
+                    unchanged += 1
+                    continue
+
+                src_date = source_doc.get("date_of_completion")
+                src_date_source = source_doc.get("date_of_completion_source")
+                cur_date = current_doc.get("date_of_completion")
+                cur_date_source = current_doc.get("date_of_completion_source")
+
+                if src_date == cur_date and src_date_source == cur_date_source:
+                    unchanged += 1
+                    continue
+
+                patched = dict(current_doc)
+                if src_date is None:
+                    patched.pop("date_of_completion", None)
+                else:
+                    patched["date_of_completion"] = src_date
+
+                if src_date_source is None:
+                    patched.pop("date_of_completion_source", None)
+                else:
+                    patched["date_of_completion_source"] = src_date_source
+
+                patched = _sanitize_doc_for_storage(patched)
+                new_current_json = json.dumps(patched, ensure_ascii=False)
+                new_current_fp = _compute_current_doc_fp(patched)
+
+                _archive_current_row(cur, row, history_kind="current_date_metadata_repair", archived_at=now)
+                cur.execute(
+                    """
+                    UPDATE ko_records
+                    SET current_doc_json = %s,
+                        current_fp = %s,
+                        updated_at = %s
+                    WHERE llid = %s AND env_mode = %s
+                    """,
+                    (
+                        new_current_json,
+                        new_current_fp,
+                        now,
+                        row.get("llid"),
+                        env_mode.upper(),
+                    ),
+                )
+                changed += int(cur.rowcount > 0)
+        conn.commit()
+
+    return {
+        "scanned": scanned,
+        "changed": changed,
+        "unchanged": unchanged,
+        "skipped_no_current": skipped_no_current,
+    }

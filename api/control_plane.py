@@ -12,7 +12,8 @@ from api.job_store import (JOBS, JOB_LOCK, PerJobLogHandler, clear_job_cancel, g
                            log_file_path, run_log_path, write_job_to_disk)
 from api.models import EnvMode, JobStatus
 from api.mysql_store import (ensure_schema, export_docs, fetch_record, fetch_source_docs,
-                             repair_source_metadata, summarize_status, upsert_current_docs, upsert_processed_docs, upsert_source_docs)
+                             repair_current_date_metadata, repair_source_metadata, summarize_status,
+                             upsert_current_docs, upsert_processed_docs, upsert_source_docs)
 from common.cancellation import JobCancelled
 from pipeline.io import atomic_write_json, output_dir, run_stamp
 from stages.downloader.service import download_and_prepare
@@ -426,13 +427,13 @@ def run_mysql_improver_fallback_job(
             clear_job_cancel(job_id)
 
 
-def run_mysql_export_job(job_id: str, *, env_mode: EnvMode, processed_only: bool) -> None:
+def run_mysql_export_job(job_id: str, *, env_mode: EnvMode, processed_only: bool, eligible_only: bool) -> None:
     _set_job_running(job_id)
     with _job_logging(job_id):
         try:
-            logger.info("Starting mysql export (env=%s, processed_only=%s)", env_mode.value, processed_only)
+            logger.info("Starting mysql export (env=%s, processed_only=%s, eligible_only=%s)", env_mode.value, processed_only, eligible_only)
             ensure_schema()
-            docs = export_docs(env_mode=env_mode.value, processed_only=processed_only)
+            docs = export_docs(env_mode=env_mode.value, processed_only=processed_only, eligible_only=eligible_only)
             run_id = run_stamp()
             out_dir = output_dir(env_mode.value, root=os.getenv("OUTPUT_ROOT", "output"))
             out_path = out_dir / f"final_improved_mysql_export_{run_id}.json"
@@ -443,6 +444,7 @@ def run_mysql_export_job(job_id: str, *, env_mode: EnvMode, processed_only: bool
                     "created_at": datetime.utcnow().isoformat(timespec="seconds"),
                     "stage": "mysql_export",
                     "processed_only": processed_only,
+                    "eligible_only": eligible_only,
                 },
                 "counts": {"docs": len(docs)},
                 "docs": docs,
@@ -477,6 +479,27 @@ def run_mysql_source_metadata_repair_job(
             _set_job_done(job_id, details=details)
         except Exception as e:
             logger.exception("Source metadata repair failed")
+            _set_job_error(job_id, e)
+
+
+def run_mysql_current_date_metadata_repair_job(
+    job_id: str,
+    *,
+    env_mode: EnvMode,
+    max_docs: Optional[int],
+    llids: Optional[List[str]] = None,
+) -> None:
+    _set_job_running(job_id)
+    with _job_logging(job_id):
+        try:
+            logger.info("Starting current date metadata repair (env=%s, max_docs=%s, llids=%s)", env_mode.value, max_docs, llids)
+            ensure_schema()
+            stats = repair_current_date_metadata(env_mode=env_mode.value, max_docs=max_docs, llids=llids)
+            details = {**stats, "mysql_status": summarize_status(env_mode=env_mode.value)}
+            logger.info("Current date metadata repair finished: %s", details)
+            _set_job_done(job_id, details=details)
+        except Exception as e:
+            logger.exception("Current date metadata repair failed")
             _set_job_error(job_id, e)
 
 

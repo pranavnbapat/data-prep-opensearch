@@ -12,6 +12,7 @@ from uuid import uuid4
 load_dotenv()
 
 from api.control_plane import (get_mysql_record, run_backend_sync_job, run_mysql_export_job,
+                               run_mysql_current_date_metadata_repair_job,
                                run_mysql_improver_fallback_job, run_mysql_pipeline_job,
                                run_mysql_source_metadata_repair_job)
 from api.job_runner import run_pipeline_job
@@ -278,6 +279,36 @@ def source_metadata_repair_status():
 
 
 @app.post(
+    "/current/repair-date-of-completion",
+    summary="Repair date_of_completion in current_doc_json from source_doc_json",
+    description=(
+        "Copies `date_of_completion` and `date_of_completion_source` from source_doc_json into current_doc_json "
+        "for rows that already have current_doc_json. Rows with empty current_doc_json are skipped."
+    ),
+)
+def trigger_current_date_metadata_repair(params: MysqlSourceMetadataRepairParams, bg: BackgroundTasks):
+    env_mode_val = (params.env_mode.value if params.env_mode else (os.getenv("ENV_MODE") or "DEV")).upper()
+    resolved_env_mode = EnvMode(env_mode_val)
+    job = _create_job(env_mode=resolved_env_mode, page_size=100, job_kind="mysql_current_date_metadata_repair", scope="current_date_metadata")
+    bg.add_task(
+        run_mysql_current_date_metadata_repair_job,
+        job.id,
+        env_mode=job.env_mode,
+        max_docs=params.max_docs,
+        llids=params.llids,
+    )
+    return {"status": "scheduled", "job_id": job.id}
+
+
+@app.get("/current/repair-date-of-completion/status")
+def current_date_metadata_repair_status():
+    with JOB_LOCK:
+        jobs = [j for j in JOBS.values() if j.job_kind == "mysql_current_date_metadata_repair"]
+        jobs.sort(key=lambda x: x.created_at, reverse=True)
+        return [j.model_dump(mode="json") for j in jobs[:10]]
+
+
+@app.post(
     "/records/{record_id}/reprocess",
     summary="Reprocess one MySQL-backed record",
     description="Queues one logical-layer record for targeted reprocessing through the fast-path pipeline.",
@@ -311,6 +342,7 @@ def get_record(record_id: str, env_mode: EnvMode | None = None):
     summary="Export final-improved snapshot from MySQL",
     description=(
         "Builds a fresh JSON export from MySQL-backed record state. "
+        "By default only processing-eligible records are exported. "
         "If `processed_only=true`, only records with processed state are exported."
     ),
 )
@@ -323,6 +355,7 @@ def export_final_improved(params: MysqlExportParams, bg: BackgroundTasks):
         job.id,
         env_mode=job.env_mode,
         processed_only=bool(params.processed_only),
+        eligible_only=bool(params.eligible_only),
     )
     return {"status": "scheduled", "job_id": job.id}
 
