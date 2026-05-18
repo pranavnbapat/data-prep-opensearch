@@ -77,7 +77,6 @@ Checkpoint behavior:
 Main endpoints:
 
 - `GET /healthz`
-- `POST /run-pipeline`
 - `POST /sync/backend-core`
 - `GET /sync/backend-core/status`
 - `POST /pipeline/fast`
@@ -107,13 +106,9 @@ Development with reload:
 uvicorn api.app:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-Example trigger:
+Legacy compatibility note:
 
-```bash
-curl -X POST http://127.0.0.1:8000/run-pipeline \
-  -H "Content-Type: application/json" \
-  -d '{"env_mode":"DEV","page_size":100}'
-```
+- The original `POST /run-pipeline` endpoint is still implemented, but it is hidden from `/docs` and is no longer the recommended operational path.
 
 Example cancel:
 
@@ -278,7 +273,7 @@ Improver:
 - `IMPROVER_DEFAULT_NUM_PREDICT`
 - `IMPROVER_COMBINE_NUM_PREDICT`
 
-Pipeline stage flags (used by the original `/run-pipeline` endpoint):
+Pipeline stage flags (used only by the hidden legacy `/run-pipeline` endpoint):
 
 - `ENABLE_DOWNLOADER`
 - `ENABLE_ENRICHER`
@@ -311,6 +306,17 @@ Recommended flow:
 3. `POST /pipeline/deferred`
 4. `POST /pipeline/improver-fallback` (optional, for deferred rows lacking summaries)
 5. `POST /exports/final-improved`
+
+Active scheduler (`data-prep-opensearch-scheduler`):
+
+- daily `04:00`: `POST /sync/backend-core`
+- daily `07:00`: `POST /pipeline/fast`
+- daily `09:00`: `POST /exports/final-improved`
+- Friday `22:00`: `POST /pipeline/deferred`
+
+Scheduler note:
+
+- the Friday deferred run happens after the daily `09:00` export, so those deferred updates are included in the next export unless you trigger an extra export manually.
 
 Current behavior:
 

@@ -21,6 +21,19 @@ It adds five operational capabilities:
 3. `POST /pipeline/deferred`
 4. `POST /exports/final-improved`
 
+## Active Scheduler
+
+Current `data-prep-opensearch-scheduler` timings:
+
+- daily `04:00`: `POST /sync/backend-core`
+- daily `07:00`: `POST /pipeline/fast`
+- daily `09:00`: `POST /exports/final-improved`
+- Friday `22:00`: `POST /pipeline/deferred`
+
+Operational note:
+
+- the Friday deferred run lands after the daily export, so deferred Friday updates appear in the next export unless you trigger another export manually.
+
 ## Full Workflow
 
 ```text
@@ -339,7 +352,7 @@ It adds five operational capabilities:
 ## Notes
 
 - This does not replace the original file-based pipeline yet.
-- The original `/run-pipeline` endpoint still works.
+- The original `/run-pipeline` endpoint still works, but it is hidden from `/docs` and is no longer part of the active scheduler path.
 - MySQL endpoints require `PyMySQL` in the runtime environment.
 - Stage artifacts are still written under `output/`.
 - Schema bootstrap is automatic when the FastAPI app starts and MySQL is configured.

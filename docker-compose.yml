@@ -62,21 +62,21 @@ services:
       retries: 3
       start_period: 10s
 
-#  data-prep-opensearch-scheduler:
-#    build:
-#      context: .
-#      dockerfile: Dockerfile.scheduler
-#    image: ghcr.io/pranavnbapat/data-prep-opensearch-scheduler:latest
-#    container_name: data-prep-opensearch-scheduler
-#    depends_on:
-#      data-prep-opensearch-mysql:
-#        condition: service_healthy
-#      data-prep-opensearch:
-#        condition: service_healthy
-#    env_file:
-#      - .env
-#    environment:
-#      TARGET_URL: http://data-prep-opensearch:8000/run-pipeline
-#      HEALTH_URL: http://data-prep-opensearch:8000/healthz
-#    restart: always
-#    user: "${UID}:${GID}"
+  data-prep-opensearch-scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile.scheduler
+    image: ghcr.io/pranavnbapat/data-prep-opensearch-scheduler:latest
+    container_name: data-prep-opensearch-scheduler
+    depends_on:
+      data-prep-opensearch-mysql:
+        condition: service_healthy
+      data-prep-opensearch:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      API_BASE_URL: http://data-prep-opensearch:8000
+      HEALTH_URL: http://data-prep-opensearch:8000/healthz
+    restart: always
+    user: "${UID}:${GID}"

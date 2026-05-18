@@ -231,6 +231,7 @@ def enrich_with_project(ko_doc: Dict[str, Any], projects_index: Dict[str, Dict[s
     ko_doc["project_url"] = p.get("URL") or p.get("projectURL") or p.get("website")
     ko_doc["project_doi"] = (p.get("identifiers") or {}).get("grantDoi") or p.get("projectDoi")
     ko_doc["project_type"] = p.get("project_type") or p.get("type")
+    ko_doc["project_slug"] = p.get("slug")
     if p.get("created_ts"):
         ko_doc["proj_created_at"] = p["created_ts"]
     if p.get("updated_ts"):

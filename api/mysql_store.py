@@ -701,11 +701,14 @@ def _probe_office_pdf_pages(raw: bytes, *, extension: str, timeout: int) -> Opti
         with tempfile.TemporaryDirectory(prefix="processing_office_") as tmpdir:
             src_path = os.path.join(tmpdir, f"input{ext}")
             out_dir = os.path.join(tmpdir, "out")
+            profile_dir = os.path.join(tmpdir, "libreoffice-profile")
             os.makedirs(out_dir, exist_ok=True)
+            os.makedirs(profile_dir, exist_ok=True)
             with open(src_path, "wb") as f:
                 f.write(raw)
             cmd = [
                 "/usr/bin/libreoffice",
+                f"-env:UserInstallation=file://{profile_dir}",
                 "--headless",
                 "--convert-to",
                 "pdf",
@@ -1328,13 +1331,14 @@ def repair_source_metadata(*, env_mode: str, max_docs: Optional[int], llids: Opt
     return {"scanned": scanned, "changed": changed, "unchanged": unchanged}
 
 
-def repair_current_date_metadata(*, env_mode: str, max_docs: Optional[int], llids: Optional[List[str]] = None) -> Dict[str, int]:
+def repair_current_date_metadata(*, env_mode: str, max_docs: Optional[int], llids: Optional[List[str]] = None, fields: Optional[List[str]] = None) -> Dict[str, int]:
     ensure_schema()
     scanned = 0
     changed = 0
     unchanged = 0
     skipped_no_current = 0
     now = datetime.utcnow()
+    field_set = set(fields or ["date_of_completion", "project_slug"])
 
     where = ["env_mode = %s"]
     params: List[Any] = [env_mode.upper()]
@@ -1377,29 +1381,47 @@ def repair_current_date_metadata(*, env_mode: str, max_docs: Optional[int], llid
 
                 src_date = source_doc.get("date_of_completion")
                 src_date_source = source_doc.get("date_of_completion_source")
+                src_project_slug = source_doc.get("project_slug")
                 cur_date = current_doc.get("date_of_completion")
                 cur_date_source = current_doc.get("date_of_completion_source")
+                cur_project_slug = current_doc.get("project_slug")
 
-                if src_date == cur_date and src_date_source == cur_date_source:
+                needs_date = (
+                    "date_of_completion" in field_set
+                    and (src_date != cur_date or src_date_source != cur_date_source)
+                )
+                needs_slug = (
+                    "project_slug" in field_set
+                    and src_project_slug != cur_project_slug
+                )
+
+                if not needs_date and not needs_slug:
                     unchanged += 1
                     continue
 
                 patched = dict(current_doc)
-                if src_date is None:
-                    patched.pop("date_of_completion", None)
-                else:
-                    patched["date_of_completion"] = src_date
+                if "date_of_completion" in field_set:
+                    if src_date is None:
+                        patched.pop("date_of_completion", None)
+                    else:
+                        patched["date_of_completion"] = src_date
 
-                if src_date_source is None:
-                    patched.pop("date_of_completion_source", None)
-                else:
-                    patched["date_of_completion_source"] = src_date_source
+                    if src_date_source is None:
+                        patched.pop("date_of_completion_source", None)
+                    else:
+                        patched["date_of_completion_source"] = src_date_source
+
+                if "project_slug" in field_set:
+                    if src_project_slug is None:
+                        patched.pop("project_slug", None)
+                    else:
+                        patched["project_slug"] = src_project_slug
 
                 patched = _sanitize_doc_for_storage(patched)
                 new_current_json = json.dumps(patched, ensure_ascii=False)
                 new_current_fp = _compute_current_doc_fp(patched)
 
-                _archive_current_row(cur, row, history_kind="current_date_metadata_repair", archived_at=now)
+                _archive_current_row(cur, row, history_kind="current_metadata_repair", archived_at=now)
                 cur.execute(
                     """
                     UPDATE ko_records

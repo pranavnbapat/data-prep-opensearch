@@ -12,17 +12,57 @@ from uuid import uuid4
 load_dotenv()
 
 from api.control_plane import (get_mysql_record, run_backend_sync_job, run_mysql_export_job,
+                               run_projects_export_job,
                                run_mysql_current_date_metadata_repair_job,
                                run_mysql_improver_fallback_job, run_mysql_pipeline_job,
                                run_mysql_source_metadata_repair_job)
+from api.dependency_probe import probe_dependencies
 from api.job_runner import run_pipeline_job
 from api.job_store import (JOBS, JOB_LOGS, JOB_LOCK, bucket_parts_now, load_job_from_disk,
                            load_jobs_from_disk, log_file_path, recover_job_tmp_files, write_job_to_disk)
 from api.mysql_store import ensure_schema, mysql_enabled
 from api.job_store import request_job_cancel
-from api.models import (BackendSyncParams, EnvMode, Job, JobStatus, MysqlExportParams,
-                        MysqlSourceMetadataRepairParams,
+from api.models import (BackendSyncParams, BasicHealthResponse, CancelJobResponse, DependencyProbeResponse, EnvMode, Job,
+                        JobLogsResponse, JobStatus, LatestExportResponse, MysqlCurrentMetadataRepairParams,
+                        MysqlExportParams, MysqlRecordResponse, MysqlSourceMetadataRepairParams, ProjectsExportParams,
+                        ReprocessRecordResponse,
+                        ScheduledJobResponse,
                         MysqlPipelineParams, PipelineRunParams, effective_page_size)
+
+OPENAPI_TAGS = [
+    {
+        "name": "Health",
+        "description": "Basic service health and external dependency probes.",
+    },
+    {
+        "name": "Sync",
+        "description": "Backend-core ingestion and MySQL source-state refresh operations.",
+    },
+    {
+        "name": "Pipeline",
+        "description": "Fast, deferred, and improver-fallback processing jobs over MySQL-backed records.",
+    },
+    {
+        "name": "Metadata Repair",
+        "description": "Targeted source and current metadata repair operations that avoid rerunning enrichment and LLM stages.",
+    },
+    {
+        "name": "Records",
+        "description": "Inspect or reprocess individual MySQL-backed records.",
+    },
+    {
+        "name": "Exports",
+        "description": "Generate or inspect final MySQL-backed export snapshots.",
+    },
+    {
+        "name": "Jobs",
+        "description": "Inspect queued/running/completed jobs, cancellation, and per-job logs.",
+    },
+    # {
+    #     "name": "Legacy",
+    #     "description": "Older combined entrypoints retained for compatibility.",
+    # },
+]
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -40,7 +80,7 @@ async def lifespan(app: FastAPI):
     except Exception:
         pass
 
-app = FastAPI(title="Data Prep", lifespan=lifespan)
+app = FastAPI(title="Data Prep", lifespan=lifespan, openapi_tags=OPENAPI_TAGS)
 
 _tz = os.getenv("TZ")
 if _tz:
@@ -50,16 +90,53 @@ if _tz:
     except Exception:
         pass
 
-@app.get("/healthz")
+@app.get(
+    "/healthz",
+    tags=["Health"],
+    summary="Basic API health check",
+    description="Returns a minimal in-process health response for the FastAPI app itself.",
+    response_description="Simple `{ok: true}` payload when the API process is up.",
+    response_model=BasicHealthResponse,
+)
 def healthz():
     return {"ok": True}
+
+
+@app.get(
+    "/health/dependencies",
+    tags=["Health"],
+    summary="Probe external service dependencies",
+    description=(
+        "Checks the external services this app depends on, including backend-core and any "
+        "currently configured enrichment/security/LLM services. Disabled or unconfigured "
+        "services are reported as skipped. "
+        "The optional `env_mode` query parameter chooses which backend-core environment to test."
+    ),
+    response_description="Overall dependency probe result plus one status object per configured external service.",
+    response_model=DependencyProbeResponse,
+)
+def dependencies_health(env_mode: EnvMode | None = None):
+    resolved_env_mode = env_mode or EnvMode((os.getenv("ENV_MODE") or "DEV").upper())
+    return probe_dependencies(resolved_env_mode.value)
 
 
 def _ensure_no_active_job_locked() -> None:
     if any(j.status in {JobStatus.queued, JobStatus.running} for j in JOBS.values()):
         raise HTTPException(status_code=409, detail="Another job is already queued or running")
 
-@app.post("/run-pipeline")
+# Legacy endpoint retained for compatibility, but hidden from OpenAPI docs.
+@app.post(
+    "/run-pipeline",
+    tags=["Legacy"],
+    summary="Run legacy combined pipeline",
+    description=(
+        "Queues the older combined file-output pipeline entrypoint. "
+        "This is retained for compatibility; the MySQL-backed sync and pipeline endpoints are the primary flow."
+    ),
+    response_description="Scheduling confirmation with the queued job ID.",
+    response_model=ScheduledJobResponse,
+    include_in_schema=False,
+)
 def trigger_pipeline_run(params: PipelineRunParams, bg: BackgroundTasks):
     with JOB_LOCK:
         _ensure_no_active_job_locked()
@@ -116,6 +193,7 @@ def _create_job(*, env_mode: EnvMode, page_size: int, job_kind: str, scope: str 
 
 @app.post(
     "/sync/backend-core",
+    tags=["Sync"],
     summary="Sync backend-core into MySQL",
     description=(
         "Runs the downloader against backend-core and stores normalized source records in MySQL. "
@@ -123,6 +201,8 @@ def _create_job(*, env_mode: EnvMode, page_size: int, job_kind: str, scope: str 
         "`sort_criteria` is passed through to the backend metadata API, and `dl_workers` controls "
         "downloader per-page processing concurrency."
     ),
+    response_description="Scheduling confirmation with the queued backend-sync job ID.",
+    response_model=ScheduledJobResponse,
 )
 def trigger_backend_sync(params: BackendSyncParams, bg: BackgroundTasks):
     env_mode_val = (params.env_mode.value if params.env_mode else (os.getenv("ENV_MODE") or "DEV")).upper()
@@ -144,7 +224,14 @@ def trigger_backend_sync(params: BackendSyncParams, bg: BackgroundTasks):
     return {"status": "scheduled", "job_id": job.id}
 
 
-@app.get("/sync/backend-core/status")
+@app.get(
+    "/sync/backend-core/status",
+    tags=["Sync"],
+    summary="List recent backend-sync jobs",
+    description="Returns the most recent backend-sync jobs with their current status and recorded progress.",
+    response_description="Up to 10 recent backend-sync job objects.",
+    response_model=list[Job],
+)
 def backend_sync_status():
     with JOB_LOCK:
         jobs = [j for j in JOBS.values() if j.job_kind == "backend_sync"]
@@ -154,11 +241,14 @@ def backend_sync_status():
 
 @app.post(
     "/pipeline/fast",
+    tags=["Pipeline"],
     summary="Run fast MySQL-backed pipeline",
     description=(
         "Processes non-deferred MySQL records through the existing enricher and improver stages. "
         "`max_docs` caps the batch size, and `llids` can be used to target specific records."
     ),
+    response_description="Scheduling confirmation with the queued fast-pipeline job ID.",
+    response_model=ScheduledJobResponse,
 )
 def trigger_fast_pipeline(params: MysqlPipelineParams, bg: BackgroundTasks):
     env_mode_val = (params.env_mode.value if params.env_mode else (os.getenv("ENV_MODE") or "DEV")).upper()
@@ -175,7 +265,14 @@ def trigger_fast_pipeline(params: MysqlPipelineParams, bg: BackgroundTasks):
     return {"status": "scheduled", "job_id": job.id}
 
 
-@app.get("/pipeline/fast/status")
+@app.get(
+    "/pipeline/fast/status",
+    tags=["Pipeline"],
+    summary="List recent fast-pipeline jobs",
+    description="Returns the most recent fast MySQL pipeline jobs and their current processing status.",
+    response_description="Up to 10 recent fast-pipeline job objects.",
+    response_model=list[Job],
+)
 def fast_pipeline_status():
     with JOB_LOCK:
         jobs = [j for j in JOBS.values() if j.job_kind == "mysql_pipeline" and j.scope == "fast"]
@@ -185,11 +282,14 @@ def fast_pipeline_status():
 
 @app.post(
     "/pipeline/deferred",
+    tags=["Pipeline"],
     summary="Run deferred MySQL-backed pipeline",
     description=(
         "Processes deferred MySQL records, typically expensive PDFs above the fast-path threshold. "
         "`max_docs` caps the batch size, and `llids` can override selection for targeted processing."
     ),
+    response_description="Scheduling confirmation with the queued deferred-pipeline job ID.",
+    response_model=ScheduledJobResponse,
 )
 def trigger_deferred_pipeline(params: MysqlPipelineParams, bg: BackgroundTasks):
     env_mode_val = (params.env_mode.value if params.env_mode else (os.getenv("ENV_MODE") or "DEV")).upper()
@@ -206,7 +306,14 @@ def trigger_deferred_pipeline(params: MysqlPipelineParams, bg: BackgroundTasks):
     return {"status": "scheduled", "job_id": job.id}
 
 
-@app.get("/pipeline/deferred/status")
+@app.get(
+    "/pipeline/deferred/status",
+    tags=["Pipeline"],
+    summary="List recent deferred-pipeline jobs",
+    description="Returns the most recent deferred MySQL pipeline jobs and their current processing status.",
+    response_description="Up to 10 recent deferred-pipeline job objects.",
+    response_model=list[Job],
+)
 def deferred_pipeline_status():
     with JOB_LOCK:
         jobs = [j for j in JOBS.values() if j.job_kind == "mysql_pipeline" and j.scope == "deferred"]
@@ -216,6 +323,7 @@ def deferred_pipeline_status():
 
 @app.post(
     "/pipeline/improver-fallback",
+    tags=["Pipeline"],
     summary="Run improver-only fallback from MySQL source content",
     description=(
         "Processes records through improver without running enricher first. "
@@ -224,6 +332,8 @@ def deferred_pipeline_status():
         "`source_doc_json.ko_content_flat` when needed, and writes the improved result back to "
         "`current_doc_json`. By default this is intended for deferred records."
     ),
+    response_description="Scheduling confirmation with the queued improver-fallback job ID.",
+    response_model=ScheduledJobResponse,
 )
 def trigger_improver_fallback(params: MysqlPipelineParams, bg: BackgroundTasks):
     env_mode_val = (params.env_mode.value if params.env_mode else (os.getenv("ENV_MODE") or "DEV")).upper()
@@ -240,7 +350,14 @@ def trigger_improver_fallback(params: MysqlPipelineParams, bg: BackgroundTasks):
     return {"status": "scheduled", "job_id": job.id}
 
 
-@app.get("/pipeline/improver-fallback/status")
+@app.get(
+    "/pipeline/improver-fallback/status",
+    tags=["Pipeline"],
+    summary="List recent improver-fallback jobs",
+    description="Returns the most recent improver-only fallback jobs and their current processing status.",
+    response_description="Up to 10 recent improver-fallback job objects.",
+    response_model=list[Job],
+)
 def improver_fallback_status():
     with JOB_LOCK:
         jobs = [j for j in JOBS.values() if j.job_kind == "mysql_pipeline" and j.scope == "improver_fallback"]
@@ -250,11 +367,14 @@ def improver_fallback_status():
 
 @app.post(
     "/source/repair-metadata",
+    tags=["Metadata Repair"],
     summary="Repair source MIME type and source kind in MySQL",
     description=(
         "Recomputes source-side metadata for existing MySQL rows without touching current_doc_json. "
         "This updates source_doc_json, source_fp, source_url, source_mimetype, and source_kind."
     ),
+    response_description="Scheduling confirmation with the queued source-metadata-repair job ID.",
+    response_model=ScheduledJobResponse,
 )
 def trigger_source_metadata_repair(params: MysqlSourceMetadataRepairParams, bg: BackgroundTasks):
     env_mode_val = (params.env_mode.value if params.env_mode else (os.getenv("ENV_MODE") or "DEV")).upper()
@@ -270,7 +390,14 @@ def trigger_source_metadata_repair(params: MysqlSourceMetadataRepairParams, bg: 
     return {"status": "scheduled", "job_id": job.id}
 
 
-@app.get("/source/repair-metadata/status")
+@app.get(
+    "/source/repair-metadata/status",
+    tags=["Metadata Repair"],
+    summary="List recent source metadata repair jobs",
+    description="Returns the most recent source-side metadata repair jobs and their current status.",
+    response_description="Up to 10 recent source-metadata-repair job objects.",
+    response_model=list[Job],
+)
 def source_metadata_repair_status():
     with JOB_LOCK:
         jobs = [j for j in JOBS.values() if j.job_kind == "mysql_source_metadata_repair"]
@@ -279,14 +406,24 @@ def source_metadata_repair_status():
 
 
 @app.post(
-    "/current/repair-date-of-completion",
-    summary="Repair date_of_completion in current_doc_json from source_doc_json",
+    "/current/repair-metadata",
+    tags=["Metadata Repair"],
+    summary="Repair selected current_doc_json metadata from source_doc_json",
     description=(
-        "Copies `date_of_completion` and `date_of_completion_source` from source_doc_json into current_doc_json "
-        "for rows that already have current_doc_json. Rows with empty current_doc_json are skipped."
+        "Copies selected metadata fields from source_doc_json into current_doc_json "
+        "for rows that already have current_doc_json. "
+        "Supported fields are `date_of_completion` and `project_slug`. "
+        "`date_of_completion_source` is updated together with `date_of_completion`. "
+        "Rows with empty current_doc_json are skipped."
     ),
+    response_description="Scheduling confirmation with the queued current-metadata-repair job ID.",
+    response_model=ScheduledJobResponse,
 )
-def trigger_current_date_metadata_repair(params: MysqlSourceMetadataRepairParams, bg: BackgroundTasks):
+@app.post(
+    "/current/repair-date-of-completion",
+    include_in_schema=False,
+)
+def trigger_current_metadata_repair(params: MysqlCurrentMetadataRepairParams, bg: BackgroundTasks):
     env_mode_val = (params.env_mode.value if params.env_mode else (os.getenv("ENV_MODE") or "DEV")).upper()
     resolved_env_mode = EnvMode(env_mode_val)
     job = _create_job(env_mode=resolved_env_mode, page_size=100, job_kind="mysql_current_date_metadata_repair", scope="current_date_metadata")
@@ -296,12 +433,21 @@ def trigger_current_date_metadata_repair(params: MysqlSourceMetadataRepairParams
         env_mode=job.env_mode,
         max_docs=params.max_docs,
         llids=params.llids,
+        fields=[field.value for field in params.fields],
     )
     return {"status": "scheduled", "job_id": job.id}
 
 
-@app.get("/current/repair-date-of-completion/status")
-def current_date_metadata_repair_status():
+@app.get(
+    "/current/repair-metadata/status",
+    tags=["Metadata Repair"],
+    summary="List recent current metadata repair jobs",
+    description="Returns the most recent current metadata repair jobs and their current status.",
+    response_description="Up to 10 recent current-metadata-repair job objects.",
+    response_model=list[Job],
+)
+@app.get("/current/repair-date-of-completion/status", include_in_schema=False)
+def current_metadata_repair_status():
     with JOB_LOCK:
         jobs = [j for j in JOBS.values() if j.job_kind == "mysql_current_date_metadata_repair"]
         jobs.sort(key=lambda x: x.created_at, reverse=True)
@@ -310,8 +456,11 @@ def current_date_metadata_repair_status():
 
 @app.post(
     "/records/{record_id}/reprocess",
+    tags=["Records"],
     summary="Reprocess one MySQL-backed record",
     description="Queues one logical-layer record for targeted reprocessing through the fast-path pipeline.",
+    response_description="Scheduling confirmation with the queued reprocess job ID and target record ID.",
+    response_model=ReprocessRecordResponse,
 )
 def reprocess_record(record_id: str, params: MysqlPipelineParams, bg: BackgroundTasks):
     env_mode_val = (params.env_mode.value if params.env_mode else (os.getenv("ENV_MODE") or "DEV")).upper()
@@ -328,7 +477,17 @@ def reprocess_record(record_id: str, params: MysqlPipelineParams, bg: Background
     return {"status": "scheduled", "job_id": job.id, "record_id": record_id}
 
 
-@app.get("/records/{record_id}")
+@app.get(
+    "/records/{record_id}",
+    tags=["Records"],
+    summary="Fetch one MySQL-backed record",
+    description=(
+        "Returns the stored MySQL row for one logical-layer record, including source and current JSON state "
+        "for the selected environment."
+    ),
+    response_description="One MySQL-backed record payload for the requested logical-layer ID.",
+    response_model=MysqlRecordResponse,
+)
 def get_record(record_id: str, env_mode: EnvMode | None = None):
     resolved_env_mode = env_mode or EnvMode((os.getenv("ENV_MODE") or "DEV").upper())
     record = get_mysql_record(resolved_env_mode, record_id)
@@ -339,12 +498,15 @@ def get_record(record_id: str, env_mode: EnvMode | None = None):
 
 @app.post(
     "/exports/final-improved",
+    tags=["Exports"],
     summary="Export final-improved snapshot from MySQL",
     description=(
         "Builds a fresh JSON export from MySQL-backed record state. "
         "By default only processing-eligible records are exported. "
         "If `processed_only=true`, only records with processed state are exported."
     ),
+    response_description="Scheduling confirmation with the queued export job ID.",
+    response_model=ScheduledJobResponse,
 )
 def export_final_improved(params: MysqlExportParams, bg: BackgroundTasks):
     env_mode_val = (params.env_mode.value if params.env_mode else (os.getenv("ENV_MODE") or "DEV")).upper()
@@ -360,7 +522,14 @@ def export_final_improved(params: MysqlExportParams, bg: BackgroundTasks):
     return {"status": "scheduled", "job_id": job.id}
 
 
-@app.get("/exports/final-improved/latest")
+@app.get(
+    "/exports/final-improved/latest",
+    tags=["Exports"],
+    summary="Get the latest final-improved export path",
+    description="Returns the latest completed MySQL export job that produced a final-improved snapshot file.",
+    response_description="Latest export job ID, created time, and output path.",
+    response_model=LatestExportResponse,
+)
 def latest_final_improved_export():
     with JOB_LOCK:
         jobs = [j for j in JOBS.values() if j.job_kind == "mysql_export" and j.latest_path]
@@ -370,7 +539,53 @@ def latest_final_improved_export():
         job = jobs[0]
         return {"job_id": job.id, "latest_path": job.latest_path, "created_at": job.created_at}
 
-@app.get("/jobs")
+
+@app.post(
+    "/projects/export",
+    tags=["Exports"],
+    summary="Export backend-core projects snapshot",
+    description=(
+        "Fetches all backend-core projects for the selected DEV or PRD environment via paginated "
+        "`POST /api/logical_layer/projects/search`, keeps only the curated project fields, and writes "
+        "a JSON snapshot under the standard output directory."
+    ),
+    response_description="Scheduling confirmation with the queued project-export job ID.",
+    response_model=ScheduledJobResponse,
+)
+def export_projects(params: ProjectsExportParams, bg: BackgroundTasks):
+    env_mode_val = (params.env_mode.value if params.env_mode else (os.getenv("ENV_MODE") or "DEV")).upper()
+    resolved_env_mode = EnvMode(env_mode_val)
+    page_size = params.page_size or 200
+    job = _create_job(env_mode=resolved_env_mode, page_size=page_size, job_kind="projects_export", scope="projects")
+    bg.add_task(run_projects_export_job, job.id, env_mode=job.env_mode, page_size=job.page_size)
+    return {"status": "scheduled", "job_id": job.id}
+
+
+@app.get(
+    "/projects/export/latest",
+    tags=["Exports"],
+    summary="Get the latest backend-core projects export path",
+    description="Returns the latest completed projects export job and the path to the generated JSON snapshot.",
+    response_description="Latest project export job ID, created time, and output path.",
+    response_model=LatestExportResponse,
+)
+def latest_projects_export():
+    with JOB_LOCK:
+        jobs = [j for j in JOBS.values() if j.job_kind == "projects_export" and j.latest_path]
+        jobs.sort(key=lambda x: x.created_at, reverse=True)
+        if not jobs:
+            raise HTTPException(status_code=404, detail="no projects export found")
+        job = jobs[0]
+        return {"job_id": job.id, "latest_path": job.latest_path, "created_at": job.created_at}
+
+@app.get(
+    "/jobs",
+    tags=["Jobs"],
+    summary="List known jobs",
+    description="Returns queued, running, and completed jobs currently known to the API. Optionally filters by `env_mode`.",
+    response_description="List of job objects currently tracked by the API.",
+    response_model=list[Job],
+)
 def list_jobs(env_mode: EnvMode | None = None):
     with JOB_LOCK:
         jobs = JOBS.values()
@@ -378,7 +593,14 @@ def list_jobs(env_mode: EnvMode | None = None):
             jobs = [j for j in jobs if j.env_mode == env_mode]
         return [j.model_dump() for j in jobs]
 
-@app.get("/jobs/{job_id}")
+@app.get(
+    "/jobs/{job_id}",
+    tags=["Jobs"],
+    summary="Get one job",
+    description="Returns the current status and metadata for one job ID.",
+    response_description="One job object without the internal error trace field.",
+    response_model=Job,
+)
 def get_job(job_id: str):
     with JOB_LOCK:
         job = JOBS.get(job_id)
@@ -390,7 +612,14 @@ def get_job(job_id: str):
         return data
 
 
-@app.post("/jobs/{job_id}/cancel")
+@app.post(
+    "/jobs/{job_id}/cancel",
+    tags=["Jobs"],
+    summary="Request job cancellation",
+    description="Marks a queued or running job for cancellation. If the job already finished, the current terminal state is returned.",
+    response_description="Cancellation acknowledgement for the target job.",
+    response_model=CancelJobResponse,
+)
 def cancel_job(job_id: str):
     job = request_job_cancel(job_id)
     if not job:
@@ -412,7 +641,17 @@ def cancel_job(job_id: str):
         "message": "Cancellation requested",
     }
 
-@app.get("/jobs/{job_id}/logs")
+@app.get(
+    "/jobs/{job_id}/logs",
+    tags=["Jobs"],
+    summary="Get recent job log lines",
+    description=(
+        "Returns recent log lines for one job. The optional `tail` query parameter controls how many lines "
+        "to return, defaulting to 200."
+    ),
+    response_description="Job log payload with the requested tail of log lines.",
+    response_model=JobLogsResponse,
+)
 def get_job_logs(job_id: str, tail: int = 200):
     # Try in-memory buffer first
     buf = JOB_LOGS.get(job_id)

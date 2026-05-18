@@ -17,6 +17,7 @@ from api.mysql_store import (ensure_schema, export_docs, fetch_record, fetch_sou
 from common.cancellation import JobCancelled
 from pipeline.io import atomic_write_json, output_dir, run_stamp
 from stages.downloader.service import download_and_prepare
+from stages.downloader.utils import get_session, load_backend_cfg
 from stages.enricher.core import enrich_docs_via_routes
 from stages.enricher.utils import compute_enrich_inputs_fp
 from stages.improver.engine import improve_doc_in_place
@@ -24,6 +25,31 @@ from stages.improver.utils import carry_forward_previous_improvements, compute_i
 
 
 logger = logging.getLogger(__name__)
+
+PROJECT_EXPORT_FIELDS = [
+    "created_by",
+    "created_ts",
+    "updated_ts",
+    "updated_by",
+    "version",
+    "status",
+    "id",
+    "project_type",
+    "display_name",
+    "title",
+    "acronym",
+    "URL",
+    "description",
+    "teaser",
+    "startDate",
+    "endDate",
+    "duration",
+    "country",
+    "db_id",
+    "cordis_url",
+    "slug",
+    "_id",
+]
 
 
 def _has_summary(doc: Optional[Dict[str, Any]]) -> bool:
@@ -112,6 +138,68 @@ def _set_job_canceled(job_id: str, exc: Exception) -> None:
         job.finished_at = datetime.utcnow()
         job.error = f"{exc.__class__.__name__}: {exc}"
     write_job_to_disk(job)
+
+
+def _project_export_doc(raw: Dict[str, Any]) -> Dict[str, Any]:
+    doc: Dict[str, Any] = {}
+    for field in PROJECT_EXPORT_FIELDS:
+        doc[field] = raw.get(field)
+    return doc
+
+
+def _fetch_projects_export_docs(*, env_mode: EnvMode, page_size: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    backend_cfg = load_backend_cfg(env_mode.value)
+    timeout = int(os.getenv("DL_HTTP_TIMEOUT", "30"))
+    session = get_session(backend_cfg, timeout=timeout)
+    url = f"{backend_cfg['host']}/api/logical_layer/projects/search"
+    body = {"project_type": [], "project_country": [], "project_status": []}
+
+    docs: list[dict[str, Any]] = []
+    page = 1
+    total_records: Optional[int] = None
+    total_pages: Optional[int] = None
+
+    while True:
+        resp = session.post(
+            url,
+            params={"limit": page_size, "page": page},
+            json=body,
+            headers={"accept": "application/json", "Content-Type": "application/json"},
+        )
+        resp.raise_for_status()
+        payload = resp.json() if resp.content else {}
+        data = payload.get("data") or []
+        pagination = payload.get("pagination") or {}
+
+        if total_records is None:
+            try:
+                total_records = int(pagination.get("total_records"))
+            except Exception:
+                total_records = None
+        if total_pages is None:
+            try:
+                total_pages = int(pagination.get("total_pages"))
+            except Exception:
+                total_pages = None
+
+        if not data:
+            break
+
+        for raw in data:
+            if isinstance(raw, dict):
+                docs.append(_project_export_doc(raw))
+
+        next_page = pagination.get("next_page")
+        if not next_page:
+            break
+        page = int(next_page)
+
+    meta = {
+        "backend_total_records": total_records,
+        "backend_total_pages": total_pages,
+        "selected_fields": PROJECT_EXPORT_FIELDS,
+    }
+    return docs, meta
 
 
 def run_backend_sync_job(job_id: str, *, env_mode: EnvMode, page_size: int, sort_criteria: int, dl_workers: int) -> None:
@@ -461,6 +549,39 @@ def run_mysql_export_job(job_id: str, *, env_mode: EnvMode, processed_only: bool
             _set_job_error(job_id, e)
 
 
+def run_projects_export_job(job_id: str, *, env_mode: EnvMode, page_size: int) -> None:
+    _set_job_running(job_id)
+    with _job_logging(job_id):
+        try:
+            logger.info("Starting projects export (env=%s, page_size=%s)", env_mode.value, page_size)
+            docs, backend_meta = _fetch_projects_export_docs(env_mode=env_mode, page_size=page_size)
+            run_id = run_stamp()
+            out_dir = output_dir(env_mode.value, root=os.getenv("OUTPUT_ROOT", "output"))
+            out_path = out_dir / f"projects_export_{run_id}.json"
+            payload = {
+                "meta": {
+                    "env_mode": env_mode.value,
+                    "run_id": run_id,
+                    "created_at": datetime.utcnow().isoformat(timespec="seconds"),
+                    "stage": "projects_export",
+                    "page_size": page_size,
+                    **backend_meta,
+                },
+                "counts": {"projects": len(docs)},
+                "projects": docs,
+            }
+            atomic_write_json(out_path, payload)
+            logger.info("Projects export finished: projects=%s path=%s", len(docs), out_path)
+            _set_job_done(
+                job_id,
+                details={"exported_projects": len(docs), **backend_meta},
+                latest_path=str(out_path),
+            )
+        except Exception as e:
+            logger.exception("Projects export failed")
+            _set_job_error(job_id, e)
+
+
 def run_mysql_source_metadata_repair_job(
     job_id: str,
     *,
@@ -488,18 +609,19 @@ def run_mysql_current_date_metadata_repair_job(
     env_mode: EnvMode,
     max_docs: Optional[int],
     llids: Optional[List[str]] = None,
+    fields: Optional[List[str]] = None,
 ) -> None:
     _set_job_running(job_id)
     with _job_logging(job_id):
         try:
-            logger.info("Starting current date metadata repair (env=%s, max_docs=%s, llids=%s)", env_mode.value, max_docs, llids)
+            logger.info("Starting current metadata repair (env=%s, max_docs=%s, llids=%s, fields=%s)", env_mode.value, max_docs, llids, fields)
             ensure_schema()
-            stats = repair_current_date_metadata(env_mode=env_mode.value, max_docs=max_docs, llids=llids)
+            stats = repair_current_date_metadata(env_mode=env_mode.value, max_docs=max_docs, llids=llids, fields=fields)
             details = {**stats, "mysql_status": summarize_status(env_mode=env_mode.value)}
-            logger.info("Current date metadata repair finished: %s", details)
+            logger.info("Current metadata repair finished: %s", details)
             _set_job_done(job_id, details=details)
         except Exception as e:
-            logger.exception("Current date metadata repair failed")
+            logger.exception("Current metadata repair failed")
             _set_job_error(job_id, e)
 
 
