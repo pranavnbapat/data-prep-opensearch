@@ -11,7 +11,7 @@ This guide starts from a bare RunPod pod with:
 
 The goal is to run:
 
-- `OpenGVLab/InternVL3_5-14B`
+- `QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ`
 - `vLLM` on local port `8001`
 - `Traefik` on public port `8000`
 - `Supervisor` for process management
@@ -282,7 +282,7 @@ command=/bin/bash -lc 'set -a; source /run/secrets/vllm_vision.env; set +a; \
   export VLLM_CACHE_DIR=/workspace/vllm/vision/.cache/vllm; \
   export TORCH_HOME=/workspace/vllm/vision/.cache/torch; \
   export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True; \
-  vllm serve OpenGVLab/InternVL3_5-14B \
+  vllm serve QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ \
     --host 127.0.0.1 \
     --port 8001 \
     --trust-remote-code \
@@ -292,7 +292,7 @@ command=/bin/bash -lc 'set -a; source /run/secrets/vllm_vision.env; set +a; \
     --max-num-seqs 2 \
     --max-num-batched-tokens 32768 \
     --limit-mm-per-prompt "{\"image\":8}" \
-    --served-model-name internvl3-5-14b \
+    --served-model-name qwen3-vl-30b-a3b-awq \
     --api-key "$VLLM_API_KEY"'
 
 autostart=true
@@ -395,7 +395,7 @@ In your data-prep `.env`:
 
 ```env
 EUF_VISION_URL=http://<runpod-host>:8000
-EUF_VISION_MODEL=internvl3-5-14b
+EUF_VISION_MODEL=qwen3-vl-30b-a3b-awq
 EUF_VISION_API_KEY=your_token_here_without_spaces
 
 EUF_VISION_MIN_INTERVAL_SEC=0.5

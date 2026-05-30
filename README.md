@@ -484,7 +484,7 @@ Recommended RunPod config files for the shared InternVL vision pod are stored in
 
 These are tuned for:
 
-- `OpenGVLab/InternVL3_5-14B`
+- `QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ`
 - `NVIDIA A40 48 GB`
 - map-reduce style PDF/image workloads
 - stability-first operation with `16K` context and `max-num-seqs=1`

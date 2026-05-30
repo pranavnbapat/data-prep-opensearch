@@ -25,7 +25,6 @@ venv/
 ENV/
 env/
 venv*/
-.claude
 .python-version
 
 # Env files
@@ -45,3 +44,5 @@ runpod_vllm_config/
 *.tmp
 *.bak
 *.swp
+
+docker-compose.prd.yml
