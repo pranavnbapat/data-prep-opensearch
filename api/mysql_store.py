@@ -1447,3 +1447,150 @@ def repair_current_date_metadata(*, env_mode: str, max_docs: Optional[int], llid
         "unchanged": unchanged,
         "skipped_no_current": skipped_no_current,
     }
+
+
+def _safe_loads_dict(raw: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        doc = json.loads(raw)
+    except Exception:
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
+def list_translation_targets(
+    *,
+    env_mode: str,
+    llids: Optional[List[str]] = None,
+    max_docs: Optional[int] = None,
+    only_missing: bool = False,
+) -> List[Dict[str, Any]]:
+    """
+    Return lightweight per-record targets for a translations sync:
+      [{"llid": ..., "existing_fp": <str|None>, "has_translations": <bool>}, ...]
+
+    `existing_fp` / `has_translations` are read from current_doc_json when present,
+    else source_doc_json. When `only_missing` is set, records that already carry a
+    `metadata_translations` block are dropped so the backend is not even queried.
+    """
+    ensure_schema()
+    where = ["env_mode = %s"]
+    params: List[Any] = [env_mode.upper()]
+    if llids:
+        placeholders = ",".join(["%s"] * len(llids))
+        where.append(f"llid IN ({placeholders})")
+        params.extend(llids)
+
+    sql = (
+        "SELECT llid, source_doc_json, current_doc_json FROM ko_records "
+        f"WHERE {' AND '.join(where)} "
+        "ORDER BY synced_at ASC"
+    )
+    if isinstance(max_docs, int) and max_docs > 0:
+        sql += " LIMIT %s"
+        params.append(max_docs)
+
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall() or []
+
+    targets: List[Dict[str, Any]] = []
+    for row in rows:
+        llid = row.get("llid")
+        if not isinstance(llid, str) or not llid:
+            continue
+        inspect = _safe_loads_dict(row.get("current_doc_json"))
+        if inspect is None:
+            inspect = _safe_loads_dict(row.get("source_doc_json"))
+        existing_fp = None
+        has_tx = False
+        if isinstance(inspect, dict):
+            has_tx = bool(inspect.get("metadata_translations"))
+            fp = inspect.get("_translations_fp")
+            if isinstance(fp, str) and fp.strip():
+                existing_fp = fp
+        if only_missing and has_tx:
+            continue
+        targets.append({"llid": llid, "existing_fp": existing_fp, "has_translations": has_tx})
+    return targets
+
+
+def apply_translations_patch(
+    *,
+    env_mode: str,
+    llid: str,
+    block: Dict[str, Any],
+    langs: List[str],
+    translations_fp: str,
+) -> str:
+    """
+    Merge a `metadata_translations` block into both source_doc_json and (when
+    present) current_doc_json for one record, without touching source_fp or
+    re-deriving enrich/improver state. current_fp is recomputed because the export
+    reads current_doc_json. Returns 'updated' | 'unchanged' | 'missing' | 'skipped_no_doc'.
+    """
+    ensure_schema()
+    now = datetime.utcnow()
+
+    def _apply(doc: Dict[str, Any]) -> Dict[str, Any]:
+        d = dict(doc)
+        d["metadata_translations"] = block
+        d["_translation_langs"] = langs
+        d["_translations_fp"] = translations_fp
+        return d
+
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM ko_records WHERE llid = %s AND env_mode = %s",
+                (llid, env_mode.upper()),
+            )
+            row = cur.fetchone()
+            if not row:
+                return "missing"
+
+            source_doc = _safe_loads_dict(row.get("source_doc_json"))
+            current_doc = _safe_loads_dict(row.get("current_doc_json"))
+
+            new_source_json = None
+            if isinstance(source_doc, dict):
+                # Source is not sanitized here: it already fit storage and the added
+                # keys are small. Avoids truncating original source content.
+                new_source_json = json.dumps(_apply(source_doc), ensure_ascii=False)
+
+            new_current_json = None
+            new_current_fp = None
+            if isinstance(current_doc, dict):
+                new_current = _sanitize_doc_for_storage(_apply(current_doc))
+                new_current_json = json.dumps(new_current, ensure_ascii=False)
+                new_current_fp = _compute_current_doc_fp(new_current)
+
+            if new_source_json is None and new_current_json is None:
+                return "skipped_no_doc"
+
+            _archive_current_row(cur, row, history_kind="translations_sync", archived_at=now)
+
+            sets: List[str] = []
+            vals: List[Any] = []
+            if new_source_json is not None:
+                sets.append("source_doc_json = %s")
+                vals.append(new_source_json)
+            if new_current_json is not None:
+                sets.append("current_doc_json = %s")
+                vals.append(new_current_json)
+                sets.append("current_fp = %s")
+                vals.append(new_current_fp)
+            sets.append("updated_at = %s")
+            vals.append(now)
+            vals.extend([llid, env_mode.upper()])
+
+            cur.execute(
+                f"UPDATE ko_records SET {', '.join(sets)} WHERE llid = %s AND env_mode = %s",
+                vals,
+            )
+            changed = cur.rowcount > 0
+        conn.commit()
+
+    return "updated" if changed else "unchanged"

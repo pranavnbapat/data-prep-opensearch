@@ -11,12 +11,15 @@ from typing import Any, Dict, List, Optional
 from api.job_store import (JOBS, JOB_LOCK, PerJobLogHandler, clear_job_cancel, get_cancel_event,
                            log_file_path, run_log_path, write_job_to_disk)
 from api.models import EnvMode, JobStatus
-from api.mysql_store import (ensure_schema, export_docs, fetch_record, fetch_source_docs,
-                             repair_current_date_metadata, repair_source_metadata, summarize_status,
-                             upsert_current_docs, upsert_processed_docs, upsert_source_docs)
+from api.mysql_store import (apply_translations_patch, ensure_schema, export_docs, fetch_record,
+                             fetch_source_docs, list_translation_targets, repair_current_date_metadata,
+                             repair_source_metadata, summarize_status, upsert_current_docs,
+                             upsert_processed_docs, upsert_source_docs)
 from common.cancellation import JobCancelled
 from pipeline.io import atomic_write_json, output_dir, run_stamp
 from stages.downloader.service import download_and_prepare
+from stages.downloader.translations import (build_translations_block, compute_translations_fp,
+                                            fetch_metadata_translations_api)
 from stages.downloader.utils import get_session, load_backend_cfg
 from stages.enricher.core import enrich_docs_via_routes
 from stages.enricher.utils import compute_enrich_inputs_fp
@@ -510,6 +513,123 @@ def run_mysql_improver_fallback_job(
             _set_job_canceled(job_id, e)
         except Exception as e:
             logger.exception("Improver fallback failed")
+            _set_job_error(job_id, e)
+        finally:
+            clear_job_cancel(job_id)
+
+
+def run_translations_sync_job(
+    job_id: str,
+    *,
+    env_mode: EnvMode,
+    only_missing: bool,
+    max_docs: Optional[int],
+    llids: Optional[List[str]] = None,
+) -> None:
+    """
+    Fetch KO metadata translations from backend-core and merge them into existing
+    MySQL records. Fetch-only and incremental: never runs enricher/improver, and a
+    record whose translation fingerprint is unchanged is skipped without a write.
+    """
+    cancel_event = get_cancel_event(job_id)
+    _set_job_running(job_id)
+    with _job_logging(job_id):
+        try:
+            logger.info("Starting translations sync (env=%s, only_missing=%s, max_docs=%s, llids=%s)",
+                        env_mode.value, only_missing, max_docs, llids)
+            ensure_schema()
+            backend_cfg = load_backend_cfg(env_mode.value)
+            targets = list_translation_targets(
+                env_mode=env_mode.value,
+                llids=llids,
+                max_docs=max_docs,
+                only_missing=only_missing,
+            )
+            total = len(targets)
+            progress: Dict[str, Any] = {
+                "selected_records": total,
+                "processed_records": 0,
+                "fetched": 0,
+                "updated": 0,
+                "unchanged": 0,
+                "no_translations": 0,
+                "failed": 0,
+                "langs_seen": {},
+            }
+
+            def update_progress(current_index: int) -> None:
+                with JOB_LOCK:
+                    job = JOBS[job_id]
+                    job.pipeline_stats = {
+                        **progress,
+                        "processed_records": current_index,
+                        "mysql_status": summarize_status(env_mode=env_mode.value),
+                    }
+                write_job_to_disk(JOBS[job_id])
+
+            if not targets:
+                logger.info("No matching translation targets found")
+                _set_job_done(job_id, details={**progress, "notes": "no matching records"})
+                return
+
+            for idx, target in enumerate(targets, start=1):
+                if cancel_event.is_set():
+                    raise JobCancelled("Job canceled during translations sync")
+
+                llid = target.get("llid")
+                if not isinstance(llid, str) or not llid:
+                    continue
+
+                try:
+                    raw = fetch_metadata_translations_api(backend_cfg, llid)
+                except Exception:
+                    logger.exception("Translations fetch failed for llid=%s", llid)
+                    progress["failed"] += 1
+                    update_progress(idx)
+                    continue
+
+                progress["fetched"] += 1
+                block, langs = build_translations_block(raw)
+                if not block:
+                    progress["no_translations"] += 1
+                    update_progress(idx)
+                    continue
+
+                fp = compute_translations_fp(block)
+                if target.get("existing_fp") and target.get("existing_fp") == fp:
+                    progress["unchanged"] += 1
+                    update_progress(idx)
+                    continue
+
+                result = apply_translations_patch(
+                    env_mode=env_mode.value,
+                    llid=llid,
+                    block=block,
+                    langs=langs,
+                    translations_fp=fp,
+                )
+                if result == "updated":
+                    progress["updated"] += 1
+                    for lang in langs:
+                        progress["langs_seen"][lang] = progress["langs_seen"].get(lang, 0) + 1
+                elif result == "unchanged":
+                    progress["unchanged"] += 1
+                else:
+                    progress["failed"] += 1
+                update_progress(idx)
+
+            details = {
+                **progress,
+                "processed_records": total,
+                "mysql_status": summarize_status(env_mode=env_mode.value),
+            }
+            logger.info("Translations sync finished: %s", details)
+            _set_job_done(job_id, details=details, latest_path=None)
+        except JobCancelled as e:
+            logger.warning("Translations sync canceled: %s", e)
+            _set_job_canceled(job_id, e)
+        except Exception as e:
+            logger.exception("Translations sync failed")
             _set_job_error(job_id, e)
         finally:
             clear_job_cancel(job_id)

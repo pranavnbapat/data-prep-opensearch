@@ -79,6 +79,8 @@ Main endpoints:
 - `GET /healthz`
 - `POST /sync/backend-core`
 - `GET /sync/backend-core/status`
+- `POST /sync/translations`
+- `GET /sync/translations/status`
 - `POST /pipeline/fast`
 - `GET /pipeline/fast/status`
 - `POST /pipeline/deferred`
@@ -310,6 +312,7 @@ Recommended flow:
 Active scheduler (`data-prep-opensearch-scheduler`):
 
 - daily `04:00`: `POST /sync/backend-core`
+- daily `06:00`: `POST /sync/translations`
 - daily `07:00`: `POST /pipeline/fast`
 - daily `09:00`: `POST /exports/final-improved`
 - Friday `22:00`: `POST /pipeline/deferred`
@@ -338,6 +341,54 @@ Current limitations:
 See also:
 
 - [docs/mysql_control_plane.md](docs/mysql_control_plane.md)
+
+## Metadata Translations Sync
+
+`POST /sync/translations` backfills KO metadata translations into existing MySQL
+records, independently of the enricher/improver flow.
+
+- Source: backend-core `GET /api/logical_layer/metadata_translations/{ko_id}` (the api-core gateway).
+- Fields mirrored per language: `title`, `subtitle`, `description`, `keywords`.
+- Stored as a single nested `metadata_translations` block keyed by language, plus
+  `_translation_langs` and a `_translations_fp` fingerprint, merged into both
+  `source_doc_json` and `current_doc_json` so the next `/exports/final-improved`
+  includes it.
+
+Key properties:
+
+- Fetch-only. It never runs the enricher or improver. Because the translation
+  fields are not part of the source/enricher/improver fingerprints, already-improved
+  records are not reprocessed.
+- Incremental. A record whose `_translations_fp` is unchanged is skipped without a
+  write. `only_missing=true` skips records that already have a `metadata_translations`
+  block without even querying the backend.
+- Each language carries provenance: `_status` (e.g. `draft`), `_source_version` (the
+  KO metadata version the translation was made from), and `_updated_ts`.
+
+Caveat: these translate the original canonical metadata (`source.version`), not the
+improver `*_llm` output, so the English `*_llm` view and the translated languages can
+diverge. The per-language `_status` is preserved so the ingest side can filter
+(e.g. exclude `draft`).
+
+Request fields:
+
+- `env_mode` — `DEV` or `PRD`
+- `only_missing` — skip records that already have translations (default `false`)
+- `max_docs` — optional batch cap
+- `llids` — optional explicit logical-layer IDs
+
+Example:
+
+```bash
+curl -X POST http://127.0.0.1:8000/sync/translations \
+  -H "Content-Type: application/json" \
+  -d '{"env_mode":"DEV","only_missing":true}'
+```
+
+Relevant env vars (see `.env.sample`):
+
+- `TRANSLATIONS_HTTP_TIMEOUT` — timeout for the translations API calls (falls back to `DL_HTTP_TIMEOUT`)
+- `TRANSLATION_ALLOWED_LANGS` — optional language allowlist (e.g. `de,fr,es`); empty keeps all returned languages
 
 ## Docker
 

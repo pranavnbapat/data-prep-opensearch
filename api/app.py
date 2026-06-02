@@ -15,7 +15,7 @@ from api.control_plane import (get_mysql_record, run_backend_sync_job, run_mysql
                                run_projects_export_job,
                                run_mysql_current_date_metadata_repair_job,
                                run_mysql_improver_fallback_job, run_mysql_pipeline_job,
-                               run_mysql_source_metadata_repair_job)
+                               run_mysql_source_metadata_repair_job, run_translations_sync_job)
 from api.dependency_probe import probe_dependencies
 from api.job_runner import run_pipeline_job
 from api.job_store import (JOBS, JOB_LOGS, JOB_LOCK, bucket_parts_now, load_job_from_disk,
@@ -26,7 +26,7 @@ from api.models import (BackendSyncParams, BasicHealthResponse, CancelJobRespons
                         JobLogsResponse, JobStatus, LatestExportResponse, MysqlCurrentMetadataRepairParams,
                         MysqlExportParams, MysqlRecordResponse, MysqlSourceMetadataRepairParams, ProjectsExportParams,
                         ReprocessRecordResponse,
-                        ScheduledJobResponse,
+                        ScheduledJobResponse, TranslationsSyncParams,
                         MysqlPipelineParams, PipelineRunParams, effective_page_size)
 
 OPENAPI_TAGS = [
@@ -235,6 +235,52 @@ def trigger_backend_sync(params: BackendSyncParams, bg: BackgroundTasks):
 def backend_sync_status():
     with JOB_LOCK:
         jobs = [j for j in JOBS.values() if j.job_kind == "backend_sync"]
+        jobs.sort(key=lambda x: x.created_at, reverse=True)
+        return [j.model_dump(mode="json") for j in jobs[:10]]
+
+
+@app.post(
+    "/sync/translations",
+    tags=["Sync"],
+    summary="Sync KO metadata translations into MySQL",
+    description=(
+        "Fetches KO metadata translations (title, subtitle, description, keywords) from backend-core "
+        "and merges them into existing MySQL records as a `metadata_translations` block, keyed by language. "
+        "This is fetch-only and incremental: it never runs the enricher or improver, and records whose "
+        "translation fingerprint is unchanged are skipped without a write. The block is merged into both "
+        "`source_doc_json` and `current_doc_json`, so the next `/exports/final-improved` includes it. "
+        "Set `only_missing` to skip records that already have translations, `max_docs` to cap the batch, "
+        "and `llids` to target specific records."
+    ),
+    response_description="Scheduling confirmation with the queued translations-sync job ID.",
+    response_model=ScheduledJobResponse,
+)
+def trigger_translations_sync(params: TranslationsSyncParams, bg: BackgroundTasks):
+    env_mode_val = (params.env_mode.value if params.env_mode else (os.getenv("ENV_MODE") or "DEV")).upper()
+    resolved_env_mode = EnvMode(env_mode_val)
+    job = _create_job(env_mode=resolved_env_mode, page_size=100, job_kind="translations_sync", scope="mysql")
+    bg.add_task(
+        run_translations_sync_job,
+        job.id,
+        env_mode=job.env_mode,
+        only_missing=bool(params.only_missing),
+        max_docs=params.max_docs,
+        llids=params.llids,
+    )
+    return {"status": "scheduled", "job_id": job.id}
+
+
+@app.get(
+    "/sync/translations/status",
+    tags=["Sync"],
+    summary="List recent translations-sync jobs",
+    description="Returns the most recent translations-sync jobs with their current status and recorded progress.",
+    response_description="Up to 10 recent translations-sync job objects.",
+    response_model=list[Job],
+)
+def translations_sync_status():
+    with JOB_LOCK:
+        jobs = [j for j in JOBS.values() if j.job_kind == "translations_sync"]
         jobs.sort(key=lambda x: x.created_at, reverse=True)
         return [j.model_dump(mode="json") for j in jobs[:10]]
 

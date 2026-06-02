@@ -81,6 +81,10 @@ while true; do
     '{"page_size":0,"env_mode":"PRD","sort_criteria":1,"dl_workers":0}'
 
   run_if_due \
+    "sync_translations" "*" "06" "00" "/sync/translations" \
+    '{"env_mode":"PRD","only_missing":false}'
+
+  run_if_due \
     "pipeline_fast" "*" "07" "00" "/pipeline/fast" \
     '{"env_mode":"PRD"}'
 
