@@ -75,7 +75,8 @@ run_if_due() {
   fi
 }
 
-# Daily KO chain (UTC). Spacing leaves room for a long-running job to finish
+# Daily KO chain (times are in the scheduler's TZ; .env sets Europe/Amsterdam).
+# Spacing leaves room for a long-running job to finish
 # before the next fires, and the chain completes well before data-ingest's
 # 09:30 index build (which consumes the 08:00 final-improved export):
 #   02:00 backend-core sync -> 04:00 translations -> 05:30 fast pipeline

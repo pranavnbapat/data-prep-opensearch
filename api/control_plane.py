@@ -155,7 +155,11 @@ def _fetch_projects_export_docs(*, env_mode: EnvMode, page_size: int) -> tuple[l
     timeout = int(os.getenv("DL_HTTP_TIMEOUT", "30"))
     session = get_session(backend_cfg, timeout=timeout)
     url = f"{backend_cfg['host']}/api/logical_layer/projects/search"
-    body = {"project_type": [], "project_country": [], "project_status": []}
+    base_body = {"project_type": [], "project_country": [], "project_status": []}
+    # Backend reads `limit`/`page` from the request BODY; passing them as query
+    # params is silently ignored (it then always serves page 1 with next_page=2,
+    # which previously sent this loop spinning forever).
+    effective_limit = page_size if isinstance(page_size, int) and page_size > 0 else 200
 
     docs: list[dict[str, Any]] = []
     page = 1
@@ -165,8 +169,7 @@ def _fetch_projects_export_docs(*, env_mode: EnvMode, page_size: int) -> tuple[l
     while True:
         resp = session.post(
             url,
-            params={"limit": page_size, "page": page},
-            json=body,
+            json={**base_body, "limit": effective_limit, "page": page},
             headers={"accept": "application/json", "Content-Type": "application/json"},
         )
         resp.raise_for_status()
@@ -192,10 +195,32 @@ def _fetch_projects_export_docs(*, env_mode: EnvMode, page_size: int) -> tuple[l
             if isinstance(raw, dict):
                 docs.append(_project_export_doc(raw))
 
+        logger.info(
+            "projects/search page=%s got=%s collected=%s total_records=%s total_pages=%s",
+            page, len(data), len(docs), total_records, total_pages,
+        )
+
+        # Guard: if the backend ignores paging (current_page never advances), stop
+        # instead of looping forever on the same page.
+        current_page = pagination.get("current_page")
+        try:
+            if current_page is not None and int(current_page) != page:
+                logger.warning(
+                    "projects/search ignored page=%s (returned current_page=%s); stopping to avoid an infinite loop",
+                    page, current_page,
+                )
+                break
+        except Exception:
+            pass
+
         next_page = pagination.get("next_page")
         if not next_page:
             break
-        page = int(next_page)
+        next_page = int(next_page)
+        if next_page <= page:
+            logger.warning("projects/search next_page=%s did not advance past %s; stopping", next_page, page)
+            break
+        page = next_page
 
     meta = {
         "backend_total_records": total_records,
