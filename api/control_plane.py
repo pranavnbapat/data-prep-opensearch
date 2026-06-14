@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -694,12 +695,71 @@ def run_mysql_export_job(job_id: str, *, env_mode: EnvMode, processed_only: bool
             _set_job_error(job_id, e)
 
 
+def _projects_fingerprint(docs: List[Dict[str, Any]]) -> str:
+    """Stable content hash of the exported projects, order-independent. Two runs
+    with identical project content produce the same fingerprint regardless of
+    backend pagination order."""
+    ordered = sorted(docs, key=lambda d: (str(d.get("id")), str(d.get("_id"))))
+    blob = json.dumps(ordered, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _latest_projects_export_path(env_mode: str) -> Optional[Path]:
+    """Most recent projects_export_*.json for the env, across all year/month dirs."""
+    root = Path(os.getenv("OUTPUT_ROOT", "output")) / env_mode.upper()
+    if not root.exists():
+        return None
+    candidates = list(root.rglob("projects_export_*.json"))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def _previous_projects_fingerprint(prev_path: Optional[Path]) -> Optional[str]:
+    if prev_path is None:
+        return None
+    try:
+        prev_payload = json.loads(prev_path.read_text(encoding="utf-8"))
+    except Exception:
+        logger.warning("Could not read previous projects export %s for dedup", prev_path)
+        return None
+    fp = (prev_payload.get("meta") or {}).get("projects_fp")
+    if fp:
+        return fp
+    # Older exports predate the stored fp: recompute from their projects list.
+    return _projects_fingerprint(prev_payload.get("projects") or [])
+
+
 def run_projects_export_job(job_id: str, *, env_mode: EnvMode, page_size: int) -> None:
     _set_job_running(job_id)
     with _job_logging(job_id):
         try:
             logger.info("Starting projects export (env=%s, page_size=%s)", env_mode.value, page_size)
             docs, backend_meta = _fetch_projects_export_docs(env_mode=env_mode, page_size=page_size)
+            new_fp = _projects_fingerprint(docs)
+
+            # Idempotent: if the projects are identical to the last export, don't
+            # write a new file — reuse the existing one.
+            prev_path = _latest_projects_export_path(env_mode.value)
+            prev_fp = _previous_projects_fingerprint(prev_path)
+            if prev_fp is not None and prev_fp == new_fp:
+                logger.info(
+                    "Projects export unchanged (fp=%s, %s projects); reusing %s",
+                    new_fp, len(docs), prev_path,
+                )
+                _set_job_done(
+                    job_id,
+                    details={
+                        "exported_projects": len(docs),
+                        "unchanged": True,
+                        "projects_fp": new_fp,
+                        "reused_path": str(prev_path),
+                        **backend_meta,
+                    },
+                    latest_path=str(prev_path),
+                )
+                return
+
             run_id = run_stamp()
             out_dir = output_dir(env_mode.value, root=os.getenv("OUTPUT_ROOT", "output"))
             out_path = out_dir / f"projects_export_{run_id}.json"
@@ -710,6 +770,7 @@ def run_projects_export_job(job_id: str, *, env_mode: EnvMode, page_size: int) -
                     "created_at": datetime.utcnow().isoformat(timespec="seconds"),
                     "stage": "projects_export",
                     "page_size": page_size,
+                    "projects_fp": new_fp,
                     **backend_meta,
                 },
                 "counts": {"projects": len(docs)},
@@ -719,7 +780,7 @@ def run_projects_export_job(job_id: str, *, env_mode: EnvMode, page_size: int) -
             logger.info("Projects export finished: projects=%s path=%s", len(docs), out_path)
             _set_job_done(
                 job_id,
-                details={"exported_projects": len(docs), **backend_meta},
+                details={"exported_projects": len(docs), "unchanged": False, "projects_fp": new_fp, **backend_meta},
                 latest_path=str(out_path),
             )
         except Exception as e:
