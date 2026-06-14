@@ -258,6 +258,25 @@ def improve_doc_in_place(doc: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
         summary_text = doc.get(summary_field)
         summary_text = summary_text if isinstance(summary_text, str) else ""
 
+        # --- contributor opt-out gate ---
+        # When the contributor explicitly disallowed AI metadata overwrite
+        # (allow_ai_metadata_override is False, set via the upload form), keep
+        # their original title/subtitle/description/keywords as the *_llm values
+        # and skip the metadata LLM calls. The content summary above is still
+        # generated, as it is derived content rather than contributor-supplied
+        # metadata.
+        #
+        # Default is allow (True) when the flag is ABSENT: legacy KOs predate the
+        # flag and must retain the existing improve behaviour so the corpus is not
+        # silently de-improved on reprocessing. Only an explicit False opts out.
+        if not bool(doc.get("allow_ai_metadata_override", True)):
+            doc["title_llm"] = doc.get("title", "")
+            doc["subtitle_llm"] = doc.get("subtitle", "")
+            doc["description_llm"] = doc.get("description", "")
+            doc["keywords_llm"] = doc.get("keywords", [])
+            doc["improved"] = 1
+            return True, None
+
         # --- metadata (title/subtitle/description/keywords) ---
         # Only attempt metadata generation if summary has enough substance
         if not summary_text.strip() or len(summary_text.split()) < 50:

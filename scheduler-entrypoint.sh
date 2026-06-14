@@ -75,22 +75,33 @@ run_if_due() {
   fi
 }
 
+# Daily KO chain (UTC). Spacing leaves room for a long-running job to finish
+# before the next fires, and the chain completes well before data-ingest's
+# 09:30 index build (which consumes the 08:00 final-improved export):
+#   02:00 backend-core sync -> 04:00 translations -> 05:30 fast pipeline
+#   -> 08:00 final-improved export -> (09:30 data-ingest build_index)
+# pipeline_deferred stays on its weekly Friday-night slot; projects_export is
+# decoupled (separate JSON snapshot) and parked at noon, clear of everything.
 while true; do
   run_if_due \
-    "sync_backend_core" "*" "04" "00" "/sync/backend-core" \
+    "sync_backend_core" "*" "02" "00" "/sync/backend-core" \
     '{"page_size":0,"env_mode":"PRD","sort_criteria":1,"dl_workers":0}'
 
   run_if_due \
-    "sync_translations" "*" "06" "00" "/sync/translations" \
+    "sync_translations" "*" "04" "00" "/sync/translations" \
     '{"env_mode":"PRD","only_missing":false}'
 
   run_if_due \
-    "pipeline_fast" "*" "07" "00" "/pipeline/fast" \
+    "pipeline_fast" "*" "05" "30" "/pipeline/fast" \
     '{"env_mode":"PRD"}'
 
   run_if_due \
-    "export_final_improved" "*" "09" "00" "/exports/final-improved" \
+    "export_final_improved" "*" "08" "00" "/exports/final-improved" \
     '{"env_mode":"PRD","processed_only":false,"eligible_only":true}'
+
+  run_if_due \
+    "projects_export" "*" "12" "00" "/projects/export" \
+    '{"env_mode":"PRD","page_size":200}'
 
   run_if_due \
     "pipeline_deferred" "5" "22" "00" "/pipeline/deferred" \

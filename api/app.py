@@ -194,7 +194,7 @@ def _create_job(*, env_mode: EnvMode, page_size: int, job_kind: str, scope: str 
 @app.post(
     "/sync/backend-core",
     tags=["Sync"],
-    summary="Sync backend-core into MySQL",
+    summary="Sync backend-core into MySQL — scheduled daily 02:00 UTC",
     description=(
         "Runs the downloader against backend-core and stores normalized source records in MySQL. "
         "`page_size` controls backend paging, `env_mode` selects DEV/PRD output scope, "
@@ -242,7 +242,7 @@ def backend_sync_status():
 @app.post(
     "/sync/translations",
     tags=["Sync"],
-    summary="Sync KO metadata translations into MySQL",
+    summary="Sync KO metadata translations into MySQL — scheduled daily 04:00 UTC",
     description=(
         "Fetches KO metadata translations (title, subtitle, description, keywords) from backend-core "
         "and merges them into existing MySQL records as a `metadata_translations` block, keyed by language. "
@@ -288,7 +288,7 @@ def translations_sync_status():
 @app.post(
     "/pipeline/fast",
     tags=["Pipeline"],
-    summary="Run fast MySQL-backed pipeline",
+    summary="Run fast MySQL-backed pipeline — scheduled daily 05:30 UTC",
     description=(
         "Processes non-deferred MySQL records through the existing enricher and improver stages. "
         "`max_docs` caps the batch size, and `llids` can be used to target specific records."
@@ -329,7 +329,7 @@ def fast_pipeline_status():
 @app.post(
     "/pipeline/deferred",
     tags=["Pipeline"],
-    summary="Run deferred MySQL-backed pipeline",
+    summary="Run deferred MySQL-backed pipeline — scheduled Fridays 22:00 UTC",
     description=(
         "Processes deferred MySQL records, typically expensive PDFs above the fast-path threshold. "
         "`max_docs` caps the batch size, and `llids` can override selection for targeted processing."
@@ -545,7 +545,7 @@ def get_record(record_id: str, env_mode: EnvMode | None = None):
 @app.post(
     "/exports/final-improved",
     tags=["Exports"],
-    summary="Export final-improved snapshot from MySQL",
+    summary="Export final-improved snapshot from MySQL — scheduled daily 08:00 UTC",
     description=(
         "Builds a fresh JSON export from MySQL-backed record state. "
         "By default only processing-eligible records are exported. "
@@ -589,7 +589,7 @@ def latest_final_improved_export():
 @app.post(
     "/projects/export",
     tags=["Exports"],
-    summary="Export backend-core projects snapshot",
+    summary="Export backend-core projects snapshot — scheduled daily 12:00 UTC",
     description=(
         "Fetches all backend-core projects for the selected DEV or PRD environment via paginated "
         "`POST /api/logical_layer/projects/search`, keeps only the curated project fields, and writes "
