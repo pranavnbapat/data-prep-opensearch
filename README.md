@@ -298,7 +298,8 @@ The original pipeline remains file-snapshot based. An optional MySQL layer can n
 
 - sync backend-core records into a local MySQL table
 - run a fast path against records stored in MySQL
-- defer expensive PDFs above `FAST_PIPELINE_PDF_MAX_PAGES`
+- defer long docs to the weekly pipeline: PDFs above `FAST_PIPELINE_PDF_MAX_PAGES`, Office docs above `FAST_PIPELINE_OFFICE_MAX_PAGES`, text/CSV above `FAST_PIPELINE_TEXT_MAX_CHARS`
+- PDF reading is text-first: a born-digital PDF's embedded text layer is indexed verbatim (lossless, any length); only scanned/sparse PDFs use vision — a sampled page subset for 31–100 pages, and metadata-only above `EUF_VISION_PDF_MAX_PAGES`
 - export a fresh final-improved snapshot from MySQL state
 
 Recommended flow:
@@ -335,7 +336,7 @@ Current behavior:
 Current limitations:
 
 - this is an additive control plane, not a full replacement of the original downloader/orchestrator yet
-- deferred classification currently focuses on hosted PDFs whose page count exceeds `FAST_PIPELINE_PDF_MAX_PAGES`
+- deferred classification covers hosted PDFs and Office docs by page count and text/CSV by flat-text length; only PDFs get the in-enricher page sampling (Office/text are text-extracted, so their cost is bounded by length + deferral)
 - the same enricher/improver stage logic is reused; stage artifacts are still written under `output/`
 
 See also:

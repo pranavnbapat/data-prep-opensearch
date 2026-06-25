@@ -199,19 +199,19 @@ def _doc_llid(doc: Dict[str, Any]) -> Optional[str]:
 
 
 def _fast_pdf_max_pages() -> int:
-    return max(1, int(os.getenv("FAST_PIPELINE_PDF_MAX_PAGES", "10")))
+    return max(1, int(os.getenv("FAST_PIPELINE_PDF_MAX_PAGES", "100")))
+
+
+def _fast_office_max_pages() -> int:
+    return max(1, int(os.getenv("FAST_PIPELINE_OFFICE_MAX_PAGES", "100")))
+
+
+def _fast_text_max_chars() -> int:
+    return max(1, int(os.getenv("FAST_PIPELINE_TEXT_MAX_CHARS", "200000")))
 
 
 def _processing_max_file_size_bytes() -> int:
     return max(1, int(os.getenv("PROCESSING_MAX_FILE_SIZE_BYTES", str(1024 ** 3))))
-
-
-def _processing_max_pdf_pages() -> int:
-    return max(1, int(os.getenv("PROCESSING_MAX_PDF_PAGES", "100")))
-
-
-def _processing_max_office_pages() -> int:
-    return max(1, int(os.getenv("PROCESSING_MAX_OFFICE_PAGES", "100")))
 
 
 def _processing_max_text_bytes() -> int:
@@ -511,10 +511,25 @@ def _scan_file_security(doc: Dict[str, Any]) -> Dict[str, Any]:
         )
 
 
+def _security_scan_trusted_sources() -> set:
+    """Upload sources already security-scanned upstream — data-prep skips agri-gate
+    for them. Defaults to the AI Uploader, which runs agri-gate + quarantine before
+    publishing. NOT public_api/upload_form: neither is scanned upstream today."""
+    raw = os.getenv("SECURITY_SCAN_TRUSTED_UPLOAD_SOURCES", "ai_uploader")
+    return {s.strip().lower() for s in raw.split(",") if s.strip()}
+
+
 def _classify_security(doc: Dict[str, Any], *, existing: Optional[Dict[str, Any]] = None) -> tuple[str, Dict[str, Any]]:
     security_fp = _compute_security_fp(doc)
     if existing and (existing.get("security_fp") or "") == security_fp and not _security_scan_stale(existing):
         return security_fp, _reuse_existing_security(existing)
+    upload_source = str(doc.get("ko_upload_source") or "").strip().lower()
+    if upload_source and upload_source in _security_scan_trusted_sources():
+        # Already scanned by the upstream uploader (agri-gate + quarantine); skip the
+        # redundant scan. 'skipped' is non-blocking, so processing_eligible stays 1.
+        return security_fp, _security_decision(
+            status="skipped", scope="none", engine="upstream", reason=f"scanned_upstream:{upload_source}"
+        )
     decisions: List[Dict[str, Any]] = []
     url_decision: Optional[Dict[str, Any]] = None
     file_decision: Optional[Dict[str, Any]] = None
@@ -764,7 +779,26 @@ def _compute_pdf_page_count(doc: Dict[str, Any]) -> Optional[int]:
         return None
 
 
-def _classify_processing_eligibility(doc: Dict[str, Any], *, pdf_page_count: Optional[int]) -> tuple[int, Optional[str]]:
+def _compute_office_page_count(doc: Dict[str, Any]) -> Optional[int]:
+    """Converted (LibreOffice->PDF) page count for an Office doc, or None.
+
+    Mirrors _compute_pdf_page_count for DOCX/PPTX/XLSX so the deferral split can
+    treat Office docs by page count too. The single conversion here replaces the
+    one the eligibility check used to do, so each Office record is converted once.
+    """
+    if not _looks_like_office_doc(doc):
+        return None
+    url = (doc.get("ko_file_id") or "").strip() if isinstance(doc.get("ko_file_id"), str) else ""
+    if not url:
+        return None
+    timeout = int(os.getenv("PROCESSING_PROBE_TIMEOUT", "30"))
+    raw = _download_remote_bytes(url, timeout=timeout)
+    if raw is None:
+        return None
+    return _probe_office_pdf_pages(raw, extension=str(doc.get("ko_object_extension") or ""), timeout=timeout)
+
+
+def _classify_processing_eligibility(doc: Dict[str, Any]) -> tuple[int, Optional[str]]:
     size_raw = doc.get("ko_object_size")
     try:
         size_val = int(size_raw) if size_raw is not None else None
@@ -773,9 +807,9 @@ def _classify_processing_eligibility(doc: Dict[str, Any], *, pdf_page_count: Opt
     if isinstance(size_val, int) and size_val > _processing_max_file_size_bytes():
         return 0, "file_too_large"
 
-    if pdf_page_count is not None and pdf_page_count > _processing_max_pdf_pages():
-        return 0, "pdf_page_limit"
-
+    # PDF/Office page count is no longer a hard reject: long docs are deferred and
+    # enriched from flat text instead (see _classify_deferred). Only the size,
+    # dimension and duration guardrails below remain as eligibility limits.
     if _looks_like_text_doc(doc):
         if isinstance(size_val, int) and size_val > _processing_max_text_bytes():
             return 0, "text_file_too_large"
@@ -785,13 +819,6 @@ def _classify_processing_eligibility(doc: Dict[str, Any], *, pdf_page_count: Opt
 
     probe_url = (doc.get("ko_file_id") or "").strip() if isinstance(doc.get("ko_file_id"), str) else ""
     probe_timeout = int(os.getenv("PROCESSING_PROBE_TIMEOUT", "30"))
-
-    if _looks_like_office_doc(doc) and probe_url:
-        raw = _download_remote_bytes(probe_url, timeout=probe_timeout)
-        if raw is not None:
-            office_pages = _probe_office_pdf_pages(raw, extension=str(doc.get("ko_object_extension") or ""), timeout=probe_timeout)
-            if office_pages is not None and office_pages > _processing_max_office_pages():
-                return 0, "office_page_limit"
 
     if _is_image_doc(doc) and probe_url:
         raw = _download_remote_bytes(probe_url, timeout=probe_timeout)
@@ -814,16 +841,27 @@ def _classify_processing_eligibility(doc: Dict[str, Any], *, pdf_page_count: Opt
 def _classify_deferred(doc: Dict[str, Any], *, existing: Optional[Dict[str, Any]] = None) -> tuple[int, Optional[int], Optional[str], int, Optional[str], str, Dict[str, Any]]:
     page_count = _compute_pdf_page_count(doc)
     security_fp, security = _classify_security(doc, existing=existing)
-    processing_eligible, processing_ineligible_reason = _classify_processing_eligibility(doc, pdf_page_count=page_count)
+    processing_eligible, processing_ineligible_reason = _classify_processing_eligibility(doc)
     if security["status"] == "malicious":
         processing_eligible, processing_ineligible_reason = 0, f"security_{security['reason']}"
     elif security["status"] == "error" and bool(security.get("escalated")):
         processing_eligible, processing_ineligible_reason = 0, f"security_{security['reason']}"
-    if page_count is None:
-        return 0, None, None, processing_eligible, processing_ineligible_reason, security_fp, security
-    max_pages = _fast_pdf_max_pages()
-    if page_count > max_pages:
+
+    # Deferral routes the most expensive docs to the weekly pipeline. PDFs by
+    # rendered page count, Office (DOCX/PPTX/XLSX) by converted page count, and
+    # text/CSV by flat-text length. The pdf_page_count column stays PDF-specific.
+    if page_count is not None and page_count > _fast_pdf_max_pages():
         return 1, page_count, "pdf_over_fast_limit", processing_eligible, processing_ineligible_reason, security_fp, security
+
+    office_pages = _compute_office_page_count(doc)
+    if office_pages is not None and office_pages > _fast_office_max_pages():
+        return 1, None, "office_over_fast_limit", processing_eligible, processing_ineligible_reason, security_fp, security
+
+    if _looks_like_text_doc(doc):
+        content = doc.get("ko_content_flat")
+        if isinstance(content, str) and len(content) > _fast_text_max_chars():
+            return 1, None, "text_over_fast_limit", processing_eligible, processing_ineligible_reason, security_fp, security
+
     return 0, page_count, None, processing_eligible, processing_ineligible_reason, security_fp, security
 
 

@@ -214,6 +214,159 @@ def _pdf_page_count(pdf_bytes: bytes, *, timeout: int) -> Optional[int]:
         return None
 
 
+# --- Long-document page selection -------------------------------------------
+# Mirrors the AI Uploader strategy (django_euf_admin pod1_runner) so data-prep
+# and the uploader bound long-PDF cost the same way:
+#   <= 30 pages      -> render/describe every page (short docs are cheap)
+#   31 .. max pages   -> map-reduce a representative SUBSET (head + stratified
+#                       text-rich middle + tail). Subset size is ADAPTIVE:
+#                       round(RATE * N) clamped to [MIN, MAX] (defaults 30% in
+#                       [18, 30]) so it tracks document length.
+#   > max pages       -> handled by the caller: returns pdf_too_many_pages and the
+#                       enricher keeps the upstream ko_content_flat text.
+def _pdf_full_process_max_pages() -> int:
+    return max(1, int(os.getenv("EUF_VISION_PDF_FULL_PROCESS_MAX_PAGES", "30")))
+
+
+def _pdf_sample_rate() -> float:
+    return min(1.0, max(0.0, float(os.getenv("EUF_VISION_PDF_SAMPLE_RATE", "0.30"))))
+
+
+def _pdf_sample_min_pages() -> int:
+    return max(1, int(os.getenv("EUF_VISION_PDF_SAMPLE_MIN_PAGES", "18")))
+
+
+def _pdf_sample_max_pages() -> int:
+    return max(_pdf_sample_min_pages(), int(os.getenv("EUF_VISION_PDF_SAMPLE_MAX_PAGES", "30")))
+
+
+def _pdf_sample_head_pages() -> int:
+    return max(0, int(os.getenv("EUF_VISION_PDF_SAMPLE_HEAD_PAGES", "5")))
+
+
+def _pdf_sample_tail_pages() -> int:
+    return max(0, int(os.getenv("EUF_VISION_PDF_SAMPLE_TAIL_PAGES", "2")))
+
+
+def _adaptive_sample_target(n: int) -> int:
+    """Subset size for an n-page doc: round(RATE * n) clamped to [MIN, MAX] and n."""
+    target = int(round(_pdf_sample_rate() * n))
+    target = max(_pdf_sample_min_pages(), min(target, _pdf_sample_max_pages()))
+    return min(target, n)
+
+
+def _pdf_page_texts(pdf_bytes: bytes, *, timeout: int) -> Optional[list[str]]:
+    """Extract per-page plain text in one pdftotext call (pages split on form-feed).
+
+    Returns a list of length page_count, or None if extraction failed. Used only to
+    rank pages by text richness for stratified sampling; rendering still happens per
+    selected page.
+    """
+    try:
+        with tempfile.TemporaryDirectory(prefix="vision_pdftext_") as tmpdir:
+            pdf_path = os.path.join(tmpdir, "input.pdf")
+            with open(pdf_path, "wb") as f:
+                f.write(pdf_bytes)
+            cmd = ["/usr/bin/pdftotext", "-enc", "UTF-8", pdf_path, "-"]
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=max(timeout, 30))
+            if proc.returncode != 0:
+                logger.warning("[VisionPdfTextFail] rc=%s stderr=%s", proc.returncode, (proc.stderr or "")[:300])
+                return None
+            # pdftotext separates pages with the form-feed (\x0c) character.
+            return (proc.stdout or "").split("\f")
+    except Exception as e:
+        logger.warning("[VisionPdfTextFail] err=%r", e)
+        return None
+
+
+def _usable_pdf_text_layer(page_texts: Optional[list[str]], page_count: int) -> Optional[str]:
+    """Return the PDF's embedded text layer as one string when it is substantial
+    enough to use as the body verbatim (born-digital PDFs), else None.
+
+    Text-first: when a PDF carries a real text layer we index it directly — lossless,
+    cheap, and full-coverage even for long/over-limit documents — instead of rendering
+    and OCR-ing pages. Returns None for scanned/sparse PDFs so the caller falls back to
+    vision (or, when too long to OCR, to metadata-only).
+    """
+    if not page_texts:
+        return None
+    min_total = int(os.getenv("EUF_VISION_PDF_TEXT_LAYER_MIN_CHARS", "200"))
+    min_page_chars = int(os.getenv("EUF_VISION_PDF_TEXT_LAYER_MIN_PAGE_CHARS", "50"))
+    min_page_ratio = float(os.getenv("EUF_VISION_PDF_TEXT_LAYER_MIN_PAGE_RATIO", "0.5"))
+    cleaned = [((t or "").strip()) for t in page_texts]
+    total_chars = sum(len(t) for t in cleaned)
+    if total_chars < min_total:
+        return None
+    pages_with_text = sum(1 for t in cleaned if len(t) >= min_page_chars)
+    if pages_with_text / max(1, page_count) < min_page_ratio:
+        return None
+    full = "\n\n".join(t for t in cleaned if t)
+    # Cap to the same limit storage applies to ko_content_flat, so the value the
+    # improver fingerprints in-memory equals the value persisted — otherwise a text
+    # layer larger than the cap would mismatch every run and re-summarise endlessly.
+    cap = int(os.getenv("STORAGE_MAX_KO_CONTENT_FLAT_CHARS", os.getenv("PROCESSING_MAX_TEXT_CHARS", "500000")))
+    full = full[:cap]
+    return full or None
+
+
+def _select_pdf_pages_for_processing(
+    page_count: int, *, page_texts: Optional[list[str]] = None
+) -> Tuple[list[int], dict]:
+    """Pick the 1-based page numbers to render for a PDF.
+
+    For documents above the full-process threshold, choose a representative subset
+    instead of every page: always keep the first HEAD and last TAIL pages, then fill
+    the remaining budget from the middle by stratified sampling — the most text-rich
+    page in each evenly-spaced window (more metadata signal). When per-page text is
+    unavailable, the window midpoint is used. Returns (page_nums, info).
+    """
+    n = max(0, int(page_count))
+    if n <= _pdf_full_process_max_pages():
+        return list(range(1, n + 1)), {"strategy": "full", "total_pages": n, "processed_pages": n}
+
+    head = min(_pdf_sample_head_pages(), n)
+    tail = min(_pdf_sample_tail_pages(), max(0, n - head))
+    target = _adaptive_sample_target(n)
+    target = min(max(target, head + tail), n)
+
+    head_idx = list(range(0, head))
+    tail_idx = list(range(n - tail, n)) if tail else []
+    middle = list(range(head, n - tail))
+
+    def _page_text_len(idx: int) -> int:
+        if page_texts is not None and 0 <= idx < len(page_texts):
+            return len((page_texts[idx] or "").strip())
+        return 0
+
+    remaining = max(0, target - len(head_idx) - len(tail_idx))
+    chosen_middle: list[int] = []
+    if remaining > 0 and middle:
+        step = len(middle) / remaining
+        for k in range(remaining):
+            w_start = int(k * step)
+            w_end = int((k + 1) * step) if k < remaining - 1 else len(middle)
+            window = middle[w_start:w_end]
+            if not window:
+                continue
+            if page_texts is not None:
+                best = max(window, key=_page_text_len)
+            else:
+                best = window[len(window) // 2]
+            chosen_middle.append(best)
+
+    sel_idx = sorted(set(head_idx + chosen_middle + tail_idx))
+    page_nums = [i + 1 for i in sel_idx]
+    return page_nums, {
+        "strategy": "sampled",
+        "total_pages": n,
+        "target_pages": target,
+        "processed_pages": len(page_nums),
+        "head_pages": head,
+        "tail_pages": tail,
+        "processed_page_nums": page_nums,
+    }
+
+
 def _join_chunk_texts(chunks: list[str]) -> str:
     cleaned = []
     seen = set()
@@ -438,26 +591,41 @@ def describe_visual_url_detailed(target_url: str, *, source_page_url: Optional[s
         page_count = _pdf_page_count(pdf_bytes, timeout=int(timeout)) or 1
         map_reduce_threshold = max(1, int(os.getenv("EUF_VISION_PDF_MAP_REDUCE_THRESHOLD", "3")))
         chunk_size = max(1, int(os.getenv("EUF_VISION_PDF_CHUNK_PAGES", "3")))
-        max_pages = max(1, int(os.getenv("EUF_VISION_PDF_MAX_PAGES", "80")))
+        max_pages = max(1, int(os.getenv("EUF_VISION_PDF_MAX_PAGES", "100")))
+
+        # Text-first: a born-digital PDF carries a full text layer — index it verbatim
+        # (lossless, cheap, full coverage even beyond max_pages) instead of OCR-ing
+        # pages. Only scanned/sparse PDFs fall through to vision below.
+        page_texts = _pdf_page_texts(pdf_bytes, timeout=int(timeout))
+        text_layer = _usable_pdf_text_layer(page_texts, page_count)
+        if text_layer is not None:
+            logger.info("[VisionPdfTextLayer] target=%s page_count=%s chars=%s", target_url, page_count, len(text_layer))
+            return text_layer, "pdf_text_layer"
 
         if page_count > max_pages:
-            logger.warning("[VisionPdfSkip] target=%s page_count=%s max_pages=%s", target_url, page_count, max_pages)
+            # Scanned/sparse AND too long to OCR every page → no lossless body. Caller
+            # keeps upstream ko_content_flat (often empty) and indexes metadata only.
+            logger.warning("[VisionPdfSkip] target=%s page_count=%s max_pages=%s reason=no_text_layer", target_url, page_count, max_pages)
             return None, "pdf_too_many_pages"
 
         if page_count > map_reduce_threshold:
+            # Scanned/sparse long doc: render a representative subset of pages instead
+            # of every page (head + stratified text-rich middle + tail) to bound OCR.
+            selected_pages, sel_info = _select_pdf_pages_for_processing(page_count, page_texts=page_texts)
             logger.info(
-                "[VisionPdfMapReduce] target=%s page_count=%s chunk_pages=%s threshold=%s max_pages=%s",
+                "[VisionPdfMapReduce] target=%s page_count=%s chunk_pages=%s threshold=%s max_pages=%s selection=%s",
                 target_url,
                 page_count,
                 chunk_size,
                 map_reduce_threshold,
                 max_pages,
+                sel_info,
             )
             chunk_summaries: list[str] = []
-            for start in range(1, page_count + 1, chunk_size):
-                end = min(start + chunk_size - 1, page_count)
+            for start in range(0, len(selected_pages), chunk_size):
+                chunk_pages = selected_pages[start:start + chunk_size]
                 page_texts: list[str] = []
-                for page_num in range(start, end + 1):
+                for page_num in chunk_pages:
                     rendered = _render_pdf_page_data_url(pdf_bytes, page_num=page_num, timeout=int(timeout))
                     if not rendered:
                         continue
@@ -472,7 +640,7 @@ def describe_visual_url_detailed(target_url: str, *, source_page_url: Optional[s
                 if page_texts:
                     chunk_summary = _reduce_text_parts(
                         page_texts,
-                        target_url=f"{target_url}#pages={start}-{end}",
+                        target_url=f"{target_url}#pages={chunk_pages[0]}-{chunk_pages[-1]}",
                         timeout=timeout,
                     )
                     if chunk_summary:

@@ -1066,6 +1066,14 @@ def as_bool(v: Any) -> bool:
     return bool(v)
 
 def set_enrich_via(d: Dict[str, Any]) -> None:
+    # AI Uploader pass-through: these KOs were already read and processed upstream
+    # (metadata + summary produced by the AI Uploader). Never re-read the file here.
+    # Removing enrich_via makes the enricher skip the record (no_route) and carry the
+    # source content forward unchanged.
+    if str(d.get("ko_upload_source") or "").strip().lower() == "ai_uploader":
+        d.pop("enrich_via", None)
+        return
+
     ko_is_hosted = as_bool(d.get("ko_is_hosted"))
     mimetype = (d.get("ko_object_mimetype") or "").strip() if isinstance(d.get("ko_object_mimetype"), str) else ""
     ko_file_id = (d.get("ko_file_id") or "").strip() if isinstance(d.get("ko_file_id"), str) else ""

@@ -195,8 +195,29 @@ def improve_doc_in_place(doc: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
     Returns (ok, reason_if_failed).
     """
     try:
-        model = _require_model()
         llid = str(doc.get("_orig_id") or doc.get("_id") or "")
+
+        # --- AI Uploader pass-through ---
+        # KOs produced by the AI Uploader already carry final metadata and a summary
+        # generated upstream. Do not re-summarise or re-generate metadata: keep the
+        # provided ko_content_flat_summarised as the index body (falling back to the
+        # flattened source content when absent), mirror the metadata into the *_llm
+        # fields, and return without any LLM call (no model required).
+        if str(doc.get("ko_upload_source") or "").strip().lower() == "ai_uploader":
+            doc["title_llm"] = doc.get("title", "")
+            doc["subtitle_llm"] = doc.get("subtitle", "")
+            doc["description_llm"] = doc.get("description", "")
+            doc["keywords_llm"] = doc.get("keywords", [])
+            summary = doc.get("ko_content_flat_summarised")
+            if not (isinstance(summary, str) and summary.strip()):
+                flat = doc.get("ko_content_flat")
+                if isinstance(flat, str) and flat.strip():
+                    doc["ko_content_flat_summarised"] = flat
+            doc["improved"] = 1
+            logger.info("[ImproveAIPassthrough] id=%s kept AI metadata+summary, skipped LLM", llid)
+            return True, None
+
+        model = _require_model()
 
         content = doc.get("ko_content_flat")
         if not isinstance(content, str) or not content.strip():

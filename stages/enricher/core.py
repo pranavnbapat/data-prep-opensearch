@@ -143,7 +143,7 @@ def enrich_docs_via_routes(
                 )
                 vision_text, vision_tag = describe_visual_url_detailed(visual_target, source_page_url=url)
                 if vision_text and not is_placeholder_content(vision_text):
-                    return vision_text, "vision_pdf_map_reduce" if vision_tag == "vision_pdf_map_reduce" else "vision_fallback"
+                    return vision_text, vision_tag if vision_tag in ("vision_pdf_map_reduce", "pdf_text_layer") else "vision_fallback"
                 existing_text = doc.get("ko_content_flat")
                 if vision_tag == "pdf_too_many_pages" and isinstance(existing_text, str) and not is_placeholder_content(existing_text):
                     logger.info("[VisionPreferredSkipKeepUpstream] id=%s page=%s target=%s reason=%s", llid, url, visual_target, vision_tag)
@@ -185,7 +185,7 @@ def enrich_docs_via_routes(
                                 llid, url, visual_target, visual_reason)
                     vision_text, vision_tag = describe_visual_url_detailed(visual_target, source_page_url=url)
                     if vision_text and not is_placeholder_content(vision_text):
-                        return vision_text, "vision_pdf_map_reduce" if vision_tag == "vision_pdf_map_reduce" else "vision_fallback"
+                        return vision_text, vision_tag if vision_tag in ("vision_pdf_map_reduce", "pdf_text_layer") else "vision_fallback"
                     existing_text = doc.get("ko_content_flat")
                     if vision_tag == "pdf_too_many_pages" and isinstance(existing_text, str) and not is_placeholder_content(existing_text):
                         logger.info("[VisionFallbackSkipKeepUpstream] id=%s page=%s target=%s reason=%s", llid, url, visual_target, vision_tag)

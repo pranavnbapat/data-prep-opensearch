@@ -67,15 +67,16 @@ Operational note:
       │ - try to compute pdf_page_count                              │
       │ - apply processing eligibility checks                        │
       │   * all files <= 1 GiB                                       │
-      │   * PDFs <= 100 pages                                        │
-      │   * Office docs <= 100 converted pages/slides                │
       │   * text files <= 5 MB and <= 500000 chars extracted         │
       │   * images <= 10000 px on either side                        │
       │   * audio/video <= 3000 s                                    │
-      │ - if page_count > FAST_PIPELINE_PDF_MAX_PAGES                │
-      │     => is_deferred = 1                                       │
-      │ - else                                                       │
-      │     => is_deferred = 0                                       │
+      │   (PDF/Office page count is NOT an eligibility limit; long    │
+      │    docs are deferred + enriched from flat text instead)       │
+      │ - deferral (route to weekly pipeline) if any of:            │
+      │     * PDF pages    > FAST_PIPELINE_PDF_MAX_PAGES    (100)     │
+      │     * Office pages > FAST_PIPELINE_OFFICE_MAX_PAGES (100)     │
+      │     * text/CSV chars > FAST_PIPELINE_TEXT_MAX_CHARS          │
+      │     => is_deferred = 1, else is_deferred = 0                 │
       │ - if any eligibility check fails                             │
       │     => processing_eligible = 0                               │
       │        processing_ineligible_reason = <reason>               │
@@ -191,8 +192,10 @@ Operational note:
       │ Same per-record logic as /pipeline/fast, but selection is:   │
       │ - is_deferred = 1                                            │
       │ - processing_eligible = 1                                    │
-      │ Typically these are hosted PDFs above                        │
-      │ FAST_PIPELINE_PDF_MAX_PAGES                                  │
+      │ These are long docs above the fast-path page/char limits     │
+      │ (PDF/Office > 100 pages, or text/CSV over the char limit).   │
+      │ PDFs over EUF_VISION_PDF_MAX_PAGES skip vision and are        │
+      │ enriched from the upstream ko_content_flat text.             │
       └──────────────┬───────────────────────────────────────────────┘
                      │
                      v
